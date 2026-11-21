@@ -37,8 +37,9 @@ import torch
 
 BK = 128
 GROUP_M = 8
-# setmaxnreg: 384 threads x 1 block -> 168 entry registers; 24 x 128 + 240 x 256 = 168 x 384.
-PRODUCER_REGS, CONSUMER_REGS = 24, 240
+# setmaxnreg: 384 threads x 1 block -> 168 entry registers; 40 x 128 + 232 x 256 = 168 x 384 (DeepGEMM's split;
+# a 24-register producer spills once multicast addressing is added).
+PRODUCER_REGS, CONSUMER_REGS = 40, 232
 SMEM_BYTES = 227 * 1024
 
 
@@ -58,12 +59,19 @@ def sfa_mn_major(sfa):
 def num_stages(bm, bn):
     per_stage = bm * BK + bn * BK + bm * 4  # A, B (fp8) and the A scales
     c_bytes = bm * bn * 2  # bf16 staging tile of the epilogue
-    return min(6, (SMEM_BYTES - c_bytes - 1024) // per_stage)
+    return min(6, (SMEM_BYTES - c_bytes - 3072) // per_stage)  # 3 KB: barriers + per-tile sfb (2 x K/128 floats)
 
 
 def pick_config(M, N, K):
-    """(bm, bn, cluster) for a shape: DeepGEMM's sm90 choices for the gated shapes."""
+    """(bm, bn, cluster) for a shape, from the H200 sweep over the gated shapes (sm90-probe logs/b2/v4_gated.log).
+
+    * narrow N: 128 x 192 tiles give more tiles per wave than 256 x 128 (N = 2112 -> 11 exact column tiles);
+    * short K: few k-blocks per tile, so the per-tile cost dominates and sharing B across an M pair pays;
+    * otherwise DeepGEMM's main tile, 256 x 128 with A multicast across an N pair.
+    """
     if N <= 2304:
+        return 128, 192, None
+    if K <= 1536:
         return 128, 192, "m"
     return 256, 128, "n"
 
@@ -83,6 +91,10 @@ def make_kernel(
     _multicast: bool = True,
     _launch_cluster: int = 0,
     _cid_from_bid: bool = False,
+    _uniform_wg: bool = True,
+    _sfb_smem: bool = True,
+    _kunroll: int = 8,
+    _warp_release: bool = True,
 ):
     from tvm_tirx.backend.cuda.lang import NamedBarriers, SMEMPool
     from tvm_tirx.backend.cuda.lang import wgmma as W
@@ -165,17 +177,26 @@ def make_kernel(
         A_s = T.alloc_tensor(ty_args=[T.Tensor((STAGES, bm, BK), "float8_e4m3fn", scope="shared", align=1024)])
         B_s = T.alloc_tensor(ty_args=[T.Tensor((STAGES, bn, BK), "float8_e4m3fn", scope="shared", align=1024)])
         S_s = T.alloc_tensor(ty_args=[T.Tensor((STAGES, bm), "float32", scope="shared", align=128)])
+        if T.constexpr(_sfb_smem):
+            # this tile's two candidate sfb rows (blocks nb0, nb0 + 1) for every k-block, filled once per tile
+            SFB_s = T.alloc_tensor(ty_args=[T.Tensor((2, KB), "float32", scope="shared", align=16)])
         # epilogue staging: [wave][consumer][64-column block] 128B-swizzled 64 x 64 boxes, as the TMA store reads them
         C_s = T.alloc_tensor(ty_args=[T.Tensor((waves, 2, c_blocks, 64, 64), "bfloat16", scope="shared", align=1024)])
-        bars = NamedBarriers(reserved=(1, 2))  # 1 + wg: per-consumer epilogue barriers
+        bars = NamedBarriers(reserved=(1, 2, 3))  # 1 + wg: per-consumer epilogue barriers; 3: both consumers
         pool = SMEMPool()
         full = TMABar(pool, STAGES)
         empty = MBarrier(pool, STAGES)
         pool.commit()
         full.init(1)
-        empty.init(2 * MCS)  # one arrive per consumer warpgroup per CTA of the cluster
-        it = T.alloc_local([1], "int32")
-        it[0] = 0
+        if T.constexpr(_warp_release):
+            empty.init(8 * MCS)  # one arrive per consumer warp per CTA of the cluster (DeepGEMM)
+        else:
+            empty.init(2 * MCS)  # one arrive per consumer warpgroup per CTA of the cluster
+        # ring position as (stage, phase), advanced incrementally: no per-k-block % / // (signed int division
+        # by a constant still costs a multiply-high plus sign fix-ups)
+        sp = T.alloc_local([2], "int32")
+        sp[0] = 0
+        sp[1] = 0
         if tx == 0:
             T.ptx.prefetch.tensormap(T.address_of(A_map))
             T.ptx.prefetch.tensormap(T.address_of(B_map))
@@ -198,8 +219,8 @@ def make_kernel(
                         m_blk = (first + (t % (GROUP_M * NC)) % gsize) * CM + (rank if CM == 2 else 0)
                         n_blk = (t % (GROUP_M * NC)) // gsize * CN + (rank if CN == 2 else 0)
                         for kb in T.serial(KB):
-                            stage = it[0] % STAGES
-                            empty.wait(stage, ((it[0] // STAGES) & 1) ^ 1)
+                            stage = sp[0]
+                            empty.wait(stage, sp[1] ^ 1)
                             full.arrive(stage, stage_tx)
                             if T.constexpr(MA == 2):
                                 T.ptx[tma_mc](A_s.ptr_to([stage, rank * a_rows, 0]), T.address_of(A_map), kb * BK,
@@ -214,18 +235,28 @@ def make_kernel(
                                 T.ptx[tma](B_s.ptr_to([stage, 0, 0]), T.address_of(B_map), kb * BK, n_blk * bn,
                                            full.ptr_to([stage]))
                             T.ptx[tma](S_s.ptr_to([stage, 0]), T.address_of(S_map), m_blk * bm, kb, full.ptr_to([stage]))
-                            it[0] = it[0] + 1
+                            sp[1] = sp[1] ^ T.Cast("int32", sp[0] == STAGES - 1)
+                            sp[0] = T.Select(sp[0] == STAGES - 1, 0, sp[0] + 1)
                 if T.constexpr(MCS > 1):
                     # Drain: wait until every stage was released by both CTAs. After that no remote arrive or
                     # multicast write targets this CTA, so it may exit; no kernel-end cluster barrier (which would
                     # park the idle warps at a cluster barrier for the whole kernel).
                     for _s in T.serial(STAGES):
-                        empty.wait(it[0] % STAGES, ((it[0] // STAGES) & 1) ^ 1)
-                        it[0] = it[0] + 1
+                        empty.wait(sp[0], sp[1] ^ 1)
+                        sp[1] = sp[1] ^ T.Cast("int32", sp[0] == STAGES - 1)
+                        sp[0] = T.Select(sp[0] == STAGES - 1, 0, sp[0] + 1)
         else:
             # ---------------- consumer warpgroups ----------------
             T.ptx["setmaxnreg.inc.sync.aligned.u32"](regs[1])
-            wg = tx // 128 - 1
+            if T.constexpr(_uniform_wg):
+                # Broadcast the warpgroup index from lane 0 (DeepGEMM's __shfl_sync trick): nvcc then knows it is
+                # warp-uniform and keeps the descriptor arithmetic in uniform registers, with no R2UR per wgmma.
+                wgv = T.alloc_local([1], "uint32")
+                T.ptx.shfl_sync.idx.b32(wgv[0], T.Cast("uint32", tx // 128), T.uint32(0), T.uint32(31),
+                                        T.uint32(0xFFFFFFFF))
+                wg = T.Cast("int32", wgv[0]) - 1
+            else:
+                wg = tx // 128 - 1
             ct = tx % 128
             acc = T.alloc_tensor(ty_args=[T.Tensor((waves * acc_n,), "float32", scope="local")])
             tmp = T.alloc_tensor(ty_args=[T.Tensor((acc_n,), "float32", scope="local")])
@@ -245,12 +276,24 @@ def make_kernel(
                         acc[i] = T.float32(0.0)
                     nb0 = (n_blk * bn) // 128
                     split = 128 - (n_blk * bn) % 128  # tile column where sfb block nb0 + 1 starts
-                    for kb in T.serial(KB):
-                        stage = it[0] % STAGES
+                    if T.constexpr(_sfb_smem):
+                        # both consumer warpgroups are past the previous tile's k-loop before SFB_s is refilled
+                        T.ptx["bar.sync"](T.uint32(3), T.uint32(256))
+                        for i in T.serial(-(-2 * KB // 256)):
+                            idx = (tx - 128) + i * 256
+                            if idx < 2 * KB:
+                                SFB_s[idx // KB, idx % KB] = SFB[T.min(nb0 + idx // KB, NB - 1), idx % KB]
+                        T.ptx["bar.sync"](T.uint32(3), T.uint32(256))
+                    for kb in T.serial(KB, unroll=_kunroll):
+                        stage = sp[0]
                         # sfb is tiny and L1/L2-resident: load before waiting so its latency hides
-                        sc[6] = SFB[nb0, kb]
-                        sc[7] = SFB[T.min(nb0 + 1, NB - 1), kb]
-                        full.wait(stage, (it[0] // STAGES) & 1)
+                        if T.constexpr(_sfb_smem):
+                            sc[6] = SFB_s[0, kb]
+                            sc[7] = SFB_s[1, kb]
+                        else:
+                            sc[6] = SFB[nb0, kb]
+                            sc[7] = SFB[T.min(nb0 + 1, NB - 1), kb]
+                        full.wait(stage, sp[1])
                         b0 = W.advance_descriptor(db0, stage * b_stage_bytes)
                         for w in T.unroll(waves):
                             a0 = W.advance_descriptor(da0, stage * a_stage_bytes + w * 128 * BK)
@@ -269,7 +312,7 @@ def make_kernel(
                             sc[5] = sc[1] * sc[7]
                             W.wait(0, (tmp, acc_n))
                             if w == waves - 1:
-                                if ct == 0:
+                                if (ct % 32 if _warp_release else ct) == 0:
                                     if T.constexpr(MCS > 1):
                                         empty.arrive_multicast(stage, ranks=range(CS))
                                     else:
@@ -286,7 +329,8 @@ def make_kernel(
                                 acc[w * acc_n + c * 4 + 1] = acc[w * acc_n + c * 4 + 1] + tmp[c * 4 + 1] * lo
                                 acc[w * acc_n + c * 4 + 2] = acc[w * acc_n + c * 4 + 2] + tmp[c * 4 + 2] * hi
                                 acc[w * acc_n + c * 4 + 3] = acc[w * acc_n + c * 4 + 3] + tmp[c * 4 + 3] * hi
-                        it[0] = it[0] + 1
+                        sp[1] = sp[1] ^ T.Cast("int32", sp[0] == STAGES - 1)
+                        sp[0] = T.Select(sp[0] == STAGES - 1, 0, sp[0] + 1)
                     if T.constexpr(no_promote):
                         for i in T.unroll(acc_n):
                             acc[i] = tmp[i]
