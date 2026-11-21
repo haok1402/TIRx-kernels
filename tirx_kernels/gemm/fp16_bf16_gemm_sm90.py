@@ -15,6 +15,10 @@ Warp-specialized and persistent, written on tvm-tirx's Hopper helpers:
   (``MBarrier.arrive_multicast``).
 * Persistent grid of ``max_active_clusters`` clusters (``runtime.occupancy``).
   Each walks 2 x 1 tile pairs in a grouped raster for L2 reuse.
+* Any M; N and K multiples of 8 (TMA's 16-byte global-stride rule). Tails cost
+  nothing extra: TMA zero-fills out-of-bounds loads (a partial last k-block adds
+  zeros) and clips the epilogue's TMA stores. A tile pair whose second tile lies
+  past M still runs, so the cluster's B multicast stays symmetric.
 
 Requires tvm-tirx with ``backend/cuda/lang/wgmma.py``, ``MBarrier.arrive_multicast``
 and ``runtime/occupancy.py``.
@@ -58,11 +62,14 @@ def make_kernel(
     # The TMA epilogue stages each consumer's 64 x 256 C tile in shared memory (32 KB),
     # so the ring drops to 3 stages to fit 227 KB.
     STAGES = stages or (3 if tma_epi else 4)
-    if M % (BM * CLUSTER) or N % BN or K % BK:
+    if min(M, N, K) < 1 or N % 8 or K % 8:
         raise ValueError(
-            f"M must be a multiple of {BM * CLUSTER}, N of {BN}, K of {BK}; got {M}x{N}x{K}"
+            f"need M, N, K >= 1 and N, K multiples of 8 (TMA strides); got {M}x{N}x{K}"
         )
-    MP, NT, NK = M // (BM * CLUSTER), N // BN, K // BK  # tile pairs along M, tiles along N
+    if not tma_epi and (M % (BM * CLUSTER) or N % BN):
+        raise ValueError(f'epilogue="direct" needs full tiles (M % {BM * CLUSTER}, N % {BN} == 0)')
+    # tile pairs along M, tiles along N, k-blocks; partial ones are zero-filled / clipped by TMA
+    MP, NT, NK = -(-M // (BM * CLUSTER)), -(-N // BN), -(-K // BK)
     n_pairs = MP * NT
     rounds = (n_pairs + num_clusters - 1) // num_clusters
     half_b = BN // CLUSTER
@@ -236,10 +243,19 @@ TRACKED_SHAPES = [
     (4096, 2048, 8192),
     (8192, 1024, 2048),
 ]
+# Tails (M, N, K not multiples of the tile) and small M: correctness configs, not benchmarked for the gate.
+TAIL_SHAPES = [
+    (1, 4096, 4096),
+    (100, 2112, 7168),
+    (777, 576, 1000),
+    (4096, 2112, 7168),
+    (300, 520, 136),
+    (129, 264, 8),
+]
 CONFIGS = [
     {"dtype": d, "M": M, "N": N, "K": K, "label": f"{d}_{M}x{N}x{K}"}
     for d in ("fp16", "bf16")
-    for M, N, K in GATED_SHAPES + TRACKED_SHAPES
+    for M, N, K in GATED_SHAPES + TRACKED_SHAPES + TAIL_SHAPES
 ]
 
 
@@ -276,8 +292,13 @@ def get_kernel(dtype, M, N, K, *, backend_config=None, **kwargs):
 def run_test(dtype, M, N, K, *, backend_config=None, **kwargs):
     A, B, C = prepare_data(dtype, M, N, K)
     ex, _ = compile_persistent(dtype, M, N, K, backend_config=backend_config)
+    C.fill_(float("nan"))  # every element, tails included, must be written
     ex(A, B, C)
-    torch.testing.assert_close(C.cpu(), torch.matmul(A, B.T).cpu(), rtol=0.001, atol=0.01)
+    # fp32 reference, one output ulp of tolerance: cuBLAS itself picks a different (split-K)
+    # algorithm at small M and differs from this kernel by 1 bf16 ulp there.
+    ref = A.float() @ B.float().T
+    ulp = {"fp16": 2.0**-10, "bf16": 2.0**-7}[dtype]
+    torch.testing.assert_close(C.float().cpu(), ref.cpu(), rtol=ulp, atol=0.01)
 
 
 def run_bench(
