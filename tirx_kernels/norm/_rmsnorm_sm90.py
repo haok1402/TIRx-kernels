@@ -36,6 +36,12 @@ Why this is guaranteed by the PTX memory model (no fences needed):
   completion, and the reset follows the last completion.
 * The reset therefore sees, and removes, every ticket and completion of the launch.
 
+**Invariant: every access to the counter is a 64-bit atomic on the whole word** (``atom...u64`` at
+``ctr[0]``). A 32-bit atomic on the low half would be a different location in the memory model's
+sense (it does not overlap the word completely). It would not be ordered with the 64-bit RMWs, and
+the argument above would no longer hold. Never read or update one half on its own, not even for the
+ticket fetch.
+
 The run's version stored 0 instead, which is not ordered against another CTA's late ticket atomic.
 An ``acq_rel`` completion atomic on a separate word would also be correct, at about the same cost.
 Both cost about 0.5 us at 4113 rows (hs 4096/5120) against the run's unordered reset, and nothing
