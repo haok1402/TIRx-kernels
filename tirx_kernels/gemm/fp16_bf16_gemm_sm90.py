@@ -120,7 +120,10 @@ def make_kernel(
         empty = MBarrier(pool, STAGES)
         pool.commit()
         full.init(1)
-        empty.init(2 * CLUSTER)  # one arrive per consumer warpgroup per CTA of the cluster
+        # One arrive per consumer warp per CTA of the cluster: each warp releases a stage only after its
+        # own wait on it, so no lagging warp's full-barrier wait can be overtaken by the refill
+        # (synccheck finding, sm90-probe KERNEL-001; DeepGEMM does the same).
+        empty.init(8 * CLUSTER)
         it = T.alloc_local([1], "int32")
         it[0] = 0
         if tx == 0:
@@ -176,11 +179,11 @@ def make_kernel(
                                 [b_tile.k_step(op, s, b0) for s in range(k_steps)], accumulate=kt > 0)
                         W.wait(1, (acc, acc_n))
                         if kt > 0:
-                            if ct == 0:
+                            if ct % 32 == 0:
                                 empty.arrive_multicast((it[0] + STAGES - 1) % STAGES, ranks=range(CLUSTER))
                         it[0] = it[0] + 1
                     W.wait(0, (acc, acc_n))
-                    if ct == 0:
+                    if ct % 32 == 0:
                         empty.arrive_multicast((it[0] + STAGES - 1) % STAGES, ranks=range(CLUSTER))
                     if T.constexpr(tma_epi):
                         # The previous tile's TMA store must have finished reading C_s.
