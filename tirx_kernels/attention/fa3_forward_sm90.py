@@ -21,9 +21,21 @@ or the non-causal KV tail. It is peeled. Then for each following block:
     S = Q Kᵀ (in flight) ; rescale O ; O += P_prev V_prev (rs) ; wait 1 ; release K ;
     softmax(S) ; wait 0 ; release V_prev ; P = bf16(S)
 
-**Online softmax:** with ``c = log2(e) / sqrt(128)``, P = exp2((S - m) c). The running sum ``l`` is
+**Online softmax:** with ``c = log2(e) / sqrt(128)``, P = exp2(S c - m c). The running sum ``l`` is
 kept per lane and reduced over the quad once, at the end. O starts at zero, so every PV chain
 accumulates.
+
+**Non-finite inputs** behave as in FA3. Masked scores become -inf, so P = 0 there, but PV still
+multiplies that 0 by V. A NaN or inf in a masked V row (e.g. a causal row's future keys in the same KV
+block) therefore turns the output row into NaN, exactly as FA3 does. Review checked this matches FA3
+element for element.
+
+**For a future persistent version** (one CTA looping over tiles), two things here assume one tile per
+CTA:
+- The ping-pong leaves one unmatched ``bar.arrive``: warpgroup 2's last arrive on warpgroup 1's
+  barrier is never consumed. That is harmless at CTA exit, but would skew the next tile's ping-pong.
+- The epilogue stages O in the Q tile. The producer must not load the next Q until both
+  warpgroups' TMA stores have finished reading it (a Q-empty barrier after ``wait_group.read``).
 """
 
 import ctypes
@@ -554,9 +566,14 @@ def prepare_bench(*, backend_config=None, **kwargs: Any):
 
 
 def run_gpu(prepared, *, warmup=None, repeat=None, timer=None, backend_config=None, **kwargs):
-    """Allocate and measure after GPU assignment; FA3 is the reference."""
+    """Allocate and measure after GPU assignment; FA3 is the reference.
+
+    Kernel-only GPU time (CUPTI via Proton) is the metric, which is what the harness scores and the
+    B3 gate uses. Event timing would include ~15-25 us of FlashInfer's Python dispatch per FA3 call.
+    """
     from tirx_kernels.runner import bench
 
+    timer = timer or "proton"
     cfg = prepared["config"]
     seq_lens, num_heads, causal = cfg["seq_lens"], cfg["num_heads"], cfg["causal"]
     q, k, v = prepare_data(seq_lens, num_heads)
