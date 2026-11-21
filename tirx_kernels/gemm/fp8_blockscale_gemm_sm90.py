@@ -301,10 +301,13 @@ def make_kernel(
                             sc[5] = sc[1] * sc[7]
                             W.wait(0, (tmp, acc_n))
                             if w == waves - 1:
-                                # This stage's A scales were read through the generic proxy (ld.shared); the
-                                # producer's next TMA write to them is async proxy. The PTX memory model only
-                                # orders the two with a proxy fence (sm90-probe KERNEL-001 #2): each thread
-                                # fences its own reads, the warp syncs, then lane 0 releases the stage.
+                                # Every lane read this stage's A scales with a generic ld.shared; the producer's
+                                # refill is an async-proxy TMA write. Releasing safely takes two orderings
+                                # (sm90-probe KERNEL-001 #2):
+                                # 1. generic read -> async write, in each lane: a proxy fence. mbarrier
+                                #    release/acquire alone does not order accesses across proxies.
+                                # 2. lane i's read -> lane 0's arrive, across lanes: __syncwarp. A fence acts
+                                #    only in its own thread, and only lane 0 arrives (release).
                                 T.ptx.fence.proxy.async_.shared__cta()
                                 T.cuda.warp_sync()
                                 if ct % 32 == 0:  # lane 0 of every consumer warp releases the stage
