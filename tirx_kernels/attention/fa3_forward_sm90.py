@@ -35,6 +35,7 @@ import tvm_ffi
 
 import tirx_kernels.tirx_lite as txl
 from tirx_kernels.runner import compile_kernel, resolve_backend_config
+from tvm_tirx.backend.cuda.lang import NamedBarriers
 from tvm_tirx.backend.cuda.lang import wgmma as W
 from tvm_tirx.script import tirx as T
 
@@ -92,9 +93,20 @@ class _Regs4:
         return 4
 
 
-def make_kernel(num_heads: int, causal: bool, *, backend_config=None):
+def make_kernel(num_heads: int, causal: bool, *, backend_config=None, pingpong=None):
     bc = resolve_backend_config(backend_config)
     H = num_heads
+    if pingpong is None:
+        # Measured on H200 (sm90-probe logs/b3/v3.log): ping-pong helps causal slightly and costs
+        # non-causal 1-2%, where the intra-warpgroup overlap already hides softmax.
+        pingpong = causal
+    # Inter-warpgroup ping-pong (FA3's WarpScheduler): one barrier per consumer warpgroup, 256 threads
+    # (its own 128 syncing + the other's 128 arriving). A warpgroup syncs on its own barrier before
+    # issuing a block's GEMMs and arrives on the other's after, so one issues GEMMs while the other
+    # runs softmax.
+    bars = NamedBarriers()
+    sched = [bars.alloc(256), bars.alloc(256)]
+    assert sched[1].barrier_id == sched[0].barrier_id + 1
 
     @txl.kernel()
     def fa3_forward_sm90(
@@ -193,6 +205,22 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None):
             with txl.else_():
                 txl.ptx["setmaxnreg.inc.sync.aligned.u32"](240)
                 cw = wg - 1
+
+                def sched_sync():
+                    if pingpong:
+                        txl.ptx["bar.sync"](
+                            txl.cast(sched[0].barrier_id + cw, "uint32"), txl.uint32(256)
+                        )
+
+                def sched_arrive():
+                    if pingpong:
+                        txl.ptx["bar.arrive"](
+                            txl.cast(sched[0].barrier_id + 1 - cw, "uint32"), txl.uint32(256)
+                        )
+
+                if pingpong:  # warpgroup 1 issues first
+                    with txl.if_(cw == 1), txl.then_():
+                        txl.ptx["bar.arrive"](txl.uint32(sched[0].barrier_id), txl.uint32(256))
                 tw = tid & 127
                 lane0 = (tid & 31) == 0
                 s_acc = txl.alloc_local([QK.num_acc], "float32")
@@ -203,6 +231,7 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None):
                 l_run = txl.alloc_local([2], "float32")
                 alpha = txl.alloc_local([2], "float32")
                 mx = txl.alloc_local([2], "float32")
+                mc = txl.alloc_local([2], "float32")  # m * c
                 q_tile = W.SmemTile(q_s.ptr_to([cw * 64 * E]), rows=BM)
 
                 def k_tile(st):
@@ -223,18 +252,19 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None):
                     with txl.if_(lane0), txl.then_():
                         bar.arrive(st)
 
+                def fmax(dst, a, b):
+                    # max.f32 is one FMNMX; T.max lowers to a NaN-propagating FSETP/FSETP/FSEL triple
+                    txl.ptx["max.f32"](dst, a, b)
+
                 def softmax(first):
                     for h in range(2):
                         txl.assign(mx[h], T.float32(-math.inf) if first else m_run[h])
                     for r in range(QK.num_acc):
                         h = (r % 4) // 2
-                        txl.assign(mx[h], T.max(mx[h], s_acc[r]))
+                        fmax(mx[h], mx[h], s_acc[r])
                     for h in range(2):
                         for d in (1, 2):
-                            txl.assign(
-                                mx[h],
-                                T.max(mx[h], T.cuda.__shfl_xor_sync(T.uint32(FULL), mx[h], d, 32)),
-                            )
+                            fmax(mx[h], mx[h], T.cuda.__shfl_xor_sync(T.uint32(FULL), mx[h], d, 32))
                         if first:
                             txl.assign(alpha[h], T.float32(0.0))
                             txl.assign(l_run[h], T.float32(0.0))
@@ -242,9 +272,11 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None):
                             txl.assign(alpha[h], T.exp2((m_run[h] - mx[h]) * T.float32(SCALE_LOG2)))
                             txl.assign(l_run[h], l_run[h] * alpha[h])
                         txl.assign(m_run[h], mx[h])
+                        txl.assign(mc[h], mx[h] * T.float32(SCALE_LOG2))
                     for r in range(QK.num_acc):
                         h = (r % 4) // 2
-                        p = T.exp2((s_acc[r] - m_run[h]) * T.float32(SCALE_LOG2))
+                        # S c - m c: one FFMA feeding MUFU.EX2 (was FADD + FMUL)
+                        p = T.exp2(s_acc[r] * T.float32(SCALE_LOG2) - mc[h])
                         txl.assign(l_run[h], l_run[h] + p)
                         txl.assign(p_half[r], T.Cast("bfloat16", p))
 
@@ -258,7 +290,9 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None):
 
                 # first (highest) KV block: the only one masked (causal diagonal / KV tail)
                 k_full.wait(0, 0)
+                sched_sync()
                 qk_chain(0)
+                sched_arrive()
                 W.wait(0, (s_acc, QK.num_acc))
                 release(k_empty, 0)
                 j0 = n_blocks - 1
@@ -277,10 +311,12 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None):
                     st, ph = stage_phase(n)
                     pst, pph = stage_phase(n - 1)
                     k_full.wait(st, ph)
+                    sched_sync()
                     qk_chain(st)
                     rescale_o()
                     v_full.wait(pst, pph)
                     pv_chain(pst)
+                    sched_arrive()
                     W.wait(1, (s_acc, QK.num_acc))
                     release(k_empty, st)
                     softmax(False)
@@ -346,16 +382,18 @@ def tile_table(seq_lens, causal, device="cuda"):
     return torch.tensor(tiles, dtype=torch.int32, device=device).view(-1), len(tiles)
 
 
-def get_kernel(num_heads=None, causal=False, *, backend_config=None, **kwargs):
-    return make_kernel(num_heads, causal, backend_config=backend_config).func
+def get_kernel(num_heads=None, causal=False, *, backend_config=None, pingpong=None, **kwargs):
+    return make_kernel(num_heads, causal, backend_config=backend_config, pingpong=pingpong).func
 
 
 class Launcher:
     """Compiled kernel plus its host-side state for one (seq_lens, heads, causal) problem."""
 
-    def __init__(self, seq_lens, num_heads, causal, *, backend_config=None):
-        self.ex = compile_kernel(get_kernel(num_heads, causal, backend_config=backend_config),
-                                 backend_config=backend_config)  # fmt: skip
+    def __init__(self, seq_lens, num_heads, causal, *, backend_config=None, pingpong=None):
+        self.ex = compile_kernel(
+            get_kernel(num_heads, causal, backend_config=backend_config, pingpong=pingpong),
+            backend_config=backend_config,
+        )
         self.seq_lens, self.num_heads, self.causal = tuple(seq_lens), num_heads, causal
         self.cu = torch.tensor(
             [0, *torch.tensor(seq_lens).cumsum(0).tolist()], dtype=torch.int32, device="cuda"
