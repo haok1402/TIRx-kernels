@@ -300,8 +300,12 @@ def _kernel_args(input_data, weights, output):
     """Launch arguments for the kernel ``get_kernel`` returns for these tensors' device and shape.
 
     On Hopper (and a hidden size the sm_90 kernels take) the kernels also take a ticket counter,
-    zeroed here and returned to zero by every launch, and the grid; each argument tuple gets its
-    own counter, so launches that share it must be stream ordered.
+    zeroed here and returned to zero by every launch, and the grid.
+
+    **Do not launch one returned tuple concurrently**: not on two streams, and not from a CUDA graph
+    replayed concurrently with another launch of it. The launches would share the counter, and
+    their rows get corrupted. Sequential launches on one stream, and sequential graph replays, are
+    fine. Call this once per concurrent launch site; every call allocates its own counter.
     """
     batch_size, hidden_size = input_data.shape[0], input_data.shape[-1]
     args = (input_data.view(-1), weights, output.view(-1), batch_size)
@@ -309,7 +313,7 @@ def _kernel_args(input_data, weights, output):
         return args
     p = _sm90.plan(hidden_size, batch_size)
     grid = _sm90.grid_for(p, batch_size, hardware_num_sms(default=SM90_SM_COUNT))
-    ctr = torch.zeros(4, dtype=torch.uint32, device=input_data.device)
+    ctr = torch.zeros(2, dtype=torch.uint32, device=input_data.device)
     return (*args[:3], ctr, batch_size, grid)
 
 
@@ -357,7 +361,7 @@ def run_test(hidden_size, batch_size, *, backend_config=None, **kwargs):
     torch.cuda.synchronize()
     if len(args) > 4:
         counter = args[3].cpu().tolist()
-        assert counter == [0, 0, 0, 0], f"ticket counter not reset: {counter}"
+        assert counter == [0, 0], f"ticket counter not reset: {counter}"
     # FlashInfer's rmsnorm on the same inputs is the arbiter (the same library
     # the benchmark path compares against).
     import flashinfer
