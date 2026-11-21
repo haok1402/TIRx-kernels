@@ -45,6 +45,8 @@ BN = 128  # KV rows per block
 STAGES = 2
 E = 64  # bf16 elements per 128-byte swizzle row
 TMA3D = "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes"
+TMA3D_STORE = "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
+STMATRIX_X4 = "stmatrix.sync.aligned.m8n8.x4.shared.b16"
 FULL = 0xFFFFFFFF
 QK = W.WGMMA(BN, "bfloat16")  # S[64, BN] = Q[64, 128] K[BN, 128]^T
 PV = W.WGMMA(HEAD_DIM, "bfloat16", a_in_registers=True)  # O[64, 128] += P[64, BN] V[BN, 128]
@@ -107,12 +109,18 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None, pingpong=N
     bars = NamedBarriers()
     sched = [bars.alloc(256), bars.alloc(256)]
     assert sched[1].barrier_id == sched[0].barrier_id + 1
+    epi = [
+        bars.alloc(128),
+        bars.alloc(128),
+    ]  # per consumer warpgroup: O staged before its TMA store
+    assert epi[1].barrier_id == epi[0].barrier_id + 1
 
     @txl.kernel()
     def fa3_forward_sm90(
         Q_map: txl.Ptr(txl.TensorMap),
         K_map: txl.Ptr(txl.TensorMap),
         V_map: txl.Ptr(txl.TensorMap),
+        O_map: txl.Ptr(txl.TensorMap),
         O: txl.Tensor((txl.int64(),), "bfloat16"),
         cu_seqlens: txl.Tensor((txl.int64(),), "int32"),
         tiles: txl.Tensor((txl.int64(),), "int32"),
@@ -152,10 +160,9 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None, pingpong=N
             return value
 
         cta = txl.cta_id()
-        tile = cta // H
-        head = cta % H
-        batch = ldg_i32(tiles.ptr_to([2 * tile]))
-        m_blk = ldg_i32(tiles.ptr_to([2 * tile + 1]))
+        batch = ldg_i32(tiles.ptr_to([3 * cta]))
+        head = ldg_i32(tiles.ptr_to([3 * cta + 1]))
+        m_blk = ldg_i32(tiles.ptr_to([3 * cta + 2]))
         seq0 = ldg_i32(cu_seqlens.ptr_to([batch]))
         seq_len = txl.local_scalar("int32")
         txl.assign(seq_len, ldg_i32(cu_seqlens.ptr_to([batch + 1])) - seq0)
@@ -338,17 +345,63 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None, pingpong=N
                             l_run[h] + T.cuda.__shfl_xor_sync(T.uint32(FULL), l_run[h], d, 32),
                         )
                     txl.assign(alpha[h], T.float32(1.0) / l_run[h])
-                packed = txl.local_scalar("uint32")
-                for r in range(0, PV.num_acc, 2):
-                    row, col = W.acc_coord(tw, r)
-                    q_row = m_blk * BM + cw * 64 + row
-                    h = (r % 4) // 2
-                    with txl.if_(q_row < seq_len), txl.then_():
-                        txl.ptx["cvt.rn.bf16x2.f32"](
-                            packed, o_acc[r + 1] * alpha[h], o_acc[r] * alpha[h]
+                row0 = m_blk * BM + cw * 64  # this warpgroup's first Q row in the sequence
+                with txl.if_(row0 + 64 <= seq_len):
+                    # Whole 64 rows inside the sequence: stmatrix into this warpgroup's own 64-row slice
+                    # of the Q tile (only it reads those rows, and its last QK^T has retired), then one
+                    # TMA store per 64-column atom. A ragged tile's tail rows belong to the next
+                    # sequence, so partial tiles take the masked direct path below.
+                    with txl.then_():
+                        lane = tw & 31
+                        mat = lane >> 3
+                        srow = (tw >> 5) * 16 + (mat & 1) * 8 + (lane & 7)
+                        words = txl.alloc_local([4], "uint32")
+                        for p in range(PV.num_acc // 8):  # two 8-column chunks per stmatrix.x4
+                            for hh in range(2):
+                                r = (2 * p + hh) * 4
+                                txl.ptx["cvt.rn.bf16x2.f32"](
+                                    words[2 * hh], o_acc[r + 1] * alpha[0], o_acc[r] * alpha[0]
+                                )
+                                txl.ptx["cvt.rn.bf16x2.f32"](
+                                    words[2 * hh + 1],
+                                    o_acc[r + 3] * alpha[1],
+                                    o_acc[r + 2] * alpha[1],
+                                )
+                            col = (2 * p + (mat >> 1)) * 8
+                            chunk = ((col & 63) >> 3) ^ (srow & 7)  # 128B swizzle of 16-byte chunks
+                            txl.ptx[STMATRIX_X4](
+                                q_s.ptr_to([(col >> 6) * BM * E + (cw * 64 + srow) * E + chunk * 8]),
+                                words[0], words[1], words[2], words[3],
+                            )  # fmt: skip
+                        txl.ptx.fence.proxy.async_.shared__cta()
+                        txl.ptx["bar.sync"](
+                            txl.cast(epi[0].barrier_id + cw, "uint32"), txl.uint32(128)
                         )
-                        off = (txl.cast(seq0 + q_row, "int64") * H + head) * HEAD_DIM + col
-                        txl.ptx["st.global.b32"](O.ptr_to([off]), packed)
+                        with txl.if_(tw == 0), txl.then_():
+                            for a in range(HEAD_DIM // E):
+                                txl.ptx[TMA3D_STORE](
+                                    txl.address_of(O_map),
+                                    txl.int32(a * E),
+                                    head,
+                                    seq0 + row0,
+                                    q_s.ptr_to([a * BM * E + cw * 64 * E]),
+                                )
+                            txl.ptx.cp.async_.bulk.commit_group()
+                            txl.ptx.cp.async_.bulk.wait_group.read(
+                                0
+                            )  # shared memory outlives the read
+                    with txl.else_():
+                        packed = txl.local_scalar("uint32")
+                        for r in range(0, PV.num_acc, 2):
+                            row, col = W.acc_coord(tw, r)
+                            q_row = row0 + row
+                            h = (r % 4) // 2
+                            with txl.if_(q_row < seq_len), txl.then_():
+                                txl.ptx["cvt.rn.bf16x2.f32"](
+                                    packed, o_acc[r + 1] * alpha[h], o_acc[r] * alpha[h]
+                                )
+                                off = (txl.cast(seq0 + q_row, "int64") * H + head) * HEAD_DIM + col
+                                txl.ptx["st.global.b32"](O.ptr_to([off]), packed)
 
     return fa3_forward_sm90
 
@@ -374,11 +427,18 @@ def _tensor_map(t, box_rows):
     return desc
 
 
-def tile_table(seq_lens, causal, device="cuda"):
-    """(sequence, Q block) per CTA row. Causal: the blocks with the most KV blocks first."""
-    tiles = [(b, m) for b, n in enumerate(seq_lens) for m in range((n + BM - 1) // BM)]
-    if causal:
-        tiles.sort(key=lambda t: -t[1])
+def tile_table(seq_lens, num_heads, causal, device="cuda"):
+    """(sequence, head, Q block) per CTA, in launch order.
+
+    The Q blocks of one (sequence, head) are consecutive, so the CTAs in flight share a few heads'
+    K/V in L2. With heads innermost, about a hundred 2 MB K/V streams thrashed the 50 MB L2. Causal
+    tiles run longest first within each head (Q block descending), which also balances each wave.
+    """
+    tiles = []
+    for b, n in enumerate(seq_lens):
+        blocks = range((n + BM - 1) // BM)
+        for h in range(num_heads):
+            tiles.extend((b, h, m) for m in (reversed(blocks) if causal else blocks))
     return torch.tensor(tiles, dtype=torch.int32, device=device).view(-1), len(tiles)
 
 
@@ -398,17 +458,11 @@ class Launcher:
         self.cu = torch.tensor(
             [0, *torch.tensor(seq_lens).cumsum(0).tolist()], dtype=torch.int32, device="cuda"
         )
-        self.tiles, self.num_tiles = tile_table(seq_lens, causal)
+        self.tiles, self.num_tiles = tile_table(seq_lens, num_heads, causal)
 
     def bind(self, q, k, v, o):
-        maps = (_tensor_map(q, BM), _tensor_map(k, BN), _tensor_map(v, BN))
-        args = (
-            *[mp.ptr for mp in maps],
-            o.view(-1),
-            self.cu,
-            self.tiles,
-            self.num_tiles * self.num_heads,
-        )
+        maps = (_tensor_map(q, BM), _tensor_map(k, BN), _tensor_map(v, BN), _tensor_map(o, 64))
+        args = (*[mp.ptr for mp in maps], o.view(-1), self.cu, self.tiles, self.num_tiles)
 
         def run():
             self.ex(*args)
