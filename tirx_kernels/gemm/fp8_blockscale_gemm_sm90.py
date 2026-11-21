@@ -5,7 +5,7 @@
 
 ``D[M, N] = (A * sfa) @ (B * sfb)^T`` with
 * ``A`` e4m3 ``[M, K]`` and per-token scales ``sfa`` ``[M, K/128]`` (passed MN-major as
-  ``sfa_t = sfa.t()`` ``[K/128, M]`` so that TMA can load a CTA's 128 scales in one box),
+  ``sfa_mn_major(sfa)`` ``[K/128, align(M, 4)]`` so that TMA loads a CTA's 128 scales in one box),
 * ``B`` e4m3 ``[N, K]`` and per-block scales ``sfb`` ``[N/128, K/128]``,
 * ``D`` bf16 ``[M, N]``.
 
@@ -31,6 +31,19 @@ DEFAULT_CTAS = 132
 PRODUCER_REGS, CONSUMER_REGS = 24, 240
 
 
+def sfa_stride(M):
+    """Row stride of the MN-major A-scale tensor ``[K/128, M]``: M rounded up to 4 (16-byte TMA stride)."""
+    return -(-M // 4) * 4
+
+
+def sfa_mn_major(sfa):
+    """``sfa [M, K/128]`` -> ``[K/128, sfa_stride(M)]`` (zero-padded), the layout the kernel loads."""
+    M, kb = sfa.shape
+    out = torch.zeros(kb, sfa_stride(M), dtype=torch.float32, device=sfa.device)
+    out[:, :M] = sfa.t()
+    return out
+
+
 def _stages(bn):
     # per stage: A 16 KB + B bn*128 B + 512 B of A-scales; C staging 2 x 64 x bn x 2 B; <= 227 KB
     per_stage = BM * BK + bn * BK + BM * 4
@@ -38,7 +51,9 @@ def _stages(bn):
     return min(6, (227 * 1024 - c_bytes - 1024) // per_stage)
 
 
-def make_kernel(M: int, N: int, K: int, *, bn: int = 128, num_ctas: int = DEFAULT_CTAS, backend_config=None):
+def make_kernel(
+    M: int, N: int, K: int, *, bn: int = 128, num_ctas: int = DEFAULT_CTAS, backend_config=None, _promote: bool = True
+):
     from tvm_tirx.backend.cuda.lang import NamedBarriers, SMEMPool
     from tvm_tirx.backend.cuda.lang import wgmma as W
     from tvm_tirx.backend.cuda.lang.pipeline import MBarrier, TMABar
@@ -46,9 +61,10 @@ def make_kernel(M: int, N: int, K: int, *, bn: int = 128, num_ctas: int = DEFAUL
 
     if bn % 64 or not 64 <= bn <= 256:
         raise ValueError(f"bn must be a multiple of 64 in [64, 256], got {bn}")
-    if M % BM:
-        raise ValueError(f"M must be a multiple of {BM}, got {M}")
+    if min(M, N, K) < 1 or N % 8 or K % 16:
+        raise ValueError(f"need N % 8 == 0 and K % 16 == 0 (TMA strides); got {M}x{N}x{K}")
     STAGES = _stages(bn)
+    MS = sfa_stride(M)
     MT, NT = -(-M // BM), -(-N // bn)
     KB = -(-K // BK)  # K blocks (the last may be partial: TMA zero-fills)
     NB = -(-N // 128)  # 128-wide scale blocks of N
@@ -66,10 +82,14 @@ def make_kernel(M: int, N: int, K: int, *, bn: int = 128, num_ctas: int = DEFAUL
     stm = "stmatrix.sync.aligned.m8n8.x4.shared.b16"
     c_blocks = bn // 64
     entry_kw = {} if backend_config is None else {"backend_config": backend_config}
+    # Tile starts n_blk * bn hit the 128-column sfb grid at a fixed offset when bn % 128 == 0 or 128 % bn == 0,
+    # so which sfb block each 8-column group uses is a compile-time fact; otherwise (e.g. bn = 192) it is not.
+    static_split = bn % 128 == 0 or 128 % bn == 0
+    no_promote = not _promote
 
     # fmt: off
     @T.function
-    def main(A: T.Tensor((M, K), "float8_e4m3fn", align=16), SFA: T.Tensor((KB, M), "float32", align=16),
+    def main(A: T.Tensor((M, K), "float8_e4m3fn", align=16), SFA: T.Tensor((KB, MS), "float32", align=16),
              B: T.Tensor((N, K), "float8_e4m3fn", align=16), SFB: T.Tensor((NB, KB), "float32", align=16),
              D: T.Tensor((M, N), "bfloat16", align=16)):
         A_map: T.let[T.handle("tensormap")] = T.stack_alloca("tensormap", 1)
@@ -77,7 +97,7 @@ def make_kernel(M: int, N: int, K: int, *, bn: int = 128, num_ctas: int = DEFAUL
         B_map: T.let[T.handle("tensormap")] = T.stack_alloca("tensormap", 1)
         T.call_packed("runtime.cuTensorMapEncodeTiled", B_map, "float8_e4m3fn", 2, B.data, K, N, K, BK, bn, 1, 1, 0, 3, 2, 0)
         S_map: T.let[T.handle("tensormap")] = T.stack_alloca("tensormap", 1)
-        T.call_packed("runtime.cuTensorMapEncodeTiled", S_map, "float32", 2, SFA.data, M, KB, M * 4, BM, 1, 1, 1, 0, 0, 2, 0)
+        T.call_packed("runtime.cuTensorMapEncodeTiled", S_map, "float32", 2, SFA.data, MS, KB, MS * 4, BM, 1, 1, 1, 0, 0, 2, 0)
         D_map: T.let[T.handle("tensormap")] = T.stack_alloca("tensormap", 1)
         T.call_packed("runtime.cuTensorMapEncodeTiled", D_map, "bfloat16", 2, D.data, N, M, N * 2, 64, 64, 1, 1, 0, 3, 2, 0)
         T.device_entry(launch=T.cuda.LaunchConfig(grid=num_ctas, block=384),
@@ -130,6 +150,7 @@ def make_kernel(M: int, N: int, K: int, *, bn: int = 128, num_ctas: int = DEFAUL
             ct = tx % 128
             acc = T.alloc_tensor(ty_args=[T.Tensor((acc_n,), "float32", scope="local")])
             tmp = T.alloc_tensor(ty_args=[T.Tensor((acc_n,), "float32", scope="local")])
+            sc = T.alloc_local([8], "float32")  # sa0, sa1, the four scale products, sb0, sb1
             da0 = W.smem_descriptor(A_s.ptr_to([0, wg * 64, 0]))
             db0 = W.smem_descriptor(B_s.ptr_to([0, 0, 0]))
             r0 = (ct // 32) * 16 + (ct % 32) // 4  # this thread's rows: r0 and r0 + 8 of its 64
@@ -143,33 +164,45 @@ def make_kernel(M: int, N: int, K: int, *, bn: int = 128, num_ctas: int = DEFAUL
                     n_blk = (t % (GROUP_M * NT)) // gsize
                     for i in T.unroll(acc_n):
                         acc[i] = T.float32(0.0)
+                    nb0 = (n_blk * bn) // 128
+                    split = 128 - (n_blk * bn) % 128  # tile column where sfb block nb0 + 1 starts
                     for kb in T.serial(KB):
                         stage = it[0] % STAGES
+                        # sfb is tiny and L1/L2-resident: load before waiting so its latency hides
+                        sc[6] = SFB[nb0, kb]
+                        sc[7] = SFB[T.min(nb0 + 1, NB - 1), kb]
                         full.wait(stage, (it[0] // STAGES) & 1)
                         a0 = W.advance_descriptor(da0, stage * a_stage_bytes)
                         b0 = W.advance_descriptor(db0, stage * b_stage_bytes)
-                        W.chain(op, tmp, [a_tile.k_step(op, s, a0) for s in range(k_steps)],
-                                [b_tile.k_step(op, s, b0) for s in range(k_steps)], accumulate=False)
-                        W.wait(0, (tmp, acc_n))
-                        sa0 = S_s[stage, wg * 64 + r0]
-                        sa1 = S_s[stage, wg * 64 + r0 + 8]
+                        # DeepGEMM order: read the A scales and form the products before waiting on the
+                        # chain, so their latency hides under the MMAs.
+                        sc[0] = S_s[stage, wg * 64 + r0]
+                        sc[1] = S_s[stage, wg * 64 + r0 + 8]
+                        if T.constexpr(no_promote):  # upper-bound experiment only: plain fp8 GEMM, no scales
+                            W.chain(op, acc, [a_tile.k_step(op, s, a0) for s in range(k_steps)],
+                                    [b_tile.k_step(op, s, b0) for s in range(k_steps)], accumulate=True)
+                        else:
+                            W.chain(op, tmp, [a_tile.k_step(op, s, a0) for s in range(k_steps)],
+                                    [b_tile.k_step(op, s, b0) for s in range(k_steps)], accumulate=False)
+                        sc[2] = sc[0] * sc[6]
+                        sc[3] = sc[0] * sc[7]
+                        sc[4] = sc[1] * sc[6]
+                        sc[5] = sc[1] * sc[7]
+                        if T.constexpr(no_promote):
+                            W.wait(0, (acc, acc_n))
+                        else:
+                            W.wait(0, (tmp, acc_n))
                         if ct == 0:
                             empty.arrive(stage)
-                        # promotion: acc += tmp * sfa[row] * sfb[128-column block of the column].
-                        # A bn-wide tile spans at most two sfb blocks (nb0, nb0 + 1); `split` is the
-                        # tile column where the second one starts.
-                        nb0 = (n_blk * bn) // 128
-                        split = 128 - (n_blk * bn) % 128
-                        sb0 = SFB[nb0, kb]
-                        sb1 = SFB[T.min(nb0 + 1, NB - 1), kb]
-                        s00 = sa0 * sb0
-                        s01 = sa0 * sb1
-                        s10 = sa1 * sb0
-                        s11 = sa1 * sb1
-                        for c in T.unroll(bn // 8):
-                            first = c * 8 < split
-                            lo = T.Select(first, s00, s01)  # rows r0
-                            hi = T.Select(first, s10, s11)  # rows r0 + 8
+                        # promotion: acc += tmp * sfa[row] * sfb[128-column block of the column]; a bn-wide
+                        # tile spans at most two sfb blocks (nb0, nb0 + 1)
+                        for c in T.unroll(0 if no_promote else bn // 8):
+                            if T.constexpr(static_split):
+                                first = c * 8 < 128
+                            else:
+                                first = c * 8 < split
+                            lo = T.Select(first, sc[2], sc[3])  # rows r0
+                            hi = T.Select(first, sc[4], sc[5])  # rows r0 + 8
                             acc[c * 4] = acc[c * 4] + tmp[c * 4] * lo
                             acc[c * 4 + 1] = acc[c * 4 + 1] + tmp[c * 4 + 1] * lo
                             acc[c * 4 + 2] = acc[c * 4 + 2] + tmp[c * 4 + 2] * hi
@@ -201,7 +234,6 @@ def make_kernel(M: int, N: int, K: int, *, bn: int = 128, num_ctas: int = DEFAUL
             if ct == 0:
                 T.ptx.cp.async_.bulk.wait_group(0)
     # fmt: on
-    _ = bars
     return main
 
 
@@ -278,6 +310,6 @@ def get_kernel(M, N, K, *, backend_config=None, **kwargs):
 def run_test(M, N, K, *, backend_config=None, **kwargs):
     a8, sfa, b8, sfb, d = prepare_data(M, N, K)
     ex = compile_persistent(M, N, K, backend_config=backend_config)
-    ex(a8, sfa.t().contiguous(), b8, sfb, d)
+    ex(a8, sfa_mn_major(sfa), b8, sfb, d)
     diff = calc_diff(d, reference(a8, sfa, b8, sfb))
     assert diff < 1e-3, f"calc_diff {diff}"
