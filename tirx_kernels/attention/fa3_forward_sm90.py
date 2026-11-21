@@ -76,6 +76,16 @@ CONFIGS = [
         ("b2_s2048", (2048, 2048), 4),
     ]
     for causal in (False, True)
+] + [
+    # B3 gate shapes (plan section B3; FlashInfer FA3 is the bench reference)
+    {
+        "seq_lens": (s,) * b,
+        "num_heads": h,
+        "causal": causal,
+        "label": f"gate_b{b}_h{h}_s{s}_{'causal' if causal else 'full'}",
+    }
+    for b, h, s in [(4, 16, 4096), (2, 16, 8192), (1, 16, 16384), (8, 16, 4096), (4, 32, 8192)]
+    for causal in (False, True)
 ]
 
 
@@ -447,28 +457,43 @@ def get_kernel(num_heads=None, causal=False, *, backend_config=None, pingpong=No
 
 
 class Launcher:
-    """Compiled kernel plus its host-side state for one (seq_lens, heads, causal) problem."""
+    """The compiled kernel for one (heads, causal); ``bind`` specializes it to tensors and lengths.
 
-    def __init__(self, seq_lens, num_heads, causal, *, backend_config=None, pingpong=None):
+    Construction only compiles (no CUDA allocation), so ``prepare_bench`` can build it before the
+    workload receives a GPU.
+    """
+
+    def __init__(self, num_heads, causal, *, backend_config=None, pingpong=None):
         self.ex = compile_kernel(
             get_kernel(num_heads, causal, backend_config=backend_config, pingpong=pingpong),
             backend_config=backend_config,
         )
-        self.seq_lens, self.num_heads, self.causal = tuple(seq_lens), num_heads, causal
-        self.cu = torch.tensor(
-            [0, *torch.tensor(seq_lens).cumsum(0).tolist()], dtype=torch.int32, device="cuda"
-        )
-        self.tiles, self.num_tiles = tile_table(seq_lens, num_heads, causal)
+        self.num_heads, self.causal = num_heads, causal
 
-    def bind(self, q, k, v, o):
+    def bind(self, q, k, v, o, seq_lens):
+        """A zero-argument launch of attention over ragged ``q, k, v`` into ``o``.
+
+        ``seq_lens``: one length per sequence, summing to ``q.shape[0]``.
+        """
+        seq_lens = tuple(int(n) for n in seq_lens)
+        if sum(seq_lens) != q.shape[0] or q.shape[1] != self.num_heads:
+            raise ValueError(f"seq_lens {seq_lens} / heads do not match q {tuple(q.shape)}")
+        cu = cu_seqlens(seq_lens, q.device)
+        tiles, num_tiles = tile_table(seq_lens, self.num_heads, self.causal, q.device)
         maps = (_tensor_map(q, BM), _tensor_map(k, BN), _tensor_map(v, BN), _tensor_map(o, 64))
-        args = (*[mp.ptr for mp in maps], o.view(-1), self.cu, self.tiles, self.num_tiles)
+        args = (*[mp.ptr for mp in maps], o.view(-1), cu, tiles, num_tiles)
 
         def run():
             self.ex(*args)
 
-        run.maps = maps  # keep the host tensor maps alive with the closure
+        run.keepalive = (maps, cu, tiles)  # the host tensor maps and metadata outlive the closure
         return run
+
+
+def cu_seqlens(seq_lens, device="cuda"):
+    return torch.tensor(
+        [0, *torch.tensor(seq_lens).cumsum(0).tolist()], dtype=torch.int32, device=device
+    )
 
 
 def prepare_data(seq_lens, num_heads, **kwargs: Any):
@@ -497,8 +522,68 @@ def reference(q, k, v, seq_lens, causal):
 def run_test(seq_lens, num_heads, causal, *, backend_config=None, **kwargs):
     q, k, v = prepare_data(seq_lens, num_heads)
     o = torch.full_like(q, float("nan"))
-    run = Launcher(seq_lens, num_heads, causal, backend_config=backend_config).bind(q, k, v, o)
+    run = Launcher(num_heads, causal, backend_config=backend_config).bind(q, k, v, o, seq_lens)
     run()
     torch.cuda.synchronize()
     ref = reference(q, k, v, seq_lens, causal)
     torch.testing.assert_close(o.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+# --------------------------------------------------------------------------- benchmarking
+def _fa3_reference(q, k, v, seq_lens, num_heads, causal):
+    """FA3 (FlashInfer ``backend="fa3"``, batch ragged prefill) on the same tensors, planned untimed."""
+    import flashinfer
+
+    workspace = torch.empty(512 << 20, dtype=torch.uint8, device=q.device)
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace, "NHD", backend="fa3")
+    cu = cu_seqlens(seq_lens, q.device)
+    wrapper.plan(cu, cu, num_heads, num_heads, HEAD_DIM, causal=causal, q_data_type=torch.bfloat16)
+    return lambda: wrapper.run(q, k, v)
+
+
+def prepare_bench(*, backend_config=None, **kwargs: Any):
+    """Compile before the workload receives a GPU."""
+    from tirx_kernels.runner import prepared_gpu_benchmark
+
+    cfg = {key: kwargs[key] for key in ("seq_lens", "num_heads", "causal")}
+    state = {
+        "config": cfg,
+        "launcher": Launcher(cfg["num_heads"], cfg["causal"], backend_config=backend_config),
+    }
+    return prepared_gpu_benchmark(run_gpu, state, backend_config=backend_config)
+
+
+def run_gpu(prepared, *, warmup=None, repeat=None, timer=None, backend_config=None, **kwargs):
+    """Allocate and measure after GPU assignment; FA3 is the reference."""
+    from tirx_kernels.runner import bench
+
+    cfg = prepared["config"]
+    seq_lens, num_heads, causal = cfg["seq_lens"], cfg["num_heads"], cfg["causal"]
+    q, k, v = prepare_data(seq_lens, num_heads)
+    o = torch.empty_like(q)
+    run = prepared["launcher"].bind(q, k, v, o, seq_lens)
+    return bench(
+        {"tir": run},
+        warmup=warmup,
+        repeat=repeat,
+        timer=timer,
+        references={"fa3": lambda: _fa3_reference(q, k, v, seq_lens, num_heads, causal)},
+        **kwargs,
+    )
+
+
+def run_bench(
+    seq_lens,
+    num_heads,
+    causal,
+    warmup=None,
+    repeat=None,
+    timer=None,
+    *,
+    backend_config=None,
+    **kwargs,
+):
+    """Standalone wrapper over the same explicit prepare and GPU stages."""
+    return prepare_bench(
+        seq_lens=seq_lens, num_heads=num_heads, causal=causal, backend_config=backend_config
+    ).run_gpu(warmup=warmup, repeat=repeat, timer=timer, **kwargs)
