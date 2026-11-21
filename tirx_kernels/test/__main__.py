@@ -43,6 +43,11 @@ def main():
     parser.add_argument("--json", action="store_true", help="Output JSON results")
     parser.add_argument("--arch", type=str, default=None, help="Exact CUDA architecture filter")
     parser.add_argument(
+        "--allow-all-skipped",
+        action="store_true",
+        help="exit 0 even when every selected config was skipped (default: exit 3)",
+    )
+    parser.add_argument(
         "--num-gpus",
         type=int,
         default=None,
@@ -102,10 +107,21 @@ def main():
             print(f"ERROR: {message}", file=sys.stderr)
         sys.exit(2)
 
+    # Skips are not passes. A run whose every config skipped (e.g. an unmet reference requirement
+    # such as a pinned FlashInfer or CUTLASS DSL version) verified nothing, so it must not look green.
+    reasons = sorted({r["reason"] for r in results if r["status"] == "SKIP"})
+    all_skipped = skipped > 0 and passed == 0 and failed == 0
     if args.json:
         print(
             json.dumps(
-                {"passed": passed, "failed": failed, "skipped": skipped, "results": results},
+                {
+                    "passed": passed,
+                    "failed": failed,
+                    "skipped": skipped,
+                    "skip_reasons": reasons,
+                    "all_skipped": all_skipped,
+                    "results": results,
+                },
                 indent=2,
             )
         )
@@ -115,8 +131,19 @@ def main():
             f"Total: {passed + failed + skipped}  "
             f"Passed: {passed}  Failed: {failed}  Skipped: {skipped}"
         )
+        for reason in reasons:
+            count = sum(r.get("reason") == reason for r in results)
+            print(f"  skipped {count}x: {reason}")
+        if all_skipped:
+            print(
+                "ERROR: every selected config was skipped, so nothing was verified "
+                "(pass --allow-all-skipped to accept this)",
+                file=sys.stderr,
+            )
 
-    sys.exit(1 if failed > 0 else 0)
+    if failed > 0:
+        sys.exit(1)
+    sys.exit(3 if all_skipped and not args.allow_all_skipped else 0)
 
 
 if __name__ == "__main__":
