@@ -51,19 +51,58 @@ def _case(num_groups, expected_m_per_group, n, k, *, use_psum=False, seed=0) -> 
     }
 
 
+#: The PSUM half of `test_m_grouped_gemm_masked` (`enumerate_m_grouped_masked`, `max_m = 4096`):
+#: masked operands packed into PSUM layout, run by this kernel with
+#: `expected_m_for_psum_layout = int(expected_m_per_group * 1.2)`.
+_MASKED_GROUPS = [(32, 192), (6, 1024), (32, 20), (6, 20)]
+
+
+def _from_masked_case(num_groups, expected_m_per_group, n, k, *, seed=0) -> dict:
+    return {
+        "label": f"g{num_groups}_m{expected_m_per_group}_n{n}_k{k}_psum_from_masked",
+        "num_groups": num_groups,
+        "expected_m_per_group": expected_m_per_group,
+        "N": n,
+        "K": k,
+        "use_psum_layout": True,
+        "from_masked": True,
+        "max_m": 4096,
+        "seed": seed,
+    }
+
+
 CONFIGS = [
-    _case(g, m, n, k, use_psum=psum, seed=i)
-    for i, (psum, (g, m), (n, k)) in enumerate(
-        [(psum, gm, nk) for psum in (False, True) for gm in _GROUPS for nk in _NK], start=1
-    )
+    *[
+        _case(g, m, n, k, use_psum=psum, seed=i)
+        for i, (psum, (g, m), (n, k)) in enumerate(
+            [(psum, gm, nk) for psum in (False, True) for gm in _GROUPS for nk in _NK], start=1
+        )
+    ],
+    *[
+        _from_masked_case(g, m, n, k, seed=100 + i)
+        for i, ((g, m), (n, k)) in enumerate([(gm, nk) for gm in _MASKED_GROUPS for nk in _NK])
+    ],
 ]
 
 
 def make_desc(
-    *, num_groups, expected_m_per_group, N, K, use_psum_layout=False, seed=0, num_sms=None
+    *,
+    num_groups,
+    expected_m_per_group,
+    N,
+    K,
+    use_psum_layout=False,
+    from_masked=False,
+    max_m=4096,
+    seed=0,
+    num_sms=None,
 ):
-    """The descriptor `sm90_m_grouped_fp8_gemm_contiguous_1d2d` builds (`expected_m = m`,
-    `expected_num_groups = 1`: the source test never passes `expected_m_for_psum_layout`)."""
+    """The descriptor `sm90_m_grouped_fp8_gemm_contiguous_1d2d` builds.
+
+    Without `expected_m_for_psum_layout` (the contiguous test) `expected_m = m` and
+    `expected_num_groups = 1`; with it (the masked test's PSUM half) `expected_m` is that value
+    and `expected_num_groups = num_groups` (`sm90_fp8_gemm_1d2d.hpp:157-170`).
+    """
     from tirx_kernels.runner import hardware_num_sms
 
     from ._sm90_fp8_gemm_1d2d.spec import MK_ALIGNMENT, GemmDesc, GemmType, align_up
@@ -71,6 +110,19 @@ def make_desc(
 
     if num_sms is None:
         num_sms = hardware_num_sms()
+    if from_masked:
+        return GemmDesc(
+            GemmType.M_GROUPED_CONTIGUOUS_WITH_PSUM_LAYOUT,
+            m=num_groups * max_m,
+            n=N,
+            k=K,
+            num_groups=num_groups,
+            num_sms=num_sms,
+            expected_m=int(expected_m_per_group * 1.2),
+            expected_n=N,
+            expected_k=K,
+            expected_num_groups=num_groups,
+        )
     m = sum(
         align_up(x, MK_ALIGNMENT) for x in make_actual_ms(num_groups, expected_m_per_group, seed)
     )
@@ -105,9 +157,16 @@ def get_kernel(*, backend_config=None, **config):
 
 
 def prepare_data(**config):
-    from ._sm90_fp8_gemm_1d2d.data import prepare_m_grouped_contiguous
+    from ._sm90_fp8_gemm_1d2d.data import (
+        prepare_m_grouped_contiguous,
+        prepare_m_grouped_contiguous_psum_from_masked,
+    )
 
     config.pop("label", None)
+    if config.pop("from_masked", False):
+        config.pop("use_psum_layout", None)
+        return prepare_m_grouped_contiguous_psum_from_masked(**config)
+    config.pop("max_m", None)
     return prepare_m_grouped_contiguous(**config)
 
 
