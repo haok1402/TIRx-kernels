@@ -9,6 +9,7 @@ from typing import Any
 import torch
 
 import tirx_kernels.tirx_lite as txl
+from tirx_kernels.norm import _rmsnorm_sm90 as _sm90
 from tirx_kernels.runner import bench, hardware_num_sms, resolve_backend_config
 
 eps = 1e-6
@@ -52,6 +53,10 @@ CONFIGS = [
     {"hidden_size": hs, "batch_size": bs, "label": f"hs{hs}_bs{bs}"}
     for hs in [128, 4096, 5120, 8192]
     for bs in [1, 2, 4, 8, 16, 32, 64, 128, 4113]
+] + [
+    # the large-batch regime (the sm_90 ticket ring, incl. its >8192-row configuration)
+    {"hidden_size": hs, "batch_size": 16384, "label": f"hs{hs}_bs16384"}
+    for hs in [4096, 5120, 8192]
 ]
 
 
@@ -270,18 +275,10 @@ def make_kernel(hidden_size: int, *, backend_config=None):
                 # when this lane is past the end (orig:L784-799). Only the
                 # loads and the store are predicated.
                 for pair in range(vec // 2):
-                    scale_pair(
-                        xf,
-                        pair,
-                        (xv[2 * pair], xv[2 * pair + 1]),
-                        (rms, rms),
-                    )
+                    scale_pair(xf, pair, (xv[2 * pair], xv[2 * pair + 1]), (rms, rms))
                 for pair in range(vec // 2):
                     scale_pair(
-                        xf,
-                        pair,
-                        (xf[2 * pair], xf[2 * pair + 1]),
-                        (wf[2 * pair], wf[2 * pair + 1]),
+                        xf, pair, (xf[2 * pair], xf[2 * pair + 1]), (wf[2 * pair], wf[2 * pair + 1])
                     )
                 with txl.if_(st < hidden_size), txl.then_():
                     for pair in range(vec // 2):
@@ -295,11 +292,36 @@ def make_kernel(hidden_size: int, *, backend_config=None):
     return rmsnorm
 
 
+def _sm90_device(tensor) -> bool:
+    return tensor.is_cuda and torch.cuda.get_device_capability(tensor.device)[0] == 9
+
+
 def _kernel_args(input_data, weights, output):
-    return input_data.view(-1), weights, output.view(-1), input_data.shape[0]
+    """Launch arguments for the kernel ``get_kernel`` returns for these tensors' device and shape.
+
+    On Hopper (and a hidden size the sm_90 kernels take) the kernels also take a ticket counter,
+    zeroed here and returned to zero by every launch, and the grid; each argument tuple gets its
+    own counter, so launches that share it must be stream ordered.
+    """
+    batch_size, hidden_size = input_data.shape[0], input_data.shape[-1]
+    args = (input_data.view(-1), weights, output.view(-1), batch_size)
+    if not (_sm90_device(input_data) and _sm90.supported(hidden_size)):
+        return args
+    p = _sm90.plan(hidden_size, batch_size)
+    grid = _sm90.grid_for(p, batch_size, hardware_num_sms(default=SM90_SM_COUNT))
+    ctr = torch.zeros(4, dtype=torch.uint32, device=input_data.device)
+    return (*args[:3], ctr, batch_size, grid)
 
 
-def get_kernel(hidden_size, *, backend_config=None, **kwargs):
+def get_kernel(hidden_size, batch_size=None, *, backend_config=None, **kwargs):
+    """The kernel for ``hidden_size`` (and, on sm_90, ``batch_size``'s plan; any batch runs on it).
+
+    sm_90: the H200-evolved kernels of ``_rmsnorm_sm90`` (register kernel up to 1024 rows,
+    persistent ticket ring above), with this module's original sm_90 port for hidden sizes they do
+    not take (e.g. 128).
+    """
+    if _is_sm90(backend_config) and _sm90.supported(hidden_size):
+        return _sm90.make_kernel(hidden_size, _sm90.plan(hidden_size, batch_size)).func
     return make_kernel(hidden_size, backend_config=backend_config).func
 
 
@@ -323,11 +345,19 @@ def run_test(hidden_size, batch_size, *, backend_config=None, **kwargs):
     from tirx_kernels.runner import compile_kernel
 
     input_data, weights = prepare_data(batch_size, hidden_size)
-    kernel = get_kernel(hidden_size, backend_config=backend_config)
+    kernel = get_kernel(hidden_size, batch_size, backend_config=backend_config)
     ex = compile_kernel(kernel, backend_config=backend_config)
     output_tir = torch.empty((batch_size, hidden_size), dtype=torch.float16, device="cuda")
-    ex(*_kernel_args(input_data, weights, output_tir))
+    args = _kernel_args(input_data, weights, output_tir)
+    # Launch repeatedly on one argument tuple: the sm_90 ring's ticket counter must come back to
+    # zero after every launch, or a later launch skips rows (NaN-filled first, so a skipped row fails).
+    for _ in range(3):
+        output_tir.fill_(float("nan"))
+        ex(*args)
     torch.cuda.synchronize()
+    if len(args) > 4:
+        counter = args[3].cpu().tolist()
+        assert counter == [0, 0, 0, 0], f"ticket counter not reset: {counter}"
     # FlashInfer's rmsnorm on the same inputs is the arbiter (the same library
     # the benchmark path compares against).
     import flashinfer
