@@ -473,31 +473,44 @@ def run_test(M, N, K, *, backend_config=None, **kwargs):
     check_output(d, a8, sfa, b8, sfb)
 
 
-def check_output(d, a8, sfa, b8, sfb):
-    """Aggregate, element-wise and (with DeepGEMM installed) bitwise checks of a kernel output."""
+# Bitwise parity with DeepGEMM's sm90 1D2D kernel (same recipe, same per-k-block fp32 promotion order) is
+# an invariant of this kernel *as written*: every config is bit-identical today. It is opt-in, because a
+# change that alters rounding (split-K, another promotion grouping) may be more accurate and still differ.
+BITWISE_DEEPGEMM_ENV = "TIRX_FP8_GEMM_SM90_BITWISE_DEEPGEMM"
+
+
+def check_output(d, a8, sfa, b8, sfb, *, bitwise_deepgemm=None):
+    """Aggregate and element-wise checks of a kernel output, plus (opt-in) bitwise parity with DeepGEMM.
+
+    ``bitwise_deepgemm``: None reads ``$TIRX_FP8_GEMM_SM90_BITWISE_DEEPGEMM`` (default off); True requires
+    DeepGEMM to be installed.
+    """
+    import os
+
     ref = reference(a8, sfa, b8, sfb, out_dtype=torch.float64)
-    # DeepGEMM's aggregate criterion ...
-    diff = calc_diff(d, ref)
-    assert diff < 1e-3, f"calc_diff {diff}"
-    # ... and an element-wise one (calc_diff alone would pass a few wrong rows): one bf16 ulp of the exact
-    # result, plus the fp8 tensor-core accumulation error inside a 128-wide k-block, which scales with
-    # |A| @ |B|^T (~2^-15 of it measured; 2^-12 allowed). A wrong element is off by O(|ref|) ~ sqrt(K) x
-    # that floor's scale / 2^-12, far outside it.
-    bound = 2.0**-8 * ref.abs() + 2.0**-12 * reference(
+    # Element-wise first (DeepGEMM's aggregate calc_diff alone passes a few wrong rows or elements): one bf16 ulp of the
+    # exact result (2^-7 |ref|), plus the fp8 tensor-core accumulation error inside a 128-wide k-block, which
+    # scales with |A| @ |B|^T (~2^-15 of it measured; 2^-12 allowed). Written as ~(err <= bound) so that
+    # NaN and Inf fail here too.
+    bound = 2.0**-7 * ref.abs() + 2.0**-12 * reference(
         a8, sfa, b8, sfb, out_dtype=torch.float64, absolute=True
     )
-    bad = (d.double() - ref).abs() > bound
+    bad = ~((d.double() - ref).abs() <= bound)
     if bad.any():
         r, c = (int(x) for x in bad.nonzero()[0])
         raise AssertionError(
             f"{int(bad.sum())} of {d.numel()} outputs out of tolerance (rows {int(bad.any(1).sum())}); "
             f"first at ({r}, {c}): got {float(d[r, c])}, expected {float(ref[r, c])}"
         )
-    try:
-        import deep_gemm
-    except ImportError:
+    # ... then DeepGEMM's aggregate criterion.
+    diff = calc_diff(d, ref)
+    assert diff < 1e-3, f"calc_diff {diff}"
+    if bitwise_deepgemm is None:
+        bitwise_deepgemm = os.environ.get(BITWISE_DEEPGEMM_ENV, "0") == "1"
+    if not bitwise_deepgemm:
         return
-    # Same recipe and the same per-k-block fp32 promotion as DeepGEMM's sm90 1D2D kernel: bit-identical output.
+    import deep_gemm
+
     d_ref = torch.empty_like(d)
     deep_gemm.fp8_gemm_nt((a8, deep_gemm.get_mn_major_tma_aligned_tensor(sfa)), (b8, sfb), d_ref)
     mismatches = int((d.view(torch.int16) != d_ref.view(torch.int16)).sum())
