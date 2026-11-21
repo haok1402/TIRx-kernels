@@ -409,17 +409,21 @@ def prepare_data(M, N, K):
     return a8, sfa, b8, sfb, d
 
 
-def reference(a8, sfa, b8, sfb):
+def reference(a8, sfa, b8, sfb, out_dtype=torch.bfloat16, absolute=False):
+    """Dequantize and multiply in float64: an fp32 torch matmul may run in TF32, whose input rounding
+    (dequantized operands are not TF32-exact) is larger than the kernel's own error. ``absolute=True``
+    gives ``|A| @ |B|^T``, the scale of the accumulation error."""
     M, K = a8.shape
     N = b8.shape[0]
     kb = sfa.shape[1]
-    ap = torch.zeros(M, kb * 128, device=a8.device)
-    ap[:, :K] = a8.float()
-    bp = torch.zeros(-(-N // 128) * 128, kb * 128, device=a8.device)
-    bp[:N, :K] = b8.float()
-    ap = (ap.view(M, kb, 128) * sfa.unsqueeze(-1)).view(M, -1)
-    bp = (bp.view(-1, 128, kb, 128) * sfb[:, None, :, None]).view(bp.shape)
-    return (ap @ bp[:N].t()).to(torch.bfloat16)
+    f64 = torch.float64
+    ap = torch.zeros(M, kb * 128, device=a8.device, dtype=f64)
+    ap[:, :K] = a8.to(f64).abs() if absolute else a8.to(f64)
+    bp = torch.zeros(-(-N // 128) * 128, kb * 128, device=a8.device, dtype=f64)
+    bp[:N, :K] = b8.to(f64).abs() if absolute else b8.to(f64)
+    ap = (ap.view(M, kb, 128) * sfa.to(f64).unsqueeze(-1)).view(M, -1)
+    bp = (bp.view(-1, 128, kb, 128) * sfb.to(f64)[:, None, :, None]).view(bp.shape)
+    return (ap @ bp[:N].t()).to(out_dtype)
 
 
 def calc_diff(x, y):
@@ -466,8 +470,38 @@ def run_test(M, N, K, *, backend_config=None, **kwargs):
     ex = compile_persistent(M, N, K, backend_config=backend_config)
     d.fill_(float("nan"))  # every element, tails included, must be written
     ex(a8, sfa_mn_major(sfa), b8, sfb, d)
-    diff = calc_diff(d, reference(a8, sfa, b8, sfb))
+    check_output(d, a8, sfa, b8, sfb)
+
+
+def check_output(d, a8, sfa, b8, sfb):
+    """Aggregate, element-wise and (with DeepGEMM installed) bitwise checks of a kernel output."""
+    ref = reference(a8, sfa, b8, sfb, out_dtype=torch.float64)
+    # DeepGEMM's aggregate criterion ...
+    diff = calc_diff(d, ref)
     assert diff < 1e-3, f"calc_diff {diff}"
+    # ... and an element-wise one (calc_diff alone would pass a few wrong rows): one bf16 ulp of the exact
+    # result, plus the fp8 tensor-core accumulation error inside a 128-wide k-block, which scales with
+    # |A| @ |B|^T (~2^-15 of it measured; 2^-12 allowed). A wrong element is off by O(|ref|) ~ sqrt(K) x
+    # that floor's scale / 2^-12, far outside it.
+    bound = 2.0**-8 * ref.abs() + 2.0**-12 * reference(
+        a8, sfa, b8, sfb, out_dtype=torch.float64, absolute=True
+    )
+    bad = (d.double() - ref).abs() > bound
+    if bad.any():
+        r, c = (int(x) for x in bad.nonzero()[0])
+        raise AssertionError(
+            f"{int(bad.sum())} of {d.numel()} outputs out of tolerance (rows {int(bad.any(1).sum())}); "
+            f"first at ({r}, {c}): got {float(d[r, c])}, expected {float(ref[r, c])}"
+        )
+    try:
+        import deep_gemm
+    except ImportError:
+        return
+    # Same recipe and the same per-k-block fp32 promotion as DeepGEMM's sm90 1D2D kernel: bit-identical output.
+    d_ref = torch.empty_like(d)
+    deep_gemm.fp8_gemm_nt((a8, deep_gemm.get_mn_major_tma_aligned_tensor(sfa)), (b8, sfb), d_ref)
+    mismatches = int((d.view(torch.int16) != d_ref.view(torch.int16)).sum())
+    assert mismatches == 0, f"{mismatches} of {d.numel()} outputs differ bitwise from DeepGEMM"
 
 
 def run_bench(M, N, K, warmup=None, repeat=None, timer=None, *, backend_config=None, **kwargs):
