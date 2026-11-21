@@ -63,6 +63,7 @@ ST_S_V4 = "st.shared.v4.f32"
 LD_S_F32 = "ld.shared.f32"
 ST_S_F32 = "st.shared.f32"
 MUL_F32X2 = "mul.rz.ftz.f32x2"
+MUL_F32 = "mul.rz.ftz.f32"
 CVT_F16X2 = "cvt.rn.f16x2.f32"
 
 
@@ -79,22 +80,18 @@ def _is_sm90(backend_config):
 def make_kernel(hidden_size: int, *, backend_config=None):
     """Trace the kernel for one ``hidden_size``. Batch size stays dynamic.
 
-    On sm_90 the packed ``mul.rz.ftz.f32x2`` (sm_100+) becomes tvm-tirx's portable
-    ``packed.f32x2_mul``, which is bit-identical, and the persistent grid uses the
-    Hopper SM count. The sm_100-family kernel is unchanged.
+    On sm_90 the packed ``mul.rz.ftz.f32x2`` (sm_100+) becomes two scalar
+    ``mul.rz.ftz.f32``: packed f32x2 arithmetic is defined lane by lane, so the
+    result is bit-identical, and Hopper has no packed FMUL to lose. It needs no
+    opaque helper call, so the kernel passes tirx-lite's IR contract with no
+    ``allowed_func_calls`` grant. The persistent grid uses the Hopper SM count.
+    The sm_100-family kernel is unchanged.
     """
     sm90 = _is_sm90(backend_config)
     # Persistent grid: one CTA per SM on the sm_100 family, as before. On H200 one
     # 256-thread CTA per SM keeps too few loads in flight to approach HBM bandwidth;
     # 1/2/4/8 CTAs per SM measured 0.43/0.67/0.88/0.92x flashinfer at hs4096 x 16384.
     sm_count = hardware_num_sms(default=SM90_SM_COUNT) * SM90_CTAS_PER_SM if sm90 else SM_COUNT
-    allowed_func_calls = ()
-    if sm90:
-        from tvm_tirx.backend.cuda.lang import packed  # tvm-tirx with the f32x2 helpers
-
-        # tirx-lite's IR contract rejects opaque func_calls unless they are allowlisted;
-        # this is the one portable helper the sm_90 body calls.
-        allowed_func_calls = (packed.helper_name("mul", "rz", ftz=True),)
     # orig:L650-653 — the schedule is a pure function of hidden_size.
     vec = math.gcd(16 // F16_BYTES, hidden_size)
     block = min(256, hidden_size // vec)
@@ -123,7 +120,7 @@ def make_kernel(hidden_size: int, *, backend_config=None):
     # and 8 was the smallest value that clawed the allocation back. `None` is
     # strictly better — it also matches at hs=128, where the pin gave 32 vs the
     # original's 34.
-    @txl.kernel(allowed_func_calls=allowed_func_calls)
+    @txl.kernel()
     def rmsnorm(
         inp: txl.Tensor((txl.int64(),), "float16"),
         wgt: txl.Tensor((txl.int64(),), "float16"),
@@ -202,19 +199,21 @@ def make_kernel(hidden_size: int, *, backend_config=None):
                 txl.assign(acc[0], acc[0] + txl.reinterpret(peer, ty="float32"))
 
         def scale_pair(dst, i, a, b):
-            """``dst[2i:2i+2] = a * b`` as one packed f32x2 multiply.
+            """``dst[2i:2i+2] = a * b`` lane by lane, ``a`` and ``b`` given as float pairs.
 
-            The instruction takes one 64-bit destination and two 64-bit
-            sources, not a two-element float window (port notes §3.2), so the
-            product lands in ``pk`` and is unpacked with float2_x/float2_y —
-            exactly the original's register shape (orig:L785-799).
+            sm_100 family: one packed f32x2 multiply. The instruction takes one
+            64-bit destination and two 64-bit sources, not a two-element float
+            window (port notes §3.2), so the product lands in ``pk`` and is
+            unpacked with float2_x/float2_y — exactly the original's register
+            shape (orig:L785-799). sm_90: the same rounding and ftz per lane.
             """
             if sm90:
-                txl.assign(pk, packed.f32x2_mul(a, b, rnd="rz", ftz=True))
+                for lane in range(2):
+                    txl.ptx[MUL_F32](dst[2 * i + lane], a[lane], b[lane])
             else:
-                txl.ptx[MUL_F32X2](pk, a, b)
-            txl.ptx.mov.b32(dst[2 * i], txl.cuda.float2_x(pk))
-            txl.ptx.mov.b32(dst[2 * i + 1], txl.cuda.float2_y(pk))
+                txl.ptx[MUL_F32X2](pk, txl.cuda.make_float2(*a), txl.cuda.make_float2(*b))
+                txl.ptx.mov.b32(dst[2 * i], txl.cuda.float2_x(pk))
+                txl.ptx.mov.b32(dst[2 * i + 1], txl.cuda.float2_y(pk))
 
         txl.assign(row, bx)
         with txl.while_(row < batch_size):
@@ -274,15 +273,15 @@ def make_kernel(hidden_size: int, *, backend_config=None):
                     scale_pair(
                         xf,
                         pair,
-                        txl.cuda.make_float2(xv[2 * pair], xv[2 * pair + 1]),
-                        txl.cuda.make_float2(rms, rms),
+                        (xv[2 * pair], xv[2 * pair + 1]),
+                        (rms, rms),
                     )
                 for pair in range(vec // 2):
                     scale_pair(
                         xf,
                         pair,
-                        txl.cuda.make_float2(xf[2 * pair], xf[2 * pair + 1]),
-                        txl.cuda.make_float2(wf[2 * pair], wf[2 * pair + 1]),
+                        (xf[2 * pair], xf[2 * pair + 1]),
+                        (wf[2 * pair], wf[2 * pair + 1]),
                     )
                 with txl.if_(st < hidden_size), txl.then_():
                     for pair in range(vec // 2):
