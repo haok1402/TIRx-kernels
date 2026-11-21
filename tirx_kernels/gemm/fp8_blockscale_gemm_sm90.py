@@ -301,6 +301,12 @@ def make_kernel(
                             sc[5] = sc[1] * sc[7]
                             W.wait(0, (tmp, acc_n))
                             if w == waves - 1:
+                                # This stage's A scales were read through the generic proxy (ld.shared); the
+                                # producer's next TMA write to them is async proxy. The PTX memory model only
+                                # orders the two with a proxy fence (sm90-probe KERNEL-001 #2): each thread
+                                # fences its own reads, the warp syncs, then lane 0 releases the stage.
+                                T.ptx.fence.proxy.async_.shared__cta()
+                                T.cuda.warp_sync()
                                 if ct % 32 == 0:  # lane 0 of every consumer warp releases the stage
                                     if T.constexpr(MCS > 1):
                                         empty.arrive_multicast(stage, ranks=range(CS))
