@@ -1,0 +1,15 @@
+# This file is a TIRx port of code from DeepGEMM
+# (https://github.com/deepseek-ai/DeepGEMM @ 559d79fb), Copyright (c) 2025 DeepSeek
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# SPDX-FileCopyrightText: Copyright TIRx authors
+
+"""Shared TIRx port of DeepGEMM's SM90 `sm90_fp8_gemm_1d2d` implementation.
+
+Submodules: `spec` (descriptors, heuristics, kernel specialization), `data` (operands and the
+DeepGEMM reference), `kernel` (the `PrimFunc`), `launch` (TMA descriptors and launch).  The
+public m-grouped modules under :mod:`tirx_kernels.ported.deepgemm` pin one descriptor each.
+"""
+
+from .spec import GemmDesc, GemmType, KernelSpec, get_best_config, make_spec
+
+__all__ = ["GemmDesc", "GemmType", "KernelSpec", "get_best_config", "make_spec"]
