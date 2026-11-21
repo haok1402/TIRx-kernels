@@ -101,10 +101,14 @@ def make_kernel(
         T.device_entry(launch=T.cuda.LaunchConfig(grid=num_clusters * CLUSTER, block=384, cluster=CLUSTER),
                        kernel_attrs=T.cuda.KernelAttributes(min_blocks_per_sm=1), **entry_kw)
         tx = T.cuda.thread_idx("x")
-        # cluster_id, not block_idx // CLUSTER: the latter trips a tvm-tirx LowerIntrin bug
-        # (int32 literal overflow) at N = 11008 (sm90-probe ISSUE-001).
-        cid = T.cuda.cluster_id("x")
-        rank = T.cuda.cluster_cta_id("x")
+        # Cluster registers read once into locals. block_idx // CLUSTER trips a tvm-tirx LowerIntrin
+        # int32-literal bug at N = 11008 (sm90-probe ISSUE-001), and every use of T.cuda.cluster_id /
+        # cluster_cta_id is a fresh `asm volatile` read (ISSUE-002).
+        cl = T.alloc_local([2], "int32")
+        cl[0] = T.cuda.cluster_id("x")
+        cl[1] = T.cuda.cluster_cta_id("x")
+        cid = cl[0]
+        rank = cl[1]
         A_s = T.alloc_tensor(ty_args=[T.Tensor((STAGES, BM, BK), dt, scope="shared", align=1024)])
         B_s = T.alloc_tensor(ty_args=[T.Tensor((STAGES, BN, BK), dt, scope="shared", align=1024)])
         if T.constexpr(tma_epi):
