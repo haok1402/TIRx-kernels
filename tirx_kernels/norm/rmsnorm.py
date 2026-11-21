@@ -67,7 +67,12 @@ CVT_F16X2 = "cvt.rn.f16x2.f32"
 
 
 def _is_sm90(backend_config):
-    arch = resolve_backend_config(backend_config)["cuda"]["arch"]
+    """Whether to build the sm_90 variant. With no CUDA device and no explicit arch (e.g. a CPU-only
+    analysis host), keep building the default sm_100-family kernel, as before the sm_90 path."""
+    try:
+        arch = resolve_backend_config(backend_config)["cuda"]["arch"]
+    except ValueError:
+        return False
     return arch.startswith("sm_9")
 
 
