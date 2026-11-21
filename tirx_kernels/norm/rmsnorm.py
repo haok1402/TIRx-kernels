@@ -48,7 +48,12 @@ CONFIGS = [
     {"hidden_size": hs, "batch_size": bs, "label": f"hs{hs}_bs{bs}"}
     for hs in [128, 4096, 5120, 8192]
     for bs in [1, 2, 4, 8, 16, 32, 64, 128, 4113]
+] + [
+    # More than 2**31 elements: a 32-bit row * hidden_size wraps here (about 4.4 GB per tensor).
+    {"hidden_size": 8192, "batch_size": 270000, "label": "hs8192_bs270000_gt2p31"},
+    {"hidden_size": 128, "batch_size": (1 << 24) + 1024, "label": "hs128_bs16778240_gt2p31"},
 ]
+LARGE_ELEMENTS = 1 << 31
 
 
 FULL_MASK = 0xFFFFFFFF
@@ -130,6 +135,8 @@ def make_kernel(hidden_size: int, *, backend_config=None):
         rms = txl.local_scalar("float32")  # rms_norm
         row = txl.local_scalar("int32")  # idx
         goff = txl.local_scalar("int32")  # global element offset (see gidx)
+        rowoff = txl.local_scalar("int64")  # row * hidden_size, 64-bit (see row_gidx)
+        roff = txl.local_scalar("int64")
 
         def cta_sync(bar_id):
             txl.ptx.bar.sync(txl.uint32(bar_id), txl.uint32(nthreads))
@@ -150,6 +157,17 @@ def make_kernel(hidden_size: int, *, backend_config=None):
             """
             txl.assign(goff, offset)
             return txl.cast(goff, "int64")
+
+        def row_gidx(col):
+            """The element index ``row * hidden_size + col`` of the current row, in 64 bits.
+
+            ``batch_size * hidden_size`` may reach 2**31 (e.g. 262144 rows at 8192), and a
+            32-bit ``row * hidden_size`` then wraps to a wrong row. The row's offset is formed
+            once per row in ``rowoff``, so each access adds only its in-row column (< hidden_size,
+            32-bit-safe) to it.
+            """
+            txl.assign(roff, rowoff + txl.cast(col, "int64"))
+            return roff
 
         def warp_sum(acc):
             """Butterfly sum of ``acc[0]`` over the 32 lanes — orig:L725-729.
@@ -184,6 +202,7 @@ def make_kernel(hidden_size: int, *, backend_config=None):
 
         txl.assign(row, bx)
         with txl.while_(row < batch_size):
+            txl.assign(rowoff, txl.cast(row, "int64") * hidden_size)
             # ---- pass 1: read x, accumulate sum(x^2), stage x in f32 smem ---
             txl.assign(ss[0], txl.float32(0.0))
             with txl.serial(n_tiles) as ki:
@@ -191,9 +210,7 @@ def make_kernel(hidden_size: int, *, backend_config=None):
                     txl.ptx.mov.b32(xv[kv], txl.float32(0.0))
                 st = (ki * nthreads + tid) * vec
                 with txl.if_(st < hidden_size), txl.then_():
-                    txl.ptx[LD_G_V4](
-                        iw[0], iw[1], iw[2], iw[3], inp.ptr_to([gidx(row * hidden_size + st)])
-                    )
+                    txl.ptx[LD_G_V4](iw[0], iw[1], iw[2], iw[3], inp.ptr_to([row_gidx(st)]))
                     for pair in range(vec // 2):
                         txl.idioms.cast_f16x2_to_f32x2(xf, pair, iw[pair])
                     for kv in range(vec):
@@ -253,9 +270,7 @@ def make_kernel(hidden_size: int, *, backend_config=None):
                 with txl.if_(st < hidden_size), txl.then_():
                     for pair in range(vec // 2):
                         txl.ptx[CVT_F16X2](ow[pair], xf[2 * pair + 1], xf[2 * pair])
-                    txl.ptx[ST_G_V4](
-                        out.ptr_to([gidx(row * hidden_size + st)]), ow[0], ow[1], ow[2], ow[3]
-                    )
+                    txl.ptx[ST_G_V4](out.ptr_to([row_gidx(st)]), ow[0], ow[1], ow[2], ow[3])
             cta_sync(1)
             txl.assign(row, row + SM_COUNT)
 
@@ -292,9 +307,14 @@ def run_test(hidden_size, batch_size, *, backend_config=None, **kwargs):
     input_data, weights = prepare_data(batch_size, hidden_size)
     kernel = get_kernel(hidden_size, backend_config=backend_config)
     ex = compile_kernel(kernel, backend_config=backend_config)
-    output_tir = torch.empty((batch_size, hidden_size), dtype=torch.float16, device="cuda")
+    output_tir = torch.full(
+        (batch_size, hidden_size), float("nan"), dtype=torch.float16, device="cuda"
+    )
     ex(*_kernel_args(input_data, weights, output_tir))
     torch.cuda.synchronize()
+    if batch_size * hidden_size >= LARGE_ELEMENTS:
+        _check_large(output_tir, input_data, weights)
+        return
     # FlashInfer's rmsnorm on the same inputs is the arbiter (the same library
     # the benchmark path compares against).
     import flashinfer
@@ -303,6 +323,25 @@ def run_test(hidden_size, batch_size, *, backend_config=None, **kwargs):
     flashinfer.norm.rmsnorm(input_data, weights, eps, enable_pdl=False, out=ref)
     torch.cuda.synchronize()
     torch.testing.assert_close(output_tir.cpu(), ref.cpu(), rtol=0.001, atol=0.001)
+
+
+def _check_large(output, input_data, weights):
+    """Above 2**31 elements: every row against a float32 torch reference, in chunks.
+
+    FlashInfer is not assumed to be 64-bit-safe at this size. Every row is checked, not a sample:
+    a wrapped 32-bit offset corrupts rows far from the 2**31 boundary too (on H200, 270000 x 8192
+    with 32-bit offsets first goes wrong at row 7856).
+    """
+    import torch
+
+    batch = input_data.shape[0]
+    chunk = 8192
+    for start in range(0, batch, chunk):
+        x = input_data[start : start + chunk].float()
+        ref = (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weights.float()).half()
+        torch.testing.assert_close(
+            output[start : start + chunk], ref, rtol=0.001, atol=0.001, msg=f"rows from {start}"
+        )
 
 
 # timer=None inherits the global default (proton). Proton matters here: rmsnorm is a
