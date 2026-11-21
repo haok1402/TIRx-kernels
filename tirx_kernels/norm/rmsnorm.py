@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright TIRx authors
 
-"""Persistent SM100 RMSNorm expressed as one traced tirx-lite device body."""
+"""Persistent RMSNorm (SM100 family and SM90) expressed as one traced tirx-lite device body."""
 
 import math
 from typing import Any
@@ -9,11 +9,15 @@ from typing import Any
 import torch
 
 import tirx_kernels.tirx_lite as txl
-from tirx_kernels.runner import bench
+from tirx_kernels.runner import bench, hardware_num_sms, resolve_backend_config
 
 eps = 1e-6
 F16_BYTES = 2
 SM_COUNT = 152
+# Hopper parts: H100 SXM / H200 have 132 SMs. The persistent grid is sized from the
+# device when CUDA is initialized (runner.hardware_num_sms), else from this default.
+SM90_SM_COUNT = 132
+SM90_CTAS_PER_SM = 8  # persistent CTAs per SM on Hopper (see make_kernel)
 
 
 def ceildiv(a, b):
@@ -31,7 +35,7 @@ def prepare_data(batch_size, dim):
 KERNEL_META = {
     "name": "rmsnorm",
     "category": "norm",
-    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "runtime_cuda_archs": ["sm_100a", "sm_103a", "sm_107a", "sm_90a"],
     "reference_requirements": (
         {
             "package": "flashinfer-python",
@@ -62,8 +66,30 @@ MUL_F32X2 = "mul.rz.ftz.f32x2"
 CVT_F16X2 = "cvt.rn.f16x2.f32"
 
 
+def _is_sm90(backend_config):
+    arch = resolve_backend_config(backend_config)["cuda"]["arch"]
+    return arch.startswith("sm_9")
+
+
 def make_kernel(hidden_size: int, *, backend_config=None):
-    """Trace the kernel for one ``hidden_size``. Batch size stays dynamic."""
+    """Trace the kernel for one ``hidden_size``. Batch size stays dynamic.
+
+    On sm_90 the packed ``mul.rz.ftz.f32x2`` (sm_100+) becomes tvm-tirx's portable
+    ``packed.f32x2_mul``, which is bit-identical, and the persistent grid uses the
+    Hopper SM count. The sm_100-family kernel is unchanged.
+    """
+    sm90 = _is_sm90(backend_config)
+    # Persistent grid: one CTA per SM on the sm_100 family, as before. On H200 one
+    # 256-thread CTA per SM keeps too few loads in flight to approach HBM bandwidth;
+    # 1/2/4/8 CTAs per SM measured 0.43/0.67/0.88/0.92x flashinfer at hs4096 x 16384.
+    sm_count = hardware_num_sms(default=SM90_SM_COUNT) * SM90_CTAS_PER_SM if sm90 else SM_COUNT
+    allowed_func_calls = ()
+    if sm90:
+        from tvm_tirx.backend.cuda.lang import packed  # tvm-tirx with the f32x2 helpers
+
+        # tirx-lite's IR contract rejects opaque func_calls unless they are allowlisted;
+        # this is the one portable helper the sm_90 body calls.
+        allowed_func_calls = (packed.helper_name("mul", "rz", ftz=True),)
     # orig:L650-653 — the schedule is a pure function of hidden_size.
     vec = math.gcd(16 // F16_BYTES, hidden_size)
     block = min(256, hidden_size // vec)
@@ -92,7 +118,7 @@ def make_kernel(hidden_size: int, *, backend_config=None):
     # and 8 was the smallest value that clawed the allocation back. `None` is
     # strictly better — it also matches at hs=128, where the pin gave 32 vs the
     # original's 34.
-    @txl.kernel()
+    @txl.kernel(allowed_func_calls=allowed_func_calls)
     def rmsnorm(
         inp: txl.Tensor((txl.int64(),), "float16"),
         wgt: txl.Tensor((txl.int64(),), "float16"),
@@ -102,7 +128,7 @@ def make_kernel(hidden_size: int, *, backend_config=None):
         batch_size: "int32",
     ):
         txl.device_entry(
-            launch=txl.cuda.LaunchConfig(grid=SM_COUNT, block=bdy * 32),
+            launch=txl.cuda.LaunchConfig(grid=sm_count, block=bdy * 32),
             backend_config=backend_config,
         )
 
@@ -178,7 +204,10 @@ def make_kernel(hidden_size: int, *, backend_config=None):
             product lands in ``pk`` and is unpacked with float2_x/float2_y —
             exactly the original's register shape (orig:L785-799).
             """
-            txl.ptx[MUL_F32X2](pk, a, b)
+            if sm90:
+                txl.assign(pk, packed.f32x2_mul(a, b, rnd="rz", ftz=True))
+            else:
+                txl.ptx[MUL_F32X2](pk, a, b)
             txl.ptx.mov.b32(dst[2 * i], txl.cuda.float2_x(pk))
             txl.ptx.mov.b32(dst[2 * i + 1], txl.cuda.float2_y(pk))
 
@@ -257,7 +286,7 @@ def make_kernel(hidden_size: int, *, backend_config=None):
                         out.ptr_to([gidx(row * hidden_size + st)]), ow[0], ow[1], ow[2], ow[3]
                     )
             cta_sync(1)
-            txl.assign(row, row + SM_COUNT)
+            txl.assign(row, row + sm_count)
 
     return rmsnorm
 
