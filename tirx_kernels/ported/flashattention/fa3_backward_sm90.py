@@ -196,6 +196,18 @@ _EDGE_VARLEN = [
     _case(3, 3000, 3000, 32, 128, False, h_k=8, seed=25, prefix="edge_", varlen={"seqused": False}),
 ]
 
+#: hd64 edges: exactly one and two 128-row m-blocks, causal s_q > s_k (store_zero) and s_q < s_k (the
+#: first masking loop ending early), many heads (LPT remainder), GQA 32 / 4, varlen without seqused.
+_EDGE_HD64 = [
+    _case(3, 256, 128, 5, 64, False, seed=31, prefix="edge_"),
+    _case(3, 128, 256, 5, 64, True, seed=32, prefix="edge_"),
+    _case(1, 2000, 300, 2, 64, True, seed=33, prefix="edge_"),
+    _case(1, 300, 2000, 2, 64, True, seed=34, prefix="edge_"),
+    _case(7, 1000, 1000, 37, 64, True, seed=35, prefix="edge_"),
+    _case(2, 2048, 2048, 32, 64, True, h_k=4, seed=36, prefix="edge_"),
+    _case(9, 700, 300, 6, 64, False, seed=37, prefix="edge_", varlen={"seqused": False}),
+]
+
 CONFIGS = [
     *upstream_test_cases(128),
     *_EDGE,
@@ -206,6 +218,14 @@ CONFIGS = [
     *upstream_varlen_test_cases(128, "gqa"),
     *upstream_varlen_test_cases(128, "mqa"),
     *_EDGE_VARLEN,
+    # head dim 64 (kBlockM = kBlockN = 128, SeparateMaskingIterations, ShuffleLSE): the same upstream grids
+    *upstream_test_cases(64),
+    *upstream_test_cases(64, "gqa"),
+    *upstream_test_cases(64, "mqa"),
+    *upstream_varlen_test_cases(64),
+    *upstream_varlen_test_cases(64, "gqa"),
+    *upstream_varlen_test_cases(64, "mqa"),
+    *_EDGE_HD64,
 ]
 
 #: ``hopper/benchmark_attn.py``-style shapes: 16k tokens per batch, hidden 2048 (16 heads of 128).
@@ -225,6 +245,16 @@ BENCH_CONFIGS = [
           varlen={"zero_lengths_k": False, "seqused": False})
     for s in (1024, 4096)
     for h, hk in ((16, None), (32, 8))
+    for causal in (False, True)
+] + [
+    # head dim 64, 16k tokens per batch: 32 heads of 64 (hidden 2048), GQA 32 / 4 at s4096, and a packed batch
+    _case(16384 // s, s, s, 32, 64, causal, prefix="bench_")
+    for s in (1024, 4096, 16384)
+    for causal in (False, True)
+] + [
+    _case(4, 4096, 4096, 32, 64, causal, h_k=4, prefix="bench_") for causal in (False, True)
+] + [
+    _case(4, 4096, 4096, 32, 64, causal, prefix="bench_", varlen={"zero_lengths_k": False, "seqused": False})
     for causal in (False, True)
 ]
 

@@ -58,6 +58,9 @@ OFFSETS = {
              ds=165888, bars=198656, total=199680),
     80: dict(k=0, v=32768, dqacc=65536, q=106496, do=147456, lse=188416, dpsum=189312,
              ds=190464, bars=231424, total=232448),
+    # hd64 (kBlockM 128, d 64; sP at 133120 is unused with Mma_dKV_is_RS)
+    128: dict(k=0, v=16384, dqacc=32768, q=65536, do=98304, lse=131072, dpsum=132096,
+              ds=134144, bars=199680, total=200704),
 }
 
 _TMA_LOAD = "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
@@ -86,7 +89,10 @@ def _sw128(row, chunk):
     return row * 128 + ((chunk ^ (row % 8)) * 16)
 
 
-def _block_m(is_causal):
+def _block_m(is_causal, head_dim=128):
+    """kBlockM_sm90 of mha_bwd: hd64 128; hd128 64 (causal) / 80."""
+    if head_dim == 64:
+        return 128
     return 64 if is_causal else 80
 
 
@@ -157,9 +163,12 @@ class _Varlen:
 
 def build_preprocess(head_dim, block_m, *, varlen=False, backend_config=None):
     """FlashAttnBwdPreprocess<TileShape_MK, bf16, float, Sm90, Clear_dQaccum = true, Varlen>."""
-    assert head_dim == HEAD_DIM
+    assert head_dim in (64, 128)
+    D = head_dim
     BM = block_m
-    ROWS = BM // 16  # GmemTiledCopy (16 x 16) x 8: rows per thread
+    TPR = D // 8  # GmemTiledCopy: kGmemThreadsPerRow (8 bf16 = 128 bits per thread)
+    RPP = 256 // TPR  # rows per pass
+    ROWS = BM // RPP  # rows per thread
     # One annotation object per parameter: a shared one would tie the parameters' extents together.
     T_F32, T_BF16, T_I32 = ("tensor", "float32"), ("tensor", "bfloat16"), ("tensor", "int32")
     abi = [("o", T_BF16), ("do", T_BF16), ("lse", T_F32), ("dpsum", T_F32), ("lse_log2", T_F32),
@@ -200,8 +209,8 @@ def build_preprocess(head_dim, block_m, *, varlen=False, backend_config=None):
                     lse_v, lse.ptr_to([_i64(bb * h + bidh) * _i64(s_q) + _i64(_add(off, m_block * BM + t))])
                 )
 
-            row0 = t // 16
-            col8 = (t % 16) * 8
+            row0 = t // TPR
+            col8 = (t % TPR) * 8
             pcol = col8 < d  # tOpO(0): the one K iteration (128 = 16 x 8)
             # O / dO rows: (b, s, h, d) contiguous; row stride h*d, head stride d, batch stride s*h*d.
             row_base = _i64(bb) * _i64(s_q) + _i64(_add(off, m_block * BM))
@@ -219,9 +228,9 @@ def build_preprocess(head_dim, block_m, *, varlen=False, backend_config=None):
                 for i in range(ROWS):
                     for j in range(4):
                         txl.assign(dst[4 * i + j], txl.uint32(0))
-                    with txl.if_(txl.And(row0 + 16 * i < rows_left, pcol)), txl.then_():
+                    with txl.if_(txl.And(row0 + RPP * i < rows_left, pcol)), txl.then_():
                         txl.ptx.ld.global_.v4.u32(
-                            dst[4 * i], dst[4 * i + 1], dst[4 * i + 2], dst[4 * i + 3], gaddr(src, row0 + 16 * i)
+                            dst[4 * i], dst[4 * i + 1], dst[4 * i + 2], dst[4 * i + 3], gaddr(src, row0 + RPP * i)
                         )
 
             load_rows(rO, o)
@@ -244,13 +253,13 @@ def build_preprocess(head_dim, block_m, *, varlen=False, backend_config=None):
                     else:
                         txl.ptx["fma.rn.ftz.f32"](acc, gv, ov, acc)
                 # Allreduce<16> with SumOp: butterfly 8, 4, 2, 1.
-                for off in (8, 4, 2, 1):
+                for off in tuple(o for o in (8, 4, 2, 1) if o < TPR):  # Allreduce<kGmemThreadsPerRow>
                     peer = txl.local_scalar("float32")
                     txl.ptx.shfl_sync.bfly.b32(
                         peer, acc, txl.uint32(off), txl.uint32(0x1F), txl.uint32(0xFFFFFFFF)
                     )
                     txl.ptx["add.ftz.f32"](acc, acc, peer)
-                r = row0 + 16 * i
+                r = row0 + RPP * i
                 with txl.if_(col8 == 0), txl.then_():
                     val = txl.if_then_else(r < rows_left, acc, txl.float32(0.0))
                     txl.ptx.st.global_.f32(
@@ -267,9 +276,9 @@ def build_preprocess(head_dim, block_m, *, varlen=False, backend_config=None):
                 )
 
             # Clear_dQaccum: GmemTiledCopyAccum 256 threads x 4 floats.
-            acc_base = (_i64(bb * h + bidh) * _i64(s_q_rounded * HEAD_DIM) if off_p is None else
-                        (_i64(bb * h + bidh) * _i64(s_q_rounded) + _i64(off_p)) * _i64(HEAD_DIM)) + _i64(m_block * BM * HEAD_DIM)
-            for i in range(BM * HEAD_DIM // 1024):
+            acc_base = (_i64(bb * h + bidh) * _i64(s_q_rounded * D) if off_p is None else
+                        (_i64(bb * h + bidh) * _i64(s_q_rounded) + _i64(off_p)) * _i64(D)) + _i64(m_block * BM * D)
+            for i in range(BM * D // 1024):
                 txl.ptx.st.global_.v4.u32(
                     dq_accum.view("uint32").ptr_to([acc_base + _i64(t * 4 + 1024 * i)]),
                     txl.uint32(0), txl.uint32(0), txl.uint32(0), txl.uint32(0),
@@ -316,13 +325,18 @@ def build_postprocess(head_dim, is_causal, *, dkv=False, varlen=False, backend_c
     """The dQ convert (TileShape (kBlockM, d), TiledMmadQ), or with ``dkv`` the dK / dV convert of the
     GQA build (TileShape (kBlockN, d) = (128, 128), TiledMmadKV, dKV_swapAB false: run_flash_bwd's
     PostprocessKerneldKV, softmax_scale 1)."""
-    assert head_dim == HEAD_DIM
-    BM = BLOCK_N if dkv else _block_m(is_causal)
-    # dQ (m64n64) / dQ^T (m64n80) / dK, dV (m64n128) C fragment registers per thread
-    NREG = 64 if dkv else (32 if is_causal else 40)
-    swz333 = dkv or is_causal  # Swizzle<3,3,3> 8 x 64 atoms (MmaShapeN 64 or 128), else <1,3,3> 8 x 16
-    SMEM_ACC = BM * HEAD_DIM * 4
-    SMEM_DQ = BM * HEAD_DIM * 2
+    assert head_dim in (64, 128)
+    D = head_dim
+    BM = BLOCK_N if dkv else _block_m(is_causal, D)
+    # C fragment registers per thread: dQ (m64n64), dQ^T (m64n80), dK / dV (m64n128); hd64 m64n64
+    NREG = BM * D // 256
+    swz333 = dkv or is_causal or D == 64  # Swizzle<3,3,3> 8 x 64 atoms (MmaShapeN 64 or 128), else <1,3,3> 8 x 16
+    # STSM_N with warpgroups along M (row 64w + ..): the dK / dV convert, and hd64's dQ (AtomLayoutMdQ 2)
+    wg_rows = dkv or D == 64
+    TPR = D // 8  # gmem copy threads per row
+    RPP = 256 // TPR
+    SMEM_ACC = BM * D * 4
+    SMEM_DQ = BM * D * 2
     OFF_BAR = SMEM_ACC + SMEM_DQ
     SMEM_BYTES = OFF_BAR + 128  # sizeof(SharedStorage): 49280 / 61568 / 98432 (dK, dV)
 
@@ -357,10 +371,10 @@ def build_postprocess(head_dim, is_causal, *, dkv=False, varlen=False, backend_c
         def body(seqlen, off, off_p, bb, s_q_rounded):
 
             if off_p is None:
-                acc_base = _i64(bb * h + bidh) * _i64(s_q_rounded * HEAD_DIM) + _i64(m_block * BM * HEAD_DIM)
+                acc_base = _i64(bb * h + bidh) * _i64(s_q_rounded * D) + _i64(m_block * BM * D)
             else:  # domain_offset(offset_padded * kHeadDim) of mdQaccum(_, bidh, bb)
-                acc_base = ((_i64(bb * h + bidh) * _i64(s_q_rounded) + _i64(off_p)) * _i64(HEAD_DIM)
-                            + _i64(m_block * BM * HEAD_DIM))
+                acc_base = ((_i64(bb * h + bidh) * _i64(s_q_rounded) + _i64(off_p)) * _i64(D)
+                            + _i64(m_block * BM * D))
             with txl.if_(t == 0), txl.then_():
                 txl.ptx["mbarrier.init.shared::cta.b64"](bar, txl.uint32(1))
                 txl.ptx["mbarrier.arrive.expect_tx.shared::cta.b64"](bar, txl.uint32(SMEM_ACC))
@@ -376,7 +390,7 @@ def build_postprocess(head_dim, is_causal, *, dkv=False, varlen=False, backend_c
             for i in range(NREG // 4):
                 txl.ptx.ld.shared.v4.f32(
                     racc[4 * i], racc[4 * i + 1], racc[4 * i + 2], racc[4 * i + 3],
-                    pool_f32.ptr_to([w * (BM * 64) + (i * 128 + tt) * 4]),
+                    pool_f32.ptr_to([w * (BM * D // 2) + (i * 128 + tt) * 4]),
                 )
             for i in range(NREG):
                 txl.ptx["mul.ftz.f32"](racc[i], racc[i], softmax_scale)
@@ -402,8 +416,8 @@ def build_postprocess(head_dim, is_causal, *, dkv=False, varlen=False, backend_c
 
             for p in range(NREG // 8):
                 c_j = 2 * p + jm // 2
-                if dkv:
-                    # dK / dV fragment (KV rows 64w + 16*warp + 8i + .., d cols 8c + ..): STSM_N.
+                if wg_rows:
+                    # dK / dV (or hd64 dQ) fragment (rows 64w + 16*warp + 8i + .., d cols 8c + ..): STSM_N.
                     m = w * 64 + warp * 16 + i_j * 8 + k_
                     col = c_j * 8
                     txl.ptx[_STSM](pool.ptr_to([sdq_byte(m, col) // 2]), *[r16[4 * p + j] for j in range(4)])
@@ -419,19 +433,19 @@ def build_postprocess(head_dim, is_causal, *, dkv=False, varlen=False, backend_c
                     txl.ptx[_STSM_T](pool.ptr_to([sdq_byte(m, col) // 2]), *[r16[4 * p + j] for j in range(4)])
             txl.cuda.cta_sync()
 
-            col8 = (t % 16) * 8
+            col8 = (t % TPR) * 8
             pcol = col8 < d
-            rows = BM // 16
+            rows = BM // RPP
             v = txl.alloc_local((4 * rows,), "uint32")
             pool_u32 = pool.view("uint32")
             for i in range(rows):  # flash::copy smem -> regs (EvenM, Is_even_K): no predicate
-                m = t // 16 + 16 * i
+                m = t // TPR + RPP * i
                 txl.ptx.ld.shared.v4.u32(
                     v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3], pool_u32.ptr_to([sdq_byte(m, col8) // 4])
                 )
             limit = txl.min(seqlen - m_block * BM, BM)
             for i in range(rows):
-                m = t // 16 + 16 * i
+                m = t // TPR + RPP * i
                 with txl.if_(txl.And(m < limit, pcol)), txl.then_():
                     idx = ((_i64(bb) * _i64(s_q) + _i64(_add(off, m_block * BM + m))) * _i64(h) + _i64(bidh)) * _i64(d) + _i64(col8)
                     txl.ptx.st.global_.v4.u32(
@@ -462,6 +476,7 @@ def build_postprocess(head_dim, is_causal, *, dkv=False, varlen=False, backend_c
 
 
 def build_postprocess_dkv(head_dim, *, varlen=False, backend_config=None):
+    """The dK / dV convert: TileShape (kBlockN, d), TiledMmadKV (m64n<d> per warpgroup along M)."""
     return build_postprocess(head_dim, True, dkv=True, varlen=varlen, backend_config=backend_config)
 
 
@@ -471,20 +486,31 @@ def build_postprocess_dkv(head_dim, *, varlen=False, backend_config=None):
 
 
 def build_main_kernel(head_dim, is_causal, *, gqa=False, varlen=False, backend_config=None):
-    assert head_dim == HEAD_DIM
-    BM = _block_m(is_causal)
+    assert head_dim in (64, 128)
+    D = head_dim
+    BM = _block_m(is_causal, D)
     NC = BM // 8  # 8-column groups of the S^T / dP^T fragment
     KM = BM // 16  # k-steps of the dV / dK chains
-    NQ = 32 if is_causal else 40  # dQ / dQ^T fragment registers
+    KS = D // 16  # k-steps of the S^T / dP^T GEMMs (over d)
+    NKV = D // 2  # dV / dK (m64n<d>) fragment registers
+    NQ = BM * D // 256  # dQ / dQ^T fragment registers
+    NH = D // 64  # 64-column halves (TMA boxes) of a Q / dO / K / V tile
+    # hd64 (kHeadDim <= 64): AtomLayoutMdQ 2 (dQ warpgroups along M), ShuffleLSE / ShuffledPsum and
+    # SeparateMaskingIterations (mainloop :257-263)
+    MDQ2 = SHUFFLE = SEPMASK = D == 64
     OFF = OFFSETS[BM]
     SMEM_BYTES = OFF["total"]
-    Q_TILE = BM * 256  # bytes of one Q / dO / dS stage
+    Q_TILE = BM * D * 2  # bytes of one Q / dO stage
+    DS_TILE = BM * 256  # bytes of one dS stage (kBlockM x kBlockN)
     HALF = BM * 128  # 64-column half stride of a Q / dO / dS stage
-    TX_Q = BM * 256 + BM * 4  # TmaTransactionBytesQ + TmaTransactionBytesLSE
+    TX_Q = BM * D * 2 + BM * 4  # TmaTransactionBytesQ + TmaTransactionBytesLSE
     LSE_STRIDE = (BM + 63) // 64 * 64  # SmemLayoutLSE stage stride (floats)
     wg_s = _WG_SS.format(n=BM)
-    wg_q = _WG_SS.format(n=64 if is_causal else 80)
-    wg_kv = _WG_SS.format(n=128)
+    wg_q = _WG_SS.format(n=64 if (is_causal or D == 64) else 80)
+    wg_kv = _WG_SS.format(n=D)
+    CFG = dict(D=D, KS=KS, NKV=NKV, NH=NH, MDQ2=MDQ2, SHUFFLE=SHUFFLE, SEPMASK=SEPMASK, DS_TILE=DS_TILE,
+               dq_swapab=D == 128 and not is_causal,
+               DESC_ADV=D == 64)  # GMMA descriptor form per head dim (_desc, ISSUE-022 (B))
     # pipeline barriers: barrier_KV, q full[2] empty[2], do full[2] empty[2]
     B_KV = OFF["bars"]
 
@@ -667,7 +693,7 @@ def build_main_kernel(head_dim, is_causal, *, gqa=False, varlen=False, backend_c
                 )
                 with txl.if_(wiw == txl.uint32(0)):
                     with txl.then_():
-                        _producer_load(locals_=dict(
+                        _producer_load(locals_=dict(**CFG,
                             tile=tile, m_min_of=m_min_of, m_max_of=m_max_of, wait=wait, advance=advance,
                             tile_valid=tile_valid, seqinfo=seqinfo, varlen=varlen,
                             bar=bar, bar_s=bar_s, b_full_q=b_full_q, b_empty_q=b_empty_q,
@@ -679,7 +705,7 @@ def build_main_kernel(head_dim, is_causal, *, gqa=False, varlen=False, backend_c
                         ))
                     with txl.else_():
                         with txl.if_(wiw == txl.uint32(1)), txl.then_():
-                            _dq_store(locals_=dict(
+                            _dq_store(locals_=dict(**CFG,
                                 tile=tile, m_min_of=m_min_of, m_max_of=m_max_of, OFF=OFF, BM=BM, b16=b16,
                                 tile_valid=tile_valid, seqinfo=seqinfo, varlen=varlen,
                                 f32p=f32p, dq_accum=dq_accum, s_q_rounded=s_q_rounded, h=h,
@@ -688,7 +714,7 @@ def build_main_kernel(head_dim, is_causal, *, gqa=False, varlen=False, backend_c
             # ================================ MMA warpgroups ==================================
             with txl.else_():
                 txl.ptx["setmaxnreg.inc.sync.aligned.u32"](txl.uint32(240))
-                _mma(locals_=dict(
+                _mma(locals_=dict(**CFG, window_size_right=window_size_right,
                     tile=tile, m_min_of=m_min_of, m_max_of=m_max_of, wait=wait, advance=advance, bar=bar,
                     tile_valid=tile_valid, seqinfo=seqinfo, varlen=varlen, V=V, s_k_rounded_in=s_k_rounded_in,
                     bar_s=bar_s, b_full_q=b_full_q, b_empty_q=b_empty_q, b_full_do=b_full_do,
@@ -751,7 +777,7 @@ def _producer_load(locals_):
 
     def load_q(m, stat_row):
         q_dst = OFF["q"] + stage * L["Q_TILE"]
-        for half in range(2):
+        for half in range(L["NH"]):
             _tma_load(L["b16"](q_dst + half * L["HALF"]), L["tma_q"], 64 * half, _add(si["off_q"], m * BM),
                       bidh, si["bb_q"], bar_s(L["b_full_q"], stage), EVICT_LAST)
         txl.ptx[_BULK_G2S](
@@ -763,7 +789,7 @@ def _producer_load(locals_):
 
     def load_do(m, stat_row):
         do_dst = OFF["do"] + stage * L["Q_TILE"]
-        for half in range(2):
+        for half in range(L["NH"]):
             _tma_load(L["b16"](do_dst + half * L["HALF"]), L["tma_do"], 64 * half, _add(si["off_q"], m * BM),
                       bidh, si["bb_q"], bar_s(L["b_full_do"], stage), EVICT_LAST)
         txl.ptx[_BULK_G2S](
@@ -798,11 +824,12 @@ def _producer_load(locals_):
             acquire(L["b_empty_q"], L["b_full_q"])
             load_q(m_min, stat_row)
         with txl.if_(lane == txl.uint32(1)), txl.then_():
-            txl.ptx["mbarrier.arrive.expect_tx.shared::cta.b64"](bar(L["B_KV"]), txl.uint32(65536))
-            for half in range(2):
+            # TmaTransactionBytesK + TmaTransactionBytesV
+            txl.ptx["mbarrier.arrive.expect_tx.shared::cta.b64"](bar(L["B_KV"]), txl.uint32(2 * BLOCK_N * L["D"] * 2))
+            for half in range(L["NH"]):
                 _tma_load(L["b16"](OFF["k"] + half * 16384), L["tma_k"], 64 * half,
                           _add(si["off_k"], n_block * BLOCK_N), bidh_kv, si["bb_k"], bar(L["B_KV"]), EVICT_NORMAL)
-            for half in range(2):
+            for half in range(L["NH"]):
                 _tma_load(L["b16"](OFF["v"] + half * 16384), L["tma_v"], 64 * half,
                           _add(si["off_k"], n_block * BLOCK_N), bidh_kv, si["bb_k"], bar(L["B_KV"]), EVICT_NORMAL)
             with txl.serial(m_min, m_max - 1, unroll=2) as m:
@@ -856,7 +883,7 @@ def _dq_store(locals_):
     BM, OFF = L["BM"], L["OFF"]
     n_block, bidh, bidb = L["tile"]()
     valid = L["tile_valid"](n_block, bidb)
-    half_bytes = BM * 64 * 4
+    half_bytes = BM * L["D"] * 2  # kBlockM * kHeadDim / NumMmaWarpGroups floats
     si = {}
 
     def body():
@@ -864,14 +891,14 @@ def _dq_store(locals_):
         lane_e = txl.local_scalar("uint32")
         txl.ptx.elect_sync(lane_e, lane, txl.uint32(0xFFFFFFFF))
         # gdQaccum: domain_offset(offset_q_padded * kHeadDim) of mdQaccum(_, bidh, bb_q)
-        base = _add(None if si["off_qp"] is None else _i64(si["off_qp"]) * _i64(HEAD_DIM),
-                    _i64(si["bb_q"] * L["h"] + bidh) * _i64(L["s_q_rounded"] * HEAD_DIM))
+        base = _add(None if si["off_qp"] is None else _i64(si["off_qp"]) * _i64(L["D"]),
+                    _i64(si["bb_q"] * L["h"] + bidh) * _i64(L["s_q_rounded"] * L["D"]))
         with txl.serial(m_min, m_max, unroll=2) as m:
             for w in range(2):
                 txl.ptx["bar.sync"](txl.uint32(BAR_DQ_FULL + w), txl.uint32(160))
                 with txl.if_(lane == txl.uint32(1)), txl.then_():
                     txl.ptx[_BULK_REDUCE](
-                        L["dq_accum"].ptr_to([base + _i64(m * (BM * HEAD_DIM) + w * (BM * 64))]),
+                        L["dq_accum"].ptr_to([base + _i64(m * (BM * L["D"]) + w * (BM * L["D"] // 2))]),
                         L["f32p"](OFF["dqacc"] + w * half_bytes),
                         txl.uint32(half_bytes),
                         txl.uint64(EVICT_LAST),
@@ -933,18 +960,30 @@ def _mma(locals_):
     def mainloop_and_epilogue():
         stage = txl.local_scalar("int32", init=txl.int32(0))
         phase = txl.local_scalar("int32", init=txl.int32(0))
-        rdK = txl.alloc_local((64,), "float32")
-        rdV = txl.alloc_local((64,), "float32")
-        for i in range(64):
+        NKV = L["NKV"]
+        rdK = txl.alloc_local((NKV,), "float32")
+        rdV = txl.alloc_local((NKV,), "float32")
+        for i in range(NKV):
             txl.assign(rdK[i], txl.float32(0.0))
             txl.assign(rdV[i], txl.float32(0.0))
         # barrier_KV: try_wait (work_idx % 2 == 0), then the blocking wait if not ready.
         _consumer_wait(bar(L["B_KV"]), txl.int32(0))
         # The mask's seqlen_q / seqlen_k are the tile's SeqlenInfo lengths (mainloop :798-799).
         Lt = L if not L["varlen"] else dict(L, s_q=si["sq"], s_k=si["sk"])
-        with txl.serial(m_min, m_max, unroll=False) as m:
-            _bwd_step(Lt, m, stage, phase, rdK, rdV, n_block, w, tid, r0, q0, warp4, lane)
-        for i in range(64):
+        if L["SEPMASK"] and is_causal:
+            # SeparateMaskingIterations (mainloop :1003-1031): the causal-masked m-blocks first, each loop
+            # its own bwd_step instantiation; the second continues where the first stopped.
+            m_mask_max = txl.local_scalar("int32", init=txl.truncdiv(
+                (n_block + 1) * BLOCK_N - 1 + Lt["s_q"] - Lt["s_k"] - L["window_size_right"], BM) + 1)
+            m1 = txl.local_scalar("int32", init=txl.min(m_max, m_mask_max))
+            with txl.serial(m_min, m1, unroll=False) as m:
+                _bwd_step(Lt, m, stage, phase, rdK, rdV, n_block, w, tid, r0, q0, warp4, lane, causal_mask=True)
+            with txl.serial(txl.max(m_min, m1), m_max, unroll=False) as m:
+                _bwd_step(Lt, m, stage, phase, rdK, rdV, n_block, w, tid, r0, q0, warp4, lane, causal_mask=False)
+        else:
+            with txl.serial(m_min, m_max, unroll=False) as m:
+                _bwd_step(Lt, m, stage, phase, rdK, rdV, n_block, w, tid, r0, q0, warp4, lane)
+        for i in range(NKV):
             txl.ptx["mul.ftz.f32"](rdK[i], rdK[i], L["softmax_scale"])
         if L["gqa"]:
             _epilogue_store_gqa(L, rdK, rdV, n_block, bidh, bidb, w, tid)
@@ -987,10 +1026,19 @@ def _consumer_wait(bar_ptr, phase):
         txl.cuda.mbarrier_wait_parity(bar_ptr, _u32(phase), txl.uint32(TRY_WAIT_TICKS))
 
 
-def _desc(pool_base, byte, lbo_field):
-    """64-bit GMMA descriptor of the operand at pool byte offset ``byte`` (an expression), rebuilt per
-    k-step. Advancing a base descriptor as cute does (``desc.lo += offset >> 4``) is shorter in SASS but
-    measured up to 1.4 % slower on this stack (sm90-probe ISSUE-022 (B)), so the rebuild stays."""
+def _desc(pool_base, byte, lbo_field, advance=False):
+    """64-bit GMMA descriptor of the operand at pool byte offset ``byte`` (an expression).
+
+    The form is chosen per head dim, like the producer's row base (sm90-probe ISSUE-022 (B)):
+    - hd128 rebuilds it per k-step, ``((base + off) >> 4) & 0x3FFF | LBO``. cute's advance form was up to
+      1.4 % slower there in a same-step A/B (perf_gate ledger E4).
+    - hd64 (``advance``) uses cute's advance (``desc.lo += offset >> 4``): a loop-invariant base low word
+      plus ``off >> 4``. At hd64 the rebuild's uniform-datapath work (+40 USHF / +40 ULOP3 per m-block) lands
+      on the HGMMA issue path. Same-step A/B on v4: GQA 32/4 s4096 causal 1495 -> 1465 us, h32 s4096
+      non-causal 2697 -> 2674 us, the rest within noise."""
+    if advance:
+        lo = ((pool_base >> txl.uint32(4)) & txl.uint32(0x3FFF) | txl.uint32(lbo_field << 16)) + (_u32(byte) >> txl.uint32(4))
+        return (txl.uint64(DESC_HI) << txl.uint64(32)) | txl.cast(lo, "uint64")
     lo = ((pool_base + _u32(byte)) >> txl.uint32(4)) & txl.uint32(0x3FFF) | txl.uint32(lbo_field << 16)
     return (txl.uint64(DESC_HI) << txl.uint64(32)) | txl.cast(lo, "uint64")
 
@@ -1004,17 +1052,24 @@ def _fence(regs, n):
         txl.cuda.wgmma.noop_barrier(regs[i])
 
 
-def _bwd_step(L, m, stage, phase, rdK, rdV, n_block, w, tid, r0, q0, warp4, lane):
-    """bwd_step (mainloop :834-1001) for one m_block."""
+def _bwd_step(L, m, stage, phase, rdK, rdV, n_block, w, tid, r0, q0, warp4, lane, causal_mask=None):
+    """bwd_step (mainloop :834-1001) for one m_block. ``causal_mask``: the mask_fn's Causal_mask (default:
+    the build's causality; hd64's SeparateMaskingIterations passes it per loop)."""
     BM, OFF, NC, KM, NQ = L["BM"], L["OFF"], L["NC"], L["KM"], L["NQ"]
-    is_causal = L["is_causal"]
+    KS, NKV, NH, SHUFFLE = L["KS"], L["NKV"], L["NH"], L["SHUFFLE"]
+    is_causal = L["is_causal"] if causal_mask is None else causal_mask
+    # LBO of the MN-major sQ / sdO operands: the 64-column half stride, or 0 for one atom column (hd64)
+    lbo_mn = (L["HALF"] >> 4) if NH == 2 else 0
     bar_s, advance, b16, f32p = L["bar_s"], L["advance"], L["b16"], L["f32p"]
     pb = L["pool_base"]
+
+    def _desc_(byte, lbo):
+        return _desc(pb, byte, lbo, L["DESC_ADV"])
     HALF, Q_TILE = L["HALF"], L["Q_TILE"]
     NS = BM // 2  # S^T / dP^T fragment registers
     q_off = OFF["q"] + stage * Q_TILE
     do_off = OFF["do"] + stage * Q_TILE
-    ds_off = OFF["ds"] + stage * Q_TILE
+    ds_off = OFF["ds"] + stage * L["DS_TILE"]
     lse_off = OFF["lse"] + stage * (L["LSE_STRIDE"] * 4)
     dps_off = OFF["dpsum"] + stage * (L["LSE_STRIDE"] * 4)
     w_i = _i32(w)
@@ -1026,28 +1081,38 @@ def _bwd_step(L, m, stage, phase, rdK, rdV, n_block, w, tid, r0, q0, warp4, lane
     txl.ptx.wgmma.fence.sync.aligned()
     k_base = OFF["k"] + w_i * (64 * 128)
     v_base = OFF["v"] + w_i * (64 * 128)
-    for k in range(8):
+    for k in range(KS):
         txl.ptx[L["wg_s"]](
             *[rS[j] for j in range(NS)],
-            _desc(pb, _kmajor_step(k_base, k, 16384), 1),
-            _desc(pb, _kmajor_step(q_off, k, HALF), 1),
+            _desc_(_kmajor_step(k_base, k, 16384), 1),
+            _desc_(_kmajor_step(q_off, k, HALF), 1),
             k > 0, 1, 1, 0, 0,
         )
     txl.ptx.wgmma.commit_group.sync.aligned()
     _fence(rS, NS)
-    rLSE = txl.alloc_local((2 * NC,), "float32")
-    for c in range(NC):
-        txl.ptx.ld.shared.v2.f32(rLSE[2 * c], rLSE[2 * c + 1], f32p(lse_off + (8 * c + q0) * 4))
+    if SHUFFLE:
+        # ShuffleLSE (:845-855): entries lane / 4 + 8i of the thread's column partition of sLSE, entry j
+        # being q column 8 * (j // 2) + 2 * (lane % 4) + j % 2.
+        rLSE = txl.alloc_local((4,), "float32")
+        for i in range(4):
+            q_col = 8 * (lane // 8 + 4 * i) + q0 + (lane // 4) % 2
+            raw = txl.local_scalar("uint32")
+            txl.ptx.ld.shared.u32(raw, f32p(lse_off + q_col * 4))  # ld.shared.u32, as the source's PTX
+            txl.assign(rLSE[i], txl.reinterpret(raw, ty="float32"))
+    else:
+        rLSE = txl.alloc_local((2 * NC,), "float32")
+        for c in range(NC):
+            txl.ptx.ld.shared.v2.f32(rLSE[2 * c], rLSE[2 * c + 1], f32p(lse_off + (8 * c + q0) * 4))
     # ---- dP^T = V dO^T (ss) ----
     rdP = txl.alloc_local((NS,), "float32")
     _consumer_wait(bar_s(L["b_full_do"], stage), phase)
     _fence(rdP, NS)
     txl.ptx.wgmma.fence.sync.aligned()
-    for k in range(8):
+    for k in range(KS):
         txl.ptx[L["wg_s"]](
             *[rdP[j] for j in range(NS)],
-            _desc(pb, _kmajor_step(v_base, k, 16384), 1),
-            _desc(pb, _kmajor_step(do_off, k, HALF), 1),
+            _desc_(_kmajor_step(v_base, k, 16384), 1),
+            _desc_(_kmajor_step(do_off, k, HALF), 1),
             k > 0, 1, 1, 0, 0,
         )
     txl.ptx.wgmma.commit_group.sync.aligned()
@@ -1084,27 +1149,49 @@ def _bwd_step(L, m, stage, phase, rdK, rdV, n_block, w, tid, r0, q0, warp4, lane
                         rS[reg],
                         txl.if_then_else(8 * i >= seqlenk_col_limit, txl.float32(-float("inf")), rS[reg]),
                     )
+    def stat(regs, c, e):
+        """The q column 8c + q0 + e's LSE / dPsum: own register, or (Shuffle) a shfl.sync.idx of
+        register mi // 8 from lane (mi % 8) * 4 + lane % 4, mi = 2c + e."""
+        if not SHUFFLE:
+            return regs[2 * c + e]
+        mi = 2 * c + e
+        v = txl.local_scalar("float32")
+        txl.ptx.shfl_sync.idx.b32(
+            v, regs[mi // 8], txl.uint32((mi % 8) * 4) + _u32(lane % 4), txl.uint32(31), txl.uint32(0xFFFFFFFF)
+        )
+        return v
+
     # ---- P^T = exp2(S^T * scale_log2 - LSE) ----
     for c in range(NC):
         for e in range(2):
+            lse = stat(rLSE, c, e)
             for i in range(2):
                 reg = 4 * c + 2 * i + e
                 tmp = txl.local_scalar("float32")
                 txl.ptx["mul.ftz.f32"](tmp, rS[reg], L["scale_log2"])
-                txl.ptx["sub.ftz.f32"](tmp, tmp, rLSE[2 * c + e])
+                txl.ptx["sub.ftz.f32"](tmp, tmp, lse)
                 txl.ptx["ex2.approx.ftz.f32"](rS[reg], tmp)
-    rdPsum = txl.alloc_local((2 * NC,), "float32")
-    for c in range(NC):
-        txl.ptx.ld.shared.v2.f32(rdPsum[2 * c], rdPsum[2 * c + 1], f32p(dps_off + (8 * c + q0) * 4))
+    if SHUFFLE:  # ShuffledPsum (:870-878)
+        rdPsum = txl.alloc_local((4,), "float32")
+        for i in range(4):
+            q_col = 8 * (lane // 8 + 4 * i) + q0 + (lane // 4) % 2
+            raw = txl.local_scalar("uint32")
+            txl.ptx.ld.shared.u32(raw, f32p(dps_off + q_col * 4))  # ld.shared.u32, as the source's PTX
+            txl.assign(rdPsum[i], txl.reinterpret(raw, ty="float32"))
+    else:
+        rdPsum = txl.alloc_local((2 * NC,), "float32")
+        for c in range(NC):
+            txl.ptx.ld.shared.v2.f32(rdPsum[2 * c], rdPsum[2 * c + 1], f32p(dps_off + (8 * c + q0) * 4))
     txl.ptx.wgmma.wait_group.sync.aligned(0)
     _fence(rdP, NS)
     # ---- dS^T = P^T (dP^T - dPsum) ----
     for c in range(NC):
         for e in range(2):
+            dps = stat(rdPsum, c, e)
             for i in range(2):
                 reg = 4 * c + 2 * i + e
                 tmp = txl.local_scalar("float32")
-                txl.ptx["sub.ftz.f32"](tmp, rdP[reg], rdPsum[2 * c + e])
+                txl.ptx["sub.ftz.f32"](tmp, rdP[reg], dps)
                 txl.ptx["mul.ftz.f32"](rdP[reg], rS[reg], tmp)
     rP = txl.alloc_local((NS // 2,), "uint32")
     rdS = txl.alloc_local((NS // 2,), "uint32")
@@ -1124,17 +1211,17 @@ def _bwd_step(L, m, stage, phase, rdK, rdV, n_block, w, tid, r0, q0, warp4, lane
         txl.ptx[_STSM_T](b16(byte), *[rdS[4 * p + j] for j in range(4)])
     # ---- dV += P^T dO (rs) ----
     _fence(rP, NS // 2)
-    _fence(rdV, 64)
+    _fence(rdV, NKV)
     txl.ptx.wgmma.fence.sync.aligned()
     for k in range(KM):
         txl.ptx[L["wg_kv"]](
-            *[rdV[j] for j in range(64)],
+            *[rdV[j] for j in range(NKV)],
             *[rP[4 * k + j] for j in range(4)],
-            _desc(pb, do_off + k * 2048, HALF >> 4),
+            _desc_(do_off + k * 2048, lbo_mn),
             True, 1, 1, 1,
         )
     txl.ptx.wgmma.commit_group.sync.aligned()
-    _fence(rdV, 64)
+    _fence(rdV, NKV)
     _fence(rP, NS // 2)
     txl.ptx.fence.proxy.async_.shared__cta()
     txl.ptx["bar.sync"](txl.uint32(BAR_PDS), txl.uint32(NUM_MMA_THREADS))
@@ -1142,40 +1229,43 @@ def _bwd_step(L, m, stage, phase, rdK, rdV, n_block, w, tid, r0, q0, warp4, lane
     rdQ = txl.alloc_local((NQ,), "float32")
     _fence(rdQ, NQ)
     txl.ptx.wgmma.fence.sync.aligned()
-    k_half = OFF["k"] + w_i * 16384
+    if L["MDQ2"]:  # AtomLayoutMdQ 2: dS rows 64w.. of the stage, all of sK (one 64-column atom)
+        ds_a, k_half = ds_off + w_i * (64 * 128), OFF["k"]
+    else:  # AtomLayoutMdQ 1: all dS rows, the warpgroup's 64-column half of sK
+        ds_a, k_half = ds_off, OFF["k"] + w_i * 16384
     for k in range(8):
-        if is_causal:
+        if not L["dq_swapab"]:
             txl.ptx[L["wg_q"]](
                 *[rdQ[j] for j in range(NQ)],
-                _desc(pb, _kmajor_step(ds_off, k, HALF), 1),
-                _desc(pb, k_half + k * 2048, 0),
+                _desc_(_kmajor_step(ds_a, k, HALF), 1),
+                _desc_(k_half + k * 2048, 0),
                 k > 0, 1, 1, 0, 1,
             )
         else:
             txl.ptx[L["wg_q"]](
                 *[rdQ[j] for j in range(NQ)],
-                _desc(pb, k_half + k * 2048, 0),
-                _desc(pb, _kmajor_step(ds_off, k, HALF), 1),
+                _desc_(k_half + k * 2048, 0),
+                _desc_(_kmajor_step(ds_off, k, HALF), 1),
                 k > 0, 1, 1, 1, 0,
             )
     txl.ptx.wgmma.commit_group.sync.aligned()
     _fence(rdQ, NQ)
     txl.ptx.wgmma.wait_group.sync.aligned(1)
-    _fence(rdV, 64)
+    _fence(rdV, NKV)
     _release(bar_s(L["b_empty_do"], stage))
     # ---- dK += dS^T Q (rs) ----
     _fence(rdS, NS // 2)
-    _fence(rdK, 64)
+    _fence(rdK, NKV)
     txl.ptx.wgmma.fence.sync.aligned()
     for k in range(KM):
         txl.ptx[L["wg_kv"]](
-            *[rdK[j] for j in range(64)],
+            *[rdK[j] for j in range(NKV)],
             *[rdS[4 * k + j] for j in range(4)],
-            _desc(pb, q_off + k * 2048, HALF >> 4),
+            _desc_(q_off + k * 2048, lbo_mn),
             True, 1, 1, 1,
         )
     txl.ptx.wgmma.commit_group.sync.aligned()
-    _fence(rdK, 64)
+    _fence(rdK, NKV)
     _fence(rdS, NS // 2)
     txl.ptx.wgmma.wait_group.sync.aligned(1)
     _fence(rdQ, NQ)
@@ -1184,13 +1274,13 @@ def _bwd_step(L, m, stage, phase, rdK, rdV, n_block, w, tid, r0, q0, warp4, lane
     t = tid % 128
     for i in range(NQ // 4):
         txl.ptx.st.shared.v4.f32(
-            f32p(OFF["dqacc"] + w_i * (BM * 256) + (i * 128 + t) * 16),
+            f32p(OFF["dqacc"] + w_i * (BM * L["D"] * 2) + (i * 128 + t) * 16),
             rdQ[4 * i], rdQ[4 * i + 1], rdQ[4 * i + 2], rdQ[4 * i + 3],
         )
     txl.ptx.fence.proxy.async_.shared__cta()
     txl.ptx["bar.arrive"](txl.cast(BAR_DQ_FULL + w_i, "uint32"), txl.uint32(160))
     txl.ptx.wgmma.wait_group.sync.aligned(0)
-    _fence(rdK, 64)
+    _fence(rdK, NKV)
     _release(bar_s(L["b_empty_q"], stage))
     advance(stage, phase)
 
@@ -1206,17 +1296,18 @@ def _epilogue_store(L, rdK, rdV, n_block, bidh, bidb, w, tid, r0, warp4, lane):
     """CollectiveEpilogueBwd::store, Use_TMA (epilogue_bwd.hpp:163-235)."""
     OFF, b16 = L["OFF"], L["b16"]
     w_i = _i32(w)
-    rV16 = txl.alloc_local((32,), "uint32")
-    rK16 = txl.alloc_local((32,), "uint32")
-    for wd in range(32):
+    NW = L["NKV"] // 2
+    rV16 = txl.alloc_local((NW,), "uint32")
+    rK16 = txl.alloc_local((NW,), "uint32")
+    for wd in range(NW):
         txl.ptx["cvt.rn.bf16x2.f32"](rV16[wd], rdV[2 * wd + 1], rdV[2 * wd])
-    for wd in range(32):
+    for wd in range(NW):
         txl.ptx["cvt.rn.bf16x2.f32"](rK16[wd], rdK[2 * wd + 1], rdK[2 * wd])
     txl.ptx["bar.sync"](txl.uint32(BAR_EPILOGUE), txl.uint32(NUM_MMA_THREADS))
     kk = lane % 8
     jm = lane // 8
     for base_off, regs in ((OFF["v"], rV16), (OFF["k"], rK16)):  # dV first, then dK
-        for p in range(8):
+        for p in range(L["D"] // 16):
             c_j = 2 * p + jm // 2
             i_j = jm % 2
             row = w_i * 64 + warp4 * 16 + i_j * 8 + kk  # KV row
@@ -1235,7 +1326,7 @@ def _epilogue_store(L, rdK, rdV, n_block, bidh, bidb, w, tid, r0, warp4, lane):
         txl.ptx.elect_sync(el_lane, el, txl.uint32(0xFFFFFFFF))
         with txl.if_(el == txl.uint32(1)), txl.then_():
             for tmap, base_off in ((L["tma_dv"], OFF["v"]), (L["tma_dk"], OFF["k"])):
-                for half in range(2):
+                for half in range(L["NH"]):
                     txl.ptx[_TMA_STORE](
                         txl.address_of(tmap), txl.int32(64 * half), _i32(n_block * BLOCK_N),
                         _i32(bidh), _i32(bidb), b16(base_off + half * 16384),
@@ -1252,17 +1343,18 @@ def _epilogue_store_varlen(L, rdK, rdV, n_block, bidh, bidb, w, tid, warp4, lane
     dV, then dK, at the batch's cu_seqlens_k offset."""
     OFF, b16 = L["OFF"], L["b16"]
     w_i = _i32(w)
-    rV16 = txl.alloc_local((32,), "uint32")
-    rK16 = txl.alloc_local((32,), "uint32")
-    for wd in range(32):
+    NW = L["NKV"] // 2
+    rV16 = txl.alloc_local((NW,), "uint32")
+    rK16 = txl.alloc_local((NW,), "uint32")
+    for wd in range(NW):
         txl.ptx["cvt.rn.bf16x2.f32"](rV16[wd], rdV[2 * wd + 1], rdV[2 * wd])
-    for wd in range(32):
+    for wd in range(NW):
         txl.ptx["cvt.rn.bf16x2.f32"](rK16[wd], rdK[2 * wd + 1], rdK[2 * wd])
     txl.ptx["bar.sync"](txl.uint32(BAR_EPILOGUE), txl.uint32(NUM_MMA_THREADS))  # K and V reads done
     kk = lane % 8
     jm = lane // 8
     for base_off, regs in ((OFF["v"], rV16), (OFF["k"], rK16)):  # dV first, then dK
-        for p in range(8):
+        for p in range(L["D"] // 16):
             c_j = 2 * p + jm // 2
             i_j = jm % 2
             row = w_i * 64 + warp4 * 16 + i_j * 8 + kk  # KV row
@@ -1273,13 +1365,15 @@ def _epilogue_store_varlen(L, rdK, rdV, n_block, bidh, bidb, w, tid, warp4, lane
     off = V.offset(bidb, V.cu_k)  # SeqlenInfo<Varlen, kBlockN>(bidb, shape_dK[0], cu_seqlens_k, seqused_k)
     n = V.seqlen(bidb, V.cu_k, V.su_k, L["s_k"])
     bb = V.batch(bidb, V.cu_k)
-    col8 = (tid % 16) * 8
-    chunk = tid % 16  # 16-byte chunk of the 256-byte row; half = chunk // 8
+    TPR = L["D"] // 8  # GmemTiledCopydKV: kGmemThreadsPerRow; RPP rows per pass
+    RPP = NUM_MMA_THREADS // TPR
+    col8 = (tid % TPR) * 8
+    chunk = tid % TPR  # 16-byte chunk of the row; half = chunk // 8
     regs = {}
     for name, base_off in (("v", OFF["v"]), ("k", OFF["k"])):  # flash::copy smem -> registers (EvenN)
         regs[name] = []
-        for k in range(BLOCK_N // 16):
-            r = tid // 16 + 16 * k
+        for k in range(BLOCK_N // RPP):
+            r = tid // TPR + RPP * k
             lo = txl.local_scalar("uint64")
             hi = txl.local_scalar("uint64")
             byte = base_off + (chunk // 8) * 16384 + _sw128(r, chunk % 8)
@@ -1290,13 +1384,13 @@ def _epilogue_store_varlen(L, rdK, rdV, n_block, bidh, bidb, w, tid, warp4, lane
     # tdKVgdV / tdKVgdK: this thread's first element (row tid / 16 of the tile, column col8), then a
     # fixed 16-row stride per pass (the partition's (k) mode), as cute's partition_D addresses them.
     base = txl.local_scalar("int64", init=(
-        ((_i64(bb) * _i64(L["s_k"]) + _i64(off + n_block * BLOCK_N + tid // 16)) * _i64(L["h"]) + _i64(bidh))
+        ((_i64(bb) * _i64(L["s_k"]) + _i64(off + n_block * BLOCK_N + tid // TPR)) * _i64(L["h"]) + _i64(bidh))
         * _i64(L["d"]) + _i64(col8)) // 4)  # in 16-byte (2 x u64) units of 8 bf16
-    pass_stride = txl.local_scalar("int64", init=_i64(16) * _i64(L["h"]) * _i64(L["d"]) // 4)
-    r0 = tid // 16
+    pass_stride = txl.local_scalar("int64", init=_i64(RPP) * _i64(L["h"]) * _i64(L["d"]) // 4)
+    r0 = tid // TPR
     for name, out in (("v", L["dv_out"]), ("k", L["dk_out"])):  # registers -> gmem, dV first
-        for k in range(BLOCK_N // 16):
-            with txl.if_(txl.And(r0 + 16 * k < rows, pcol)), txl.then_():
+        for k in range(BLOCK_N // RPP):
+            with txl.if_(txl.And(r0 + RPP * k < rows, pcol)), txl.then_():
                 lo, hi = regs[name][k]
                 txl.ptx.st.global_.v2.u64(out.view("uint64").ptr_to([base + pass_stride * k]), lo, hi)
 
@@ -1311,27 +1405,27 @@ def _epilogue_store_gqa(L, rdK, rdV, n_block, bidh, bidb, w, tid):
     bidh_kv = txl.local_scalar("int32", init=L["fdiv"](bidh, *L["qhkh"]))
     if not L["varlen"]:
         s_k_rounded = (L["s_k"] + BLOCK_N - 1) // BLOCK_N * BLOCK_N
-        tile = (_i64(bidb * L["h_k"] + bidh_kv) * _i64(s_k_rounded) + _i64(n_block * BLOCK_N)) * _i64(HEAD_DIM)
+        tile = (_i64(bidb * L["h_k"] + bidh_kv) * _i64(s_k_rounded) + _i64(n_block * BLOCK_N)) * _i64(L["D"])
     else:  # SeqlenInfo<Varlen, kBlockN>(bidb, shape_dKaccum[0], cu_seqlens_k, seqused_k): offset_padded
         V = L["V"]
         off_p = V.offset(bidb, V.cu_k, BLOCK_N)
         bb = V.batch(bidb, V.cu_k)
         tile = (_i64(bb * L["h_k"] + bidh_kv) * _i64(L["s_k_rounded_in"]) + _i64(off_p)
-                + _i64(n_block * BLOCK_N)) * _i64(HEAD_DIM)
+                + _i64(n_block * BLOCK_N)) * _i64(L["D"])
     txl.ptx["bar.sync"](txl.uint32(BAR_EPILOGUE), txl.uint32(NUM_MMA_THREADS))  # K and V reads done
     for regs, accum in ((rdV, L["dv_accum"]), (rdK, L["dk_accum"])):
         if regs is rdK:
             txl.ptx["bar.sync"](txl.uint32(BAR_EPILOGUE), txl.uint32(NUM_MMA_THREADS))  # sdKV free again
-        for i in range(16):
+        for i in range(L["NKV"] // 4):
             txl.ptx.st.shared.v4.f32(
-                f32p(OFF["k"] + w_i * 32768 + (i * 128 + t) * 16),
+                f32p(OFF["k"] + w_i * (64 * L["D"] * 4) + (i * 128 + t) * 16),
                 regs[4 * i], regs[4 * i + 1], regs[4 * i + 2], regs[4 * i + 3],
             )
         txl.ptx.fence.proxy.async_.shared__cta()
         txl.ptx["bar.sync"](txl.uint32(BAR_EPILOGUE), txl.uint32(NUM_MMA_THREADS))
         with txl.if_(tid == 0), txl.then_():
             txl.ptx[_BULK_REDUCE](
-                accum.ptr_to([tile]), f32p(OFF["k"]), txl.uint32(BLOCK_N * HEAD_DIM * 4), txl.uint64(EVICT_LAST)
+                accum.ptr_to([tile]), f32p(OFF["k"]), txl.uint32(BLOCK_N * L["D"] * 4), txl.uint64(EVICT_LAST)
             )
             txl.ptx.cp.async_.bulk.commit_group()
             txl.ptx.cp.async_.bulk.wait_group.read(0)
@@ -1340,7 +1434,9 @@ def _epilogue_store_gqa(L, rdK, rdV, n_block, bidh, bidb, w, tid):
 def _store_zero(L, n_block, bidh, bidb, tid):
     """CollectiveEpilogueBwd::store_zero (epilogue_bwd.hpp:286-323): GmemTiledCopydKV (16 rows x
     16 threads x 8 elements), 128-bit zero stores under the row and column predicates, dK then dV."""
-    col8 = (tid % 16) * 8
+    TPR = L["D"] // 8  # GmemTiledCopydKV: kGmemThreadsPerRow; RPP rows per pass
+    RPP = NUM_MMA_THREADS // TPR
+    col8 = (tid % TPR) * 8
     pcol = col8 < L["d"]
     off, bb = None, bidb
     if not L["varlen"]:
@@ -1351,8 +1447,8 @@ def _store_zero(L, n_block, bidh, bidb, tid):
         rows_left = V.seqlen(bidb, V.cu_k, V.su_k, L["s_k"]) - n_block * BLOCK_N
         bb = V.batch(bidb, V.cu_k)
     for out in (L["dk_out"], L["dv_out"]):
-        for k in range(BLOCK_N // 16):
-            r = tid // 16 + 16 * k
+        for k in range(BLOCK_N // RPP):
+            r = tid // TPR + RPP * k
             with txl.if_(txl.And(r < rows_left, pcol)), txl.then_():
                 row = _i64(n_block * BLOCK_N + r) if off is None else _i64(off + n_block * BLOCK_N + r)
                 idx = ((_i64(bb) * _i64(L["s_k"]) + row) * _i64(L["h"]) + _i64(bidh)) * _i64(L["d"]) + _i64(col8)
