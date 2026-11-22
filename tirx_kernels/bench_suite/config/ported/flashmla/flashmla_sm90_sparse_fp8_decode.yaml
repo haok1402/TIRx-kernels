@@ -1,0 +1,38 @@
+# FlashMLA SM90 sparse FP8 decode: the upstream performance sweep (tests/test_flash_mla_sparse_decoding.py
+# performance_cases): DeepSeek-V3.2 (V32, d_qk 576, 128 heads) and MODEL1 (d_qk 512, 64 / 128 heads, extra
+# KV cache, extra_topk_length) production batch sizes, and the peak-perf shapes (topk 16384).
+kernel: flashmla_sm90_sparse_fp8_decode
+selection_rationale: The defaults span V3.2 and MODEL1, 64 and 128 heads (cluster of 1 / 2), production and peak top-k, and the small-batch regime.
+configs:
+  - {config: prod_v32_v32_b2_hq128_sq2_sk32768_topk2048_bs64_varlen, default: false}
+  - {config: prod_v32_v32_b64_hq128_sq2_sk32768_topk2048_bs64_varlen, default: false}
+  - {config: prod_v32_v32_b74_hq128_sq2_sk32768_topk2048_bs64_varlen, default: true}
+  - {config: prod_v32_v32_b128_hq128_sq2_sk32768_topk2048_bs64_varlen, default: false}
+  - {config: prod_m1c1_model1_b2_hq64_sq2_sk16384_topk128_bs256_varlen_x16384_512_64, default: false}
+  - {config: prod_m1c1_model1_b64_hq64_sq2_sk16384_topk128_bs256_varlen_x16384_512_64, default: false}
+  - {config: prod_m1c1_model1_b74_hq64_sq2_sk16384_topk128_bs256_varlen_x16384_512_64, default: true}
+  - {config: prod_m1c1_model1_b128_hq64_sq2_sk16384_topk128_bs256_varlen_x16384_512_64, default: false}
+  - {config: prod_m1c1_model1_b148_hq64_sq2_sk16384_topk128_bs256_varlen_x16384_512_64, default: false}
+  - {config: prod_m1c1_model1_b256_hq64_sq2_sk16384_topk128_bs256_varlen_x16384_512_64, default: false}
+  - {config: prod_m1c2_model1_b2_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_64, default: true}
+  - {config: prod_m1c2_model1_b64_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_64, default: false}
+  - {config: prod_m1c2_model1_b74_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_64, default: false}
+  - {config: prod_m1c2_model1_b128_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_64, default: false}
+  - {config: prod_m1c2_model1_b148_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_64, default: false}
+  - {config: prod_m1c2_model1_b256_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_64, default: false}
+  - {config: prod_m1c3_model1_b2_hq64_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
+  - {config: prod_m1c3_model1_b64_hq64_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
+  - {config: prod_m1c3_model1_b74_hq64_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
+  - {config: prod_m1c3_model1_b128_hq64_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
+  - {config: prod_m1c3_model1_b148_hq64_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
+  - {config: prod_m1c3_model1_b256_hq64_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
+  - {config: prod_m1c4_model1_b2_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
+  - {config: prod_m1c4_model1_b64_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
+  - {config: prod_m1c4_model1_b74_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
+  - {config: prod_m1c4_model1_b128_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: true}
+  - {config: prod_m1c4_model1_b148_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
+  - {config: prod_m1c4_model1_b256_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
+  - {config: peak_model1_b148_hq64_sq2_sk32768_topk16384_bs64_varlen, default: false}
+  - {config: peak_v32_b148_hq64_sq2_sk32768_topk16384_bs64_varlen, default: false}
+  - {config: peak_model1_b148_hq128_sq2_sk32768_topk16384_bs64_varlen, default: true}
+  - {config: peak_v32_b148_hq128_sq2_sk32768_topk16384_bs64_varlen, default: false}
