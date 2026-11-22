@@ -69,6 +69,8 @@ class MQALogitsSM90Config:
     # `generate_ks_ke_tests`; "random" draws arbitrary (possibly empty, unaligned) ranges.
     ks_ke: str = "nocp"
     seed: int = 0
+    # Scales the weights; 1e-38 makes every logit an FP32 subnormal (FTZ-sensitive).
+    weights_scale: float = 1.0
 
     @property
     def block_q(self) -> int:
@@ -124,10 +126,13 @@ class KernelSpec:
 def _label(c: dict[str, Any]) -> str:
     dtype = "f32" if c["logits_dtype"] == "float32" else "bf16"
     mode = "compressed" if c["compressed_logits"] else "dense"
-    return (
+    label = (
         f"s{c['seq_len']}_skv{c['seq_len_kv']}_h{c['num_heads']}_d{c['head_dim']}"
         f"_{dtype}_{mode}_{c['ks_ke']}"
     )
+    if c.get("weights_scale", 1.0) != 1.0:
+        label += f"_w{c['weights_scale']:g}"
+    return label
 
 
 def _case(**kwargs: Any) -> dict[str, Any]:
@@ -141,6 +146,8 @@ def _case(**kwargs: Any) -> dict[str, Any]:
         "ks_ke": kwargs.get("ks_ke", "nocp"),
         "seed": kwargs.get("seed", 0),
     }
+    if kwargs.get("weights_scale", 1.0) != 1.0:
+        config["weights_scale"] = kwargs["weights_scale"]
     config["label"] = _label(config)
     return config
 
@@ -203,7 +210,8 @@ _PRODUCTION_LARGE_CASES = [
 ]
 EDGE_CASES = [
     # seq_len not a multiple of BLOCK_Q, a single query, seq_len_kv not a multiple of 4 or 256.
-    _case(seq_len=1, seq_len_kv=1, num_heads=32, head_dim=32, ks_ke="nocp", seed=900),
+    # (DeepGEMM's host asserts on seq_len_kv == 1: its per-row scale tensor loses its dimension.)
+    _case(seq_len=1, seq_len_kv=3, num_heads=32, head_dim=32, ks_ke="nocp", seed=900),
     _case(seq_len=3, seq_len_kv=257, num_heads=32, head_dim=64, ks_ke="random", seed=901),
     _case(seq_len=1001, seq_len_kv=4099, num_heads=64, head_dim=128, ks_ke="random", seed=902),
     _case(
@@ -227,6 +235,20 @@ EDGE_CASES = [
     ),
     # More query blocks than SMs times Q stages: the persistent loop wraps the Q ring.
     _case(seq_len=4099, seq_len_kv=4099, num_heads=64, head_dim=64, ks_ke="nocp", seed=905),
+    # Subnormal logits: DeepGEMM's FP32 is IEEE (no FTZ), so these must survive bit for bit.
+    _case(seq_len=512, seq_len_kv=4096, weights_scale=1e-38, ks_ke="cp", seed=907),
+    _case(
+        seq_len=512,
+        seq_len_kv=4096,
+        num_heads=32,
+        head_dim=64,
+        compressed_logits=True,
+        weights_scale=1e-38,
+        ks_ke="cp",
+        seed=908,
+    ),
+    # Logits storage above 2^31 elements (32768 x 65792): 64-bit store offsets.
+    _case(seq_len=32768, seq_len_kv=65536, num_heads=64, head_dim=128, ks_ke="nocp", seed=906),
 ]
 CONFIGS = _SPECIALIZATION_CASES + _PRODUCTION_LARGE_CASES + EDGE_CASES
 
@@ -309,7 +331,7 @@ def prepare_data(**kwargs: Any) -> dict[str, Any]:
     s, skv, h, d = config.seq_len, config.seq_len_kv, config.num_heads, config.head_dim
     q = torch.randn(s, h, d, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(skv, d, device="cuda", dtype=torch.bfloat16)
-    weights = torch.randn(s, h, device="cuda", dtype=torch.float32)
+    weights = torch.randn(s, h, device="cuda", dtype=torch.float32) * config.weights_scale
     ks, ke = _generate_ks_ke(config)
     q_in = q.to(torch.float8_e4m3fn)
     kv_in = per_custom_dims_cast_to_fp8(kv, (0,), False)
@@ -441,17 +463,20 @@ def run_deepgemm_into_sentinel(data: dict[str, Any]) -> torch.Tensor:
 
     `fp8_fp4_mqa_logits` allocates its own output with `torch.empty`; a sentinel tensor of the
     same size is freed just before the call so the caching allocator hands its block back, and
-    the reuse is checked by address.
+    the reuse is checked by address.  A first call can allocate other buffers first (JIT
+    runtime state), so a call whose output landed elsewhere is discarded and retried.
     """
     config: MQALogitsSM90Config = data["config"]
-    torch.cuda.synchronize()
-    probe = sentinel_storage(config, data["max_seqlen_k"])
-    address = probe.data_ptr()
-    del probe
-    out = run_deepgemm(data, clean_logits=False)
-    if out.data_ptr() != address:
-        raise AssertionError("DeepGEMM output did not reuse the sentinel block")
-    return out
+    for _ in range(3):
+        torch.cuda.synchronize()
+        probe = sentinel_storage(config, data["max_seqlen_k"])
+        address = probe.data_ptr()
+        del probe
+        out = run_deepgemm(data, clean_logits=False)
+        if out.data_ptr() == address:
+            return out
+        del out
+    raise AssertionError("DeepGEMM output did not reuse the sentinel block")
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -521,7 +546,10 @@ def run_test(*, backend_config=None, **kwargs: Any) -> None:
     build_launch(data, actual, backend_config=backend_config)()
     torch.cuda.synchronize()
     assert_bitwise_identical(actual, expected, detail=_label(asdict(config)))
-    check_against_reference(data, actual)
+    if config.weights_scale == 1.0:
+        # (With subnormal weights the FP32 torch reference itself underflows; there the bitwise
+        # agreement with DeepGEMM is the whole check.)
+        check_against_reference(data, actual)
 
 
 def prepare_bench(*, backend_config=None, **kwargs: Any):
