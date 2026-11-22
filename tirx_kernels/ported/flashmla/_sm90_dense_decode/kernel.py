@@ -170,7 +170,8 @@ def build_main_kernel(dtype: str, *, backend_config=None):
 
         # ---- small PTX helpers (the fast-math forms the source compiles to) ----
         def fmax(d, a, bb):
-            txl.ptx["max.ftz.f32"](d, a, bb)
+            # IEEE maxNum (`fmaxf`): one max.ftz.f32 under the source's fast-math build.
+            txl.assign(d, txl.fmax(a, bb))
 
         def fmul(d, a, bb):
             txl.ptx["mul.ftz.f32"](d, a, bb)

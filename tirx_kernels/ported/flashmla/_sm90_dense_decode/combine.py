@@ -29,7 +29,8 @@ _LOG2E = 1.4426950408889634  # (float)M_LOG2E
 
 
 def _fmax(dst, a, b):
-    txl.ptx["max.ftz.f32"](dst, a, b)
+    # IEEE maxNum (`fmaxf`): one max.ftz.f32 under the source's fast-math build.
+    txl.assign(dst, txl.fmax(a, b))
 
 
 def build_combine_kernel(dtype: str, max_splits: int, *, backend_config=None):
