@@ -398,6 +398,9 @@ def make_kernel(
                     # and the block offset into a per-row limit leaves one compare against a constant
                     # per register: ISETP + FSEL. The same mask as T.Or(k_col >= seq_len, k_col > q_row),
                     # whose short-circuit `||` NVRTC compiled into a branch per register (ISSUE-017).
+                    # Kept once ISSUE-017 is fixed: there, the two-compare form is branch-free and
+                    # equally fast on causal, but non-causal runs 0.5-1.1% slower than with this form
+                    # (sm90-probe fa3c/logs/v4_table.log).
                     lane = tw & 31
                     j0 = n_blocks - 1
                     for h in range(2):
