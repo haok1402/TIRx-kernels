@@ -179,11 +179,16 @@ the layout probe printed:
 `sdK`/`sdV` alias `sK`/`sV`; the epilogue's `named_sync(1, 256)` orders them after the last
 read of K and V by both WGs.
 
-GMMA descriptors (`desc(addr, kind)`): low word `(addr >> 4) & 0x3FFF` plus the LBO field, high
-word 0x40000040 (SWIZZLE_128B, SBO = 1024 B). K-major operand, k-step `k` of 16 elements:
+GMMA descriptors (`desc(addr, kind)`): low word = start address field `(addr >> 4) & 0x3FFF` (bits
+0-13) | LBO field << 16, high word 0x40000040 (SWIZZLE_128B in bits 62-63, SBO field 64 = 1024 B).
+The export's descriptor high/low constants (`or.b64` immediates, mma_traits_sm90_gmma.hpp:216/327):
+K-major operands (sK, sV, sQ, sdO in S^T/dP^T; sdS in dQ) `0x4000004000010000`, i.e. LBO field 1
+(16 B, ignored for swizzled K-major); MN-major sQ / sdO (dV, dK B operands, two 64-column halves)
+`0x4000004002000000` causal / `0x4000004002800000` non-causal, i.e. LBO = the half stride kBlockM*128
+(8192 / 10240 B); MN-major sK half (dQ B / dQ^T A operand, one 64-column atom per WG)
+`0x4000004000000000`, LBO 0. The start-address field is added to the low word per operand and k-step. K-major operand, k-step `k` of 16 elements:
 `base + (k // 4) * half_stride + (k % 4) * 32`. MN-major operand (tnsp = 1), k-step `k` over 16
-rows: `base + k * 2048`, LBO = the 64-column half stride (16384 for sK/sV, `kBlockM*128` for
-sQ/sdO).
+rows: `base + k * 2048`, LBO as listed above (`kBlockM*128` for sQ/sdO, 0 for the sK half).
 
 Register fragments (per MMA thread t of a WG, lane = t % 32, warp = t // 32): the WGMMA C
 fragment of an m64nN tile holds rows `16*warp + lane//4 (+8)` and columns `8*c + 2*(lane%4)
@@ -197,16 +202,24 @@ tile (FA3's `convert_layout_acc_Aregs`: no data movement).
 
 ```python
 @kernel(grid=(cdiv(s_q, kBlockM), h, b), block=256)   # __launch_bounds__(256, 2)
-def flash_bwd_preprocess(O, dO, LSE, dPsum, LSE_log2, dQaccum, dq_semaphore, s_q, ...):
+def flash_bwd_preprocess(O, dO, LSE, dPsum, LSE_log2, dQaccum, dq_semaphore, s_q, d, h, b):
+    # d (head dim, get<1>(shape_O)) is a runtime value: the column predicate below reads it.
     m_block, bidh, bidb = block_idx
     t = thread_idx; row0 = t // 16; col8 = (t % 16) * 8          # GmemTiledCopy (16 x 16) x 8
+    pcol = col8 < d                                                # tOpO (one K iteration: 128 = 16 x 8)
     lse = LSE[bidb, bidh, m_block*kBlockM + t] if t < s_q - m_block*kBlockM and t < kBlockM else +inf
     # instruction_selection: ld.global.f32 (predicated by branch); extent: scalar
-    for i in range(kBlockM // 16):                                 # 4 (m64) / 5 (m80) rows per thread
+    for i in range(kBlockM // 16):                                 # all O rows first (flash::copy of tOgO)
         r = row0 + 16*i
-        rO[i]  = copy_g2r(O [bidb, m_block*kBlockM + r, bidh, col8:col8+8], mask=r < s_q - m_block*kBlockM, fill=0)
-        rdO[i] = copy_g2r(dO[...same...], mask=..., fill=0)
-        # instruction_selection: ld.global.v2.u64 (128-bit), branch-guarded; zero fill by mov; extent: 8 / 10 loads
+        rO[i] = copy_g2r(O[bidb, m_block*kBlockM + r, bidh, col8:col8+8],
+                         mask=(r < s_q - m_block*kBlockM) and pcol, fill=0)   # Clear_OOB_MN, Clear_OOB_K
+        # instruction_selection: ld.global.v2.u64 (128-bit) under setp.lt + and.pred branch; zero fill by mov;
+        #   extent: kBlockM // 16 (4 / 5)
+    for i in range(kBlockM // 16):                                 # then all dO rows (flash::copy of tOgdO)
+        r = row0 + 16*i
+        rdO[i] = copy_g2r(dO[bidb, m_block*kBlockM + r, bidh, col8:col8+8],
+                          mask=(r < s_q - m_block*kBlockM) and pcol, fill=0)
+        # instruction_selection: ld.global.v2.u64 (128-bit), same predicate; extent: 4 / 5
     for i in range(kBlockM // 16):
         o, g = cast(rO[i], f32), cast(rdO[i], f32)                  # bf16 -> f32 by shl/and (no cvt)
         acc = mul(g[0], o[0]); acc = fma(g[j], o[j], acc) for j in 1..7
@@ -222,7 +235,8 @@ def flash_bwd_preprocess(O, dO, LSE, dPsum, LSE_log2, dQaccum, dq_semaphore, s_q
         # instruction_selection: mul.ftz.f32 + selp + st.global.f32; extent: scalar
     fill(dQaccum[bidb, bidh, m_block*kBlockM*128 + t*4 + 1024*i : +4], 0) for i in range(kBlockM*128 // 1024)
     # instruction_selection: st.global.v2.u64 (128-bit zero); extent: 8 / 10 per thread
-    if t == 0:
+    if dq_semaphore != nullptr and t == 0:                         # mha_bwd always passes one (non-null)
+        # instruction_selection: setp.eq.s64 (pointer null test) + setp (t == 0), branch
         dq_semaphore[bidh + bidb*h + m_block*h*b] = 0              # instruction_selection: st.global.u32
 ```
 
@@ -231,16 +245,23 @@ def flash_bwd_preprocess(O, dO, LSE, dPsum, LSE_log2, dQaccum, dq_semaphore, s_q
 ```python
 @specialize(causal in {True, False})
 @kernel(grid=sched_grid, block=384, min_blocks_per_sm=1, dyn_smem=199680 | 232448)
-def flash_bwd_sm90(tma_q, tma_do, tma_k, tma_v, tma_dk, tma_dv, LSE_log2, dPsum, dQaccum,
-                   s_q, s_k, h, b, softmax_scale, scale_log2, sched_params...):
-    pool = tile(SMEM, u8, dyn_bytes, align=1024)                   # offsets: table above
+def flash_bwd_sm90(tma_q, tma_do, tma_k, tma_v, tma_dk, tma_dv, LSE_log2, dPsum, dQaccum, dK, dV,
+                   s_q, s_k, d, h, b, window_size_right, softmax_scale, scale_log2, sched_params...):
+    # window_size_right (0 for causal, -1 otherwise, from mha_bwd) and d are runtime kernel parameters:
+    # every role's m-block range reads window_size_right (ld.param + sub.s32), store_zero reads d.
+    pool = tile(SMEM, u8, dyn_bytes, align=1024)                   # offsets: table above (the PTX declares the
+                                                                    # extern pool .align 16; 1024 B comes from the
+                                                                    # runtime base, as upstream relies on)
+    lane_pred = elect_one()                                        # K:166, one elect.sync reused below
+    # instruction_selection: elect.sync; extent: scalar
     warp = shfl_idx(thread_idx // 32, 0)                           # canonical_warp_idx_sync
     # instruction_selection: shfl.sync.idx.b32; extent: scalar
-    wg = thread_idx // 128
-    if warp == 0 and elect_one():
+    if warp == 0 and lane_pred:
         prefetch_tensormap(tma_q, tma_do, tma_k, tma_v, tma_dk, tma_dv)
         # instruction_selection: prefetch.tensormap x6; extent: 6
-    if warp == 0 and elect_one():
+    wg = shfl_idx(thread_idx // 128, 0)                            # canonical_warp_group_idx
+    # instruction_selection: shfl.sync.idx.b32; extent: scalar
+    if warp == 0 and lane_pred:
         mbar_init(barrier_KV, 1)                                   # instruction_selection: mbarrier.init.shared::cta.b64
     for pipe in (pipe_q, pipe_do):                                 # PipelineTmaAsync ctor, each: warp 0 elected lane
         if warp == 0 and elect_one():
@@ -252,7 +273,7 @@ def flash_bwd_sm90(tma_q, tma_do, tma_k, tma_v, tma_dk, tma_dv, LSE_log2, dPsum,
 
     if wg == 0:                                                    # ---------------- producer warpgroup
         setmaxnreg(dec, 24)                                        # instruction_selection: setmaxnreg.dec.sync.aligned.u32 24
-        wiw = shfl_idx(warp % 4, 0)
+        wiw = shfl_idx(warp % 4, 0)                                # instruction_selection: shfl.sync.idx.b32; extent: scalar
         if wiw == 0:
             producer_load_warp()
         elif wiw == 1:
@@ -267,7 +288,8 @@ def flash_bwd_sm90(tma_q, tma_do, tma_k, tma_v, tma_dk, tma_dv, LSE_log2, dPsum,
 ```python
 def tile():                                                        # get_initial_work; get_next_work -> invalid
     if causal:                                                     # SingleTileBwdLPTScheduler, SPT = false
-        # host: size_one_head = s_k*(128+128)*2 + s_k*128*4; swizzle = 1 if 40 MiB < size_one_head
+        # host: size_one_head = s_q*(128+128)*2 + s_q*128*4 (TileSchedulerArguments.seqlen_k slot receives
+        #       params.seqlen_q in run_flash_bwd); swizzle = 1 if 40 MiB < size_one_head
         #       else 2**floor(log2(40 MiB // size_one_head)); hb_rem = (h*b) % swizzle
         bidhb, l2_mod = divmod(block_idx.x, swizzle * n_blocks)    # FastDivmod (mul.hi.u32 + shr)
         if bidhb < (h*b) // swizzle: n_block, r = divmod(l2_mod, swizzle)
@@ -279,7 +301,8 @@ def tile():                                                        # get_initial
     return n_block, bidh, bidb
 def m_range(n_block):                                              # BlockMN::get_m_block_min_max (block.h:83)
     m_max = cdiv(s_q, kBlockM)
-    m_min = max(0, (n_block*128 + s_q - s_k) // kBlockM) if causal else 0   # C int division
+    m_min = max(0, (n_block*128 + s_q - s_k - window_size_right) // kBlockM) if causal else 0   # C int division
+    # instruction_selection: shl + add/sub.s32 + shr-based signed division by the constant kBlockM + max.s32
     return m_min, m_max
 ```
 
@@ -292,11 +315,13 @@ def producer_load_warp():
     m_min, m_max = m_range(n_block)
     if not (causal and m_max <= m_min):                            # load() early return (causal only)
         lane = elect_one()                                         # instruction_selection: elect.sync
+        leader = thread_idx % 128 == 0                             # PipelineParams::is_leader
         if lane:
             wait(pipe_q.empty[stage], phase)                       # producer_acquire
             # instruction_selection: mbarrier.try_wait.parity.shared::cta.b64 + hint 10000000, retry loop
-            arrive_expect_tx(pipe_q.full[stage], kBlockM*256 + kBlockM*4)   # 16640 / 20800
-            # instruction_selection: mbarrier.arrive.expect_tx.shared::cta.b64
+            if leader:
+                arrive_expect_tx(pipe_q.full[stage], kBlockM*256 + kBlockM*4)   # 16640 / 20800
+                # instruction_selection: setp.ne + bra, mbarrier.arrive.expect_tx.shared::cta.b64
             copy_g2s(Q[bidb, m_min*kBlockM:+kBlockM, bidh, :], sQ[stage], completion=pipe_q.full[stage], cache=EVICT_LAST)
             # instruction_selection: cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint
             #   x2 boxes {64 cols, kBlockM rows}, coords (64*half, m*kBlockM, bidh, bidb); extent: 2
@@ -309,22 +334,47 @@ def producer_load_warp():
             # instruction_selection: cp.async.bulk.tensor.4d ... .L2::cache_hint 0x1000000000000000;
             #   box {64, 128} x2 each; extent: 4
             for m in range(m_min, m_max - 1, unroll=2):
-                wait(pipe_do.empty[stage], phase); arrive_expect_tx(pipe_do.full[stage], kBlockM*256 + kBlockM*4)
+                wait(pipe_do.empty[stage], phase)
+                # instruction_selection: mbarrier.try_wait.parity.shared::cta.b64 + hint 10000000, retry loop
+                if leader:
+                    arrive_expect_tx(pipe_do.full[stage], kBlockM*256 + kBlockM*4)
+                    # instruction_selection: setp.ne + bra, mbarrier.arrive.expect_tx.shared::cta.b64
                 copy_g2s(dO[bidb, m*kBlockM:+kBlockM, bidh, :], sdO[stage], completion=pipe_do.full[stage], cache=EVICT_LAST)
+                # instruction_selection: cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes
+                #   .L2::cache_hint 0x14F0000000000000, box {64, kBlockM}; extent: 2
                 copy_g2s(dPsum[bidb, bidh, m*kBlockM:+kBlockM], sdPsum[stage], completion=pipe_do.full[stage])
-                # instruction_selection: as Q/LSE; extent: 2 tensor + 1 bulk
+                # instruction_selection: cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes, kBlockM*4 B
                 stage, phase = advance(stage, phase)               # one shared state (Q_dO_same_stages)
-                wait(pipe_q.empty[stage], phase); arrive_expect_tx(pipe_q.full[stage], ...)
-                copy_g2s(Q[... (m+1)*kBlockM ...], sQ[stage], ...); copy_g2s(LSE_log2[... m+1 ...], sLSE[stage], ...)
+                wait(pipe_q.empty[stage], phase)
+                # instruction_selection: mbarrier.try_wait.parity.shared::cta.b64 + hint 10000000, retry loop
+                if leader:
+                    arrive_expect_tx(pipe_q.full[stage], kBlockM*256 + kBlockM*4)
+                    # instruction_selection: setp.ne + bra, mbarrier.arrive.expect_tx.shared::cta.b64
+                copy_g2s(Q[bidb, (m+1)*kBlockM:+kBlockM, bidh, :], sQ[stage], completion=pipe_q.full[stage], cache=EVICT_LAST)
+                # instruction_selection: cp.async.bulk.tensor.4d ... .L2::cache_hint 0x14F0000000000000; extent: 2
+                copy_g2s(LSE_log2[bidb, bidh, (m+1)*kBlockM:+kBlockM], sLSE[stage], completion=pipe_q.full[stage])
+                # instruction_selection: cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes; extent: 1
         # scheduler_prefetch(): no-op
         if lane:
-            wait(pipe_do.empty[stage], phase); arrive_expect_tx(pipe_do.full[stage], ...)
-            copy_g2s(dO[... (m_max-1) ...], sdO[stage], ...); copy_g2s(dPsum[... m_max-1 ...], sdPsum[stage], ...)
+            wait(pipe_do.empty[stage], phase)
+            # instruction_selection: mbarrier.try_wait.parity.shared::cta.b64 + hint 10000000, retry loop
+            if leader:
+                arrive_expect_tx(pipe_do.full[stage], kBlockM*256 + kBlockM*4)
+                # instruction_selection: setp.ne + bra, mbarrier.arrive.expect_tx.shared::cta.b64
+            copy_g2s(dO[bidb, (m_max-1)*kBlockM:+kBlockM, bidh, :], sdO[stage], completion=pipe_do.full[stage], cache=EVICT_LAST)
+            # instruction_selection: cp.async.bulk.tensor.4d ... .L2::cache_hint 0x14F0000000000000; extent: 2
+            copy_g2s(dPsum[bidb, bidh, (m_max-1)*kBlockM:+kBlockM], sdPsum[stage], completion=pipe_do.full[stage])
+            # instruction_selection: cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes; extent: 1
             stage, phase = advance(stage, phase)
     if elect_one():                                                # load_tail: producer_tail of both pipelines
-        for s in range(2): wait(pipe_q.empty[stage_s], phase_s)
-        for s in range(2): wait(pipe_do.empty[stage_s], phase_s)
-        # instruction_selection: mbarrier.try_wait.parity + hint, retry loops; extent: 4
+        # instruction_selection: elect.sync
+        stage_do, phase_do = stage, phase                          # M:557, and producer_tail takes the state by value
+        for s in range(2):
+            wait(pipe_q.empty[stage], phase); stage, phase = advance(stage, phase)
+            # instruction_selection: mbarrier.try_wait.parity.shared::cta.b64 + hint 10000000, retry loop; extent: 2
+        for s in range(2):
+            wait(pipe_do.empty[stage_do], phase_do); stage_do, phase_do = advance(stage_do, phase_do)
+            # instruction_selection: mbarrier.try_wait.parity.shared::cta.b64 + hint 10000000, retry loop; extent: 2
 ```
 
 #### Producer warp 1: dQ bulk reduce (`:593-667`)
@@ -353,7 +403,7 @@ def dq_store_warp():
 ```python
 def mma_warpgroups(w, tid):                                        # w in {0,1} (canonical WG 1, 2), tid in 0..255
     stage, phase = 0, 0
-    if shfl_idx(warp % 4, 0) == 0:
+    if shfl_idx(warp % 4, 0) == 0:                                 # instruction_selection: shfl.sync.idx.b32; extent: scalar
         named_arrive(10 + w, 160)                                  # mma_init: dQEmpty_w; instruction_selection: bar.arrive
     n_block, bidh, bidb = tile()
     m_min, m_max = m_range(n_block)
@@ -375,7 +425,11 @@ fragment (8 / 10), `KM = NM // 16` k-steps of the dV/dK chains (4 / 5):
 ```python
 def bwd_step(m):
     rS  = reg_tile(f32, NM // 2)                                   # S^T C fragment: rows = KV 64w.., cols = Q m*NM..
-    if not try_wait(pipe_q.full[stage], phase): wait(pipe_q.full[stage], phase)        # consumer_wait(pipeline_q)
+    ready = try_wait(pipe_q.full[stage], phase)                    # consumer_try_wait(pipeline_q)
+    # instruction_selection: mbarrier.try_wait.parity.shared::cta.b64 (no suspend hint) + selp.b32; extent: 1
+    if not ready:
+        wait(pipe_q.full[stage], phase)                            # consumer_wait
+        # instruction_selection: mbarrier.try_wait.parity.shared::cta.b64 + hint 10000000, retry loop
     wgmma_fence()                                                  # instruction_selection: wgmma.fence.sync.aligned
     for k in range(8):
         gemm(rS, desc(sK + 64w*128, kmajor, k), desc(sQ[stage], kmajor, k), accumulate=k > 0)
@@ -385,12 +439,16 @@ def bwd_step(m):
     rLSE = copy_s2r(sLSE[stage][q cols of the thread's fragment])  # 2 * NC values
     # instruction_selection: ld.shared.v2.f32; extent: NC
     rdP = reg_tile(f32, NM // 2)
-    if not try_wait(pipe_do.full[stage], phase): wait(pipe_do.full[stage], phase)      # consumer_wait(pipeline_do)
-    wgmma_fence()
+    ready = try_wait(pipe_do.full[stage], phase)                   # consumer_try_wait(pipeline_do)
+    # instruction_selection: mbarrier.try_wait.parity.shared::cta.b64 (no suspend hint) + selp.b32; extent: 1
+    if not ready:
+        wait(pipe_do.full[stage], phase)                           # consumer_wait
+        # instruction_selection: mbarrier.try_wait.parity.shared::cta.b64 + hint 10000000, retry loop
+    wgmma_fence()                                                  # instruction_selection: wgmma.fence.sync.aligned
     for k in range(8):
         gemm(rdP, desc(sV + 64w*128, kmajor, k), desc(sdO[stage], kmajor, k), accumulate=k > 0)
         # instruction_selection: wgmma ... m64n{64|80}k16 ss, flags (1, 1, 0, 0); extent: 8
-    wgmma_commit()
+    wgmma_commit()                                                 # instruction_selection: wgmma.commit_group.sync.aligned
     wgmma_wait(1)                                                  # instruction_selection: wgmma.wait_group.sync.aligned 1
     # mask (mask.h:62-170, SwapAB = true; Seqlenk mask always, causal mask when causal)
     for i in (0, 1):                                               # the thread's two KV rows n = 16*warp + lane//4 + 8i
@@ -414,15 +472,16 @@ def bwd_step(m):
     rdS = cast(rdP, bf16x2)                                        # instruction_selection: cvt.rn.bf16x2.f32; extent: NM // 4
     copy_r2s(rdS, sdS[stage] at (q m, kv n) transposed)            # SM90_U16x8_STSM_T, 8x8 tiles of the C fragment
     # instruction_selection: stmatrix.sync.aligned.x4.trans.m8n8.shared.b16; extent: NM // 16 (4 / 5)
-    wgmma_fence()
+    wgmma_fence()                                                  # instruction_selection: wgmma.fence.sync.aligned
     for k in range(KM):                                            # dV += P^T dO, A from registers
         gemm(rdV, rP[4k:4k+4], desc(sdO[stage], mnmajor, k), accumulate=True)
         # instruction_selection: wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 rs, flags (1, 1, 1); extent: KM
     wgmma_commit()                                                 # no wait (wg_wait = -1)
+    # instruction_selection: wgmma.commit_group.sync.aligned
     fence_proxy_async()                                            # instruction_selection: fence.proxy.async.shared::cta
     named_sync(9, 256)                                             # PdS: instruction_selection: bar.sync 9, 256
     rdQ = reg_tile(f32, 32 if causal else 40)
-    wgmma_fence()
+    wgmma_fence()                                                  # instruction_selection: wgmma.fence.sync.aligned
     for k in range(8):
         if causal:   # dQ[:, 64w..] = dS (NM x 128) K[:, 64w..]
             gemm(rdQ, desc(sdS[stage], kmajor, k), desc(sK + 16384*w, mnmajor, k), accumulate=k > 0)
@@ -430,20 +489,25 @@ def bwd_step(m):
         else:        # dQ^T[64w.., :] = K^T[64w.., :] dS^T
             gemm(rdQ, desc(sK + 16384*w, mnmajor, k), desc(sdS[stage], kmajor, k), accumulate=k > 0)
             # instruction_selection: wgmma ... m64n80k16 ss, flags (1, 1, 1, 0); extent: 8
-    wgmma_commit(); wgmma_wait(1)                                  # retires the dV chain
+    wgmma_commit()                                                 # instruction_selection: wgmma.commit_group.sync.aligned
+    wgmma_wait(1)                                                  # retires the dV chain
+    # instruction_selection: wgmma.wait_group.sync.aligned 1
     arrive(pipe_do.empty[stage])                                   # release dO: every thread
     # instruction_selection: mapa.shared::cluster.u32 (rank 0) + mbarrier.arrive.shared::cluster.b64
-    wgmma_fence()
+    wgmma_fence()                                                  # instruction_selection: wgmma.fence.sync.aligned
     for k in range(KM):                                            # dK += dS^T Q, A from registers
         gemm(rdK, rdS[4k:4k+4], desc(sQ[stage], mnmajor, k), accumulate=True)
         # instruction_selection: wgmma ... m64n128k16 rs, flags (1, 1, 1); extent: KM
-    wgmma_commit(); wgmma_wait(1)                                  # retires the dQ chain
+    wgmma_commit()                                                 # instruction_selection: wgmma.commit_group.sync.aligned
+    wgmma_wait(1)                                                  # retires the dQ chain
+    # instruction_selection: wgmma.wait_group.sync.aligned 1
     named_sync(10 + w, 160)                                        # dQEmpty_w: instruction_selection: bar.sync 10|11, 160
     copy_r2s(rdQ, sdQacc[w] at float i*512 + tid_w*4 + j for register 4i + j)
     # instruction_selection: st.shared.v4.u32; extent: 8 / 10
     fence_proxy_async()                                            # instruction_selection: fence.proxy.async.shared::cta
     named_arrive(13 + w, 160)                                      # dQFull_w: instruction_selection: bar.arrive 13|14, 160
     wgmma_wait(0)                                                  # retires the dK chain
+    # instruction_selection: wgmma.wait_group.sync.aligned 0
     arrive(pipe_q.empty[stage])                                    # release Q: mapa + mbarrier.arrive.shared::cluster.b64
     stage, phase = advance(stage, phase)
 ```
@@ -466,6 +530,7 @@ def epilogue_store(rdK, rdV, n_block, bidh, bidb):
     fence_proxy_async()                                            # instruction_selection: fence.proxy.async.shared::cta
     named_arrive(1, 288)                                           # instruction_selection: bar.arrive 1, 288
     if shfl_idx(tid // 32, 0) == 7:                                # last MMA warp (absolute warp 11)
+        # instruction_selection: shfl.sync.idx.b32; extent: scalar
         named_sync(1, 288)                                         # instruction_selection: bar.sync 1, 288
         if elect_one():
             copy_s2g(sdV, dV[bidb, n_block*128:+128, bidh, :]); copy_s2g(sdK, dK[...])
@@ -474,22 +539,33 @@ def epilogue_store(rdK, rdV, n_block, bidh, bidb):
     bulk_wait_read(0)                                              # every thread; instruction_selection: cp.async.bulk.wait_group.read 0
 
 def store_zero(n_block, bidh, bidb):                               # causal only (epilogue_bwd.hpp:286-323)
-    for k in range(8):                                             # GmemTiledCopydKV: 256 threads, (16 rows x 16) x 8 elems
+    col8 = (tid % 16) * 8                                          # GmemTiledCopydKV: 256 threads, (16 rows x 16) x 8 elems
+    pcol = col8 < d                                                # tdKVpdK / tdKVpdV (one K iteration)
+    # instruction_selection: setp.ge.s32 (col8 >= d) feeding or.pred below; extent: scalar
+    for k in range(8):                                             # dK first (flash::copy of tdKVrdKV -> tdKVgdK)
         r = tid // 16 + 16*k
-        if r < s_k - n_block*128:
-            copy_r2g(0, dK[bidb, n_block*128 + r, bidh, (tid%16)*8 : +8])
-            # instruction_selection: st.global.v2.u64 (128-bit) under a branch; extent: 8
-    (same for dV)                                                  # extent: 8
+        if r < s_k - n_block*128 and pcol:                         # Is_even_MN = Is_even_K = false, no clears
+            copy_r2g(0, dK[bidb, n_block*128 + r, bidh, col8 : col8+8])
+            # instruction_selection: st.global.v2.u64 (128-bit zero) under setp.ge + or.pred branch; extent: 8
+    for k in range(8):                                             # then dV, same predicates
+        r = tid // 16 + 16*k
+        if r < s_k - n_block*128 and pcol:
+            copy_r2g(0, dV[bidb, n_block*128 + r, bidh, col8 : col8+8])
+            # instruction_selection: st.global.v2.u64 (128-bit zero) under or.pred branch; extent: 8
 ```
 
 ### Kernel 3: `flash_bwd_convert_dq` (`flash_bwd_postprocess_kernel.h:156-252`)
 
 ```python
 @kernel(grid=(cdiv(s_q, kBlockM), h, b), block=256, smem=49280 | 61568)   # __launch_bounds__(256, 2)
-def flash_bwd_convert_dq(dQaccum, dQ, s_q, softmax_scale, ...):
+def flash_bwd_convert_dq(dQaccum, dQ, s_q, d, h, b, softmax_scale):
     sAcc = tile(SMEM, f32, kBlockM*128, offset=0)                  # flat, the main kernel's dQaccum order
-    sdQ  = tile(SMEM, bf16, kBlockM*128, offset=kBlockM*512)       # causal: Swizzle<3,3,3> 8x64 atoms, 2 column halves;
-                                                                    # non-causal: Swizzle<1,3,3> 8x16 atoms, 8 column blocks
+    sdQ  = tile(SMEM, bf16, kBlockM*128, offset=kBlockM*512)       # (m, col) element map below
+    # causal (Swizzle<3,3,3> o ((8,8),(64,2)):((64,512),(1,4096)), 16 B chunks XOR row % 8):
+    #   byte(m, c) = (c // 64) * (kBlockM*128) + m * 128 + ((((c % 64) // 8) ^ (m % 8)) * 16) + (c % 8) * 2
+    # non-causal (Swizzle<1,3,3> o ((8,10),(16,8)):((16,128),(1,1280)), 8 x 16 atoms, chunk bit XOR row bit 2):
+    #   byte(m, c) = (c // 16) * 2560 + (m // 8) * 256 + (m % 8) * 32
+    #                + (((c % 16) // 8) ^ ((m % 8) // 4)) * 16 + (c % 8) * 2
     bar  = tile(SMEM, u64, 1, offset=kBlockM*768 rounded)          # barrier_dQaccum
     if thread_idx == 0:
         mbar_init(bar, 1); arrive_expect_tx(bar, kBlockM*512)
@@ -506,11 +582,16 @@ def flash_bwd_convert_dq(dQaccum, dQ, s_q, softmax_scale, ...):
     copy_r2s(r16, sdQ)    # causal: STSM_N into (m, d); non-causal: STSM_T of the dQ^T fragment into (m, d)
     # instruction_selection: stmatrix.sync.aligned.x4[.trans].m8n8.shared.b16; extent: 4 / 5
     cta_sync()                                                     # instruction_selection: bar.sync 0
-    for i in range(kBlockM // 16):                                 # GmemTiledCopy (16 x 16) x 8
+    col8 = (thread_idx % 16) * 8                                   # GmemTiledCopy (16 x 16) x 8
+    pcol = col8 < d                                                # tdQpdQ
+    for i in range(kBlockM // 16):                                 # all shared reads first (EvenM, Is_even_K: no predicate)
+        v[i] = copy_s2r(sdQ[thread_idx // 16 + 16*i, col8 : col8+8])
+        # instruction_selection: ld.shared.v2.u64 (128-bit); extent: 4 / 5
+    for i in range(kBlockM // 16):                                 # then the predicated global stores
         r = thread_idx // 16 + 16*i
-        v = copy_s2r(sdQ[r, (thread_idx%16)*8 : +8])               # instruction_selection: ld.shared.v2.u64; extent: 4 / 5
-        if r < s_q - m_block*kBlockM:
-            copy_r2g(v, dQ[bidb, m_block*kBlockM + r, bidh, ...])  # instruction_selection: st.global.v2.u64; extent: 4 / 5
+        if r < min(s_q - m_block*kBlockM, kBlockM) and pcol:
+            copy_r2g(v[i], dQ[bidb, m_block*kBlockM + r, bidh, col8 : col8+8])
+            # instruction_selection: st.global.v2.u64 (128-bit) under setp + and/or.pred branch; extent: 4 / 5
 ```
 
 The postprocess is built with `SeqlenInfo<true>` (always varlen-capable): it reads
