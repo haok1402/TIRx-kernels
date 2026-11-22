@@ -537,6 +537,7 @@ def build_main_kernel(head_dim, is_causal, *, backend_config=None):
                             OFF=OFF, Q_TILE=Q_TILE, HALF=HALF, TX_Q=TX_Q, LSE_STRIDE=LSE_STRIDE, BM=BM,
                             tma_q=tma_q, tma_do=tma_do, tma_k=tma_k, tma_v=tma_v, lse_log2=lse_log2,
                             dpsum=dpsum, stat_base=stat_base, thread_idx=thread_idx, is_causal=is_causal,
+                            h=h, s_q_rounded=s_q_rounded,
                         ))
                     with txl.else_():
                         with txl.if_(wiw == txl.uint32(1)), txl.then_():
@@ -577,6 +578,9 @@ def _producer_load(locals_):
     m_min = txl.local_scalar("int32", init=L["m_min_of"](n_block))
     m_max = L["m_max_c"]
     leader = L["thread_idx"] % 128 == 0  # PipelineParams::is_leader
+    # gLSE / gdPsum row base of this (bidb, bidh): built once per tile, as the source's local_tile of
+    # mLSE / mdPsum (both have the (b, h, s_q_rounded) stride), then indexed by m_block.
+    stat_row = txl.local_scalar("int64", init=L["stat_base"](bidb, bidh))  # int64, as upstream's strides
 
     def load_q(m):
         q_dst = OFF["q"] + stage * L["Q_TILE"]
@@ -585,7 +589,7 @@ def _producer_load(locals_):
                       bar_s(L["b_full_q"], stage), EVICT_LAST)
         txl.ptx[_BULK_G2S](
             L["f32p"](OFF["lse"] + stage * (L["LSE_STRIDE"] * 4)),
-            L["lse_log2"].ptr_to([L["stat_base"](bidb, bidh) + _i64(m * BM)]),
+            L["lse_log2"].ptr_to([stat_row + _i64(m * BM)]),
             txl.uint32(BM * 4),
             bar_s(L["b_full_q"], stage),
         )
@@ -597,7 +601,7 @@ def _producer_load(locals_):
                       bar_s(L["b_full_do"], stage), EVICT_LAST)
         txl.ptx[_BULK_G2S](
             L["f32p"](OFF["dpsum"] + stage * (L["LSE_STRIDE"] * 4)),
-            L["dpsum"].ptr_to([L["stat_base"](bidb, bidh) + _i64(m * BM)]),
+            L["dpsum"].ptr_to([stat_row + _i64(m * BM)]),
             txl.uint32(BM * 4),
             bar_s(L["b_full_do"], stage),
         )
