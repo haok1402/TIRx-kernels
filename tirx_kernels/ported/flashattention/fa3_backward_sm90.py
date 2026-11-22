@@ -4,7 +4,8 @@
 # SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 # SPDX-FileCopyrightText: Copyright TIRx authors
 
-"""SM90 FlashAttention-3 backward (bf16, MHA) -- flash-attention's Hopper ``hopper/`` path.
+"""SM90 FlashAttention-3 backward (bf16, head dim 128; MHA, GQA / MQA; fixed length and varlen) --
+flash-attention's Hopper ``hopper/`` path.
 
 Reference: ``flash_attn_interface._flash_attn_backward`` (``flash_attn_3._C.bwd``) on SM90, which runs
 ``mha_bwd`` (``hopper/flash_api_stable.cpp``) -> ``run_mha_bwd_hdim{64,128,256}<90, bf16>``
@@ -24,6 +25,11 @@ dQ_swapAB = false and the ``SingleTileBwdLPTScheduler``; non-causal uses kBlockM
 dQ_swapAB = true and the ``SingleTileScheduler``. Both: Stages = Stages_dO = Stages_dS = 2,
 SdP_swapAB = true, dKV_swapAB = false, 2 MMA warpgroups, AtomLayoutMSdP = 1, AtomLayoutNdKV = 2,
 AtomLayoutMdQ = 1 (so dV and dK are register-sourced WGMMAs), non-deterministic dQ accumulation.
+
+GQA / MQA (h != h_k) selects the ``GQA = true`` instantiations (CollectiveEpilogueBwdGQA: fp32 dK / dV
+reduce-added across query heads, then two more convert launches); ``varlen`` configs (cu_seqlens_q and
+cu_seqlens_k, seqused optional) select the ``Varlen = true`` ones (SeqlenInfo offsets, padded
+workspaces, the MHA epilogue's non-TMA store).
 """
 
 from __future__ import annotations
