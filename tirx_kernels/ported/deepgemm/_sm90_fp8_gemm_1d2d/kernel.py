@@ -765,11 +765,12 @@ def _math(
                 else:
                     k_loop(0)
             with txl.else_():
-                k_skip = txl.local_scalar("uint32", init=txl.uint32(0))
-                with txl.while_(k_skip < txl.uint32(shape_k_scales)):
+                # `#pragma unroll` over the compile-time `num_total_k_blocks` (`.cuh:352-356`): a
+                # constant trip count on every path lets nvcc prove the stage/phase are back at their
+                # entry values after each block, so the K loop's stage addressing folds to constants.
+                with txl.serial(0, shape_k_scales, unroll=True):
                     _wait(full(stage_idx), phase)
                     empty_barrier_arrive()
-                    txl.assign(k_skip, k_skip + 1)
                     advance()
 
         # ---- epilogue: STSM into swizzled D, TMA store (`.cuh:359-443`) ----
