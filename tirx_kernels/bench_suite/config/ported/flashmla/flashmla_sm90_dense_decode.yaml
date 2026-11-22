@@ -1,11 +1,11 @@
 # FlashMLA SM90 dense MLA decode: the upstream performance sweep (b=128, 128 heads, varlen,
 # causal and not, s_q 1/2, s_k 4K-32K) plus DeepSeek-V3 TP-sharded head counts.
 kernel: flashmla_sm90_dense_decode
-selection_rationale: The defaults span the upstream sweep's short and long contexts, s_q 1 and 2 (MTP), causal, and one TP-sharded head count.
+selection_rationale: The defaults bracket the cost range and the head-count regimes - a TP-sharded 16-head shape (one 64-row head block, few splits), the upstream sweep's shortest context at 128 heads, and its longest causal MTP shape (s_q 2, 32K). The middle contexts (8K, 16K) interpolate between those and stay available but off by default.
 configs:
-  - {config: bf16_b128_sq1_sk4096_hq128_hkv1_varlen, default: true}
+  - {config: bf16_b128_sq1_sk4096_hq128_hkv1_varlen, default: true, selection_role: medium}
   - {config: bf16_b128_sq1_sk8192_hq128_hkv1_varlen, default: false}
-  - {config: bf16_b128_sq1_sk16384_hq128_hkv1_varlen, default: true}
+  - {config: bf16_b128_sq1_sk16384_hq128_hkv1_varlen, default: false}
   - {config: bf16_b128_sq1_sk32768_hq128_hkv1_varlen, default: false}
   - {config: bf16_b128_sq2_sk4096_hq128_hkv1_varlen, default: false}
   - {config: bf16_b128_sq2_sk8192_hq128_hkv1_varlen, default: false}
@@ -18,8 +18,8 @@ configs:
   - {config: bf16_b128_sq2_sk4096_hq128_hkv1_varlen_causal, default: false}
   - {config: bf16_b128_sq2_sk8192_hq128_hkv1_varlen_causal, default: false}
   - {config: bf16_b128_sq2_sk16384_hq128_hkv1_varlen_causal, default: false}
-  - {config: bf16_b128_sq2_sk32768_hq128_hkv1_varlen_causal, default: true}
-  - {config: tp_bf16_b64_sq1_sk4096_hq16_hkv1_varlen, default: true}
+  - {config: bf16_b128_sq2_sk32768_hq128_hkv1_varlen_causal, default: true, selection_role: large}
+  - {config: tp_bf16_b64_sq1_sk4096_hq16_hkv1_varlen, default: true, selection_role: small}
   - {config: tp_bf16_b128_sq2_sk8192_hq16_hkv1_varlen, default: false}
   - {config: tp_bf16_b64_sq1_sk4096_hq32_hkv1_varlen, default: false}
   - {config: tp_bf16_b128_sq2_sk8192_hq32_hkv1_varlen, default: false}
