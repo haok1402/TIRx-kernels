@@ -319,6 +319,16 @@ def build_kernel(spec, *, backend_config=None):
                                 ),
                             )
 
+                    # `q_offset` of each row is invariant over the KV blocks; nvcc keeps it out of
+                    # the KV loop for the source, so it is formed once per Q block here.
+                    q_offsets = txl.alloc_local((BQ,), "uint64")
+                    for i in range(BQ):
+                        txl.assign(
+                            q_offsets[i],
+                            txl.cast(block_q_idx * txl.uint32(BQ) + txl.uint32(i), "uint64")
+                            * txl.cast(stride_logits, "uint64"),
+                        )
+
                     with txl.serial(0, num_kv_blocks, unroll=True, dtype="uint32") as kv_block_idx:
                         kv_stage_idx, kv_phase = kv_pipeline(kv_block_idx)
                         kv_stage_l = txl.local_scalar("uint32", init=kv_stage_idx)
@@ -367,8 +377,7 @@ def build_kernel(spec, *, backend_config=None):
                                 scale_kv_0,
                                 scale_kv_1,
                                 zero,
-                                row=block_q_idx * txl.uint32(BQ) + txl.uint32(i),
-                                stride_logits=stride_logits,
+                                q_offset=q_offsets[i],
                                 kv_offset=kv_offset,
                                 v_offsets=(v_0_offset, v_1_offset),
                                 ks=seq_k_start[i],
@@ -487,8 +496,7 @@ def _reduce_and_store(
     scale_kv_1,
     zero,
     *,
-    row,
-    stride_logits,
+    q_offset,
     kv_offset,
     v_offsets,
     ks,
@@ -548,17 +556,19 @@ def _reduce_and_store(
             txl.ptx["add.f32"](v, v, txl.reinterpret(o, ty="float32"))
 
     # Store into the global memory
-    q_offset = txl.cast(row, "uint64") * txl.cast(stride_logits, "uint64")
-    for v, vo in ((v_0, v_offsets[0]), (v_1, v_offsets[1])):
-        col = kv_offset + vo
-        index = q_offset + txl.cast(kv_offset, "uint64") + txl.cast(vo, "uint64")
-        if is_compressed:
-            index = index - txl.cast(ks, "uint64")
+    # `v_1_offset == v_0_offset + 8`: like nvcc for the source, address both values of a row from one
+    # 64-bit base (`[base]` and `[base + 8 elements]`).
+    index = q_offset + txl.cast(kv_offset, "uint64") + txl.cast(v_offsets[0], "uint64")
+    if is_compressed:
+        index = index - txl.cast(ks, "uint64")
+    ptr_0 = logits.ptr_to([txl.cast(index, "int64")])
+    ptr_1 = txl.ptx.addr(ptr_0, 8 * (2 if is_bf16 else 4))
+    for v, vo, ptr in ((v_0, v_offsets[0], ptr_0), (v_1, v_offsets[1], ptr_1)):
         # The compressed store is predicated (`@p st.global`) rather than branched around: nvrtc
         # sinks the address chain into a guarded region, and ptxas then keeps the branch instead
         # of the predicated store the source's SASS has.
+        col = kv_offset + vo
         pred = txl.And(ks <= col, col < ke) if is_compressed else None
-        ptr = logits.ptr_to([txl.cast(index, "int64")])
         if is_bf16:
             bits = txl.local_scalar("uint16", init=txl.uint16(0))
             if pred is None:
