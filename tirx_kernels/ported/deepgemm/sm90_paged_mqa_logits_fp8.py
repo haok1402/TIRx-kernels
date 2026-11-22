@@ -543,12 +543,17 @@ def run_test(*, backend_config=None, **kwargs: Any) -> None:
 def prepare_bench(*, backend_config=None, **kwargs: Any):
     from tirx_kernels.runner import prepared_gpu_benchmark
 
-    _require_sm90()
+    from tirx_kernels.runner import hardware_num_sms
+
+    # Prepare stays CUDA-free: the SM count is the compile profile's (TIRX_PREPARE_NUM_SMS, or the
+    # H100/H200 SXM count, not the runner's B200 default). run_gpu recompiles if the device differs.
     config = _make_config(**kwargs)
-    num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    num_sms = hardware_num_sms(default=132)
     executable = compile_spec(kernel_spec(config, num_sms), backend_config=backend_config)
     return prepared_gpu_benchmark(
-        run_gpu, {"config": dict(kwargs), "executable": executable}, backend_config=backend_config
+        run_gpu,
+        {"config": dict(kwargs), "executable": executable, "num_sms": num_sms},
+        backend_config=backend_config,
     )
 
 
@@ -563,7 +568,10 @@ def run_gpu(prepared, *, backend_config=None, **kwargs: Any) -> dict[str, Any]:
     }
     data = prepare_data(**kwargs)
     logits = sentinel_storage(data)
-    launch = build_launch(data, logits, executable=prepared["executable"], backend_config=backend_config)
+    # The grid and the schedule metadata use the device's SM count: use the prepared kernel only if
+    # it was compiled for the same count.
+    executable = prepared["executable"] if prepared["num_sms"] == data["num_sms"] else None
+    launch = build_launch(data, logits, executable=executable, backend_config=backend_config)
     launch()
     torch.cuda.synchronize()
     expected = run_deepgemm_into_sentinel(data)
