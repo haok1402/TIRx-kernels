@@ -36,6 +36,9 @@ MK_ALIGNMENT = 128
 #: `kNumMaxStages` in `SM90ArchSpec::get_pipeline_config`.
 MAX_STAGES = 16
 BLOCK_K = 128
+#: SM count of the SM90 parts the port targets (H100 / H200 SXM), used when a descriptor is built
+#: before CUDA is initialized (``tirx_kernels.runner.hardware_num_sms``'s own default is B200's 148).
+SM90_NUM_SMS = 132
 WGMMA_M = 64
 #: BLOCK_N values the port implements: the dispatched non-uniform (96, 192) and uniform (128)
 #: B-scale cases the upstream SM90 tests select.

@@ -78,11 +78,11 @@ def make_desc(
     """The descriptor `sm90_m_grouped_fp8_gemm_masked_1d2d` builds."""
     from tirx_kernels.runner import hardware_num_sms
 
-    from ._sm90_fp8_gemm_1d2d.spec import GemmDesc, GemmType
+    from ._sm90_fp8_gemm_1d2d.spec import SM90_NUM_SMS, GemmDesc, GemmType
 
     del seed, group_ms
     if num_sms is None:
-        num_sms = hardware_num_sms()
+        num_sms = hardware_num_sms(default=SM90_NUM_SMS)
     return GemmDesc(
         GemmType.M_GROUPED_MASKED,
         m=max_m,

@@ -150,11 +150,11 @@ def make_desc(
     """
     from tirx_kernels.runner import hardware_num_sms
 
-    from ._sm90_fp8_gemm_1d2d.spec import MK_ALIGNMENT, GemmDesc, GemmType, align_up
+    from ._sm90_fp8_gemm_1d2d.spec import MK_ALIGNMENT, SM90_NUM_SMS, GemmDesc, GemmType, align_up
     from ._sm100_fp8_fp4_gemm_1d1d.spec import make_actual_ms
 
     if num_sms is None:
-        num_sms = hardware_num_sms()
+        num_sms = hardware_num_sms(default=SM90_NUM_SMS)
     if from_masked:
         return GemmDesc(
             GemmType.M_GROUPED_CONTIGUOUS_WITH_PSUM_LAYOUT,
