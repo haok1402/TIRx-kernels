@@ -60,6 +60,12 @@ def _encode(tensor, dims, strides_bytes, box, *, swizzle=_SWIZZLE_128B, l2=_L2_P
 def make_tensor_maps(p):
     """`tma_Q`, `tma_K`, `tma_O` (innermost dimension first)."""
     q, k, o = p["q_folded"], p["kcache"], p["out"]
+    if k.size(0) == 0:
+        # FlashMLA cannot take this either: its K TensorMap encode fails and the kernel faults.
+        raise ValueError(
+            "the paged KV cache has no blocks (e.g. a batch whose every sequence is empty); "
+            "this is outside FlashMLA's dense-decode domain"
+        )
     es = q.element_size()
     tma_q = _encode(
         q,

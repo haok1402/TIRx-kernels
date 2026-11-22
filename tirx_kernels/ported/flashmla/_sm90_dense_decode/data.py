@@ -229,6 +229,12 @@ def prepare(**config) -> dict[str, Any]:
 
     require_sm90()
     cache_seqlens, q, block_table, blocked_k = generate(**config)
+    if blocked_k.size(0) == 0:
+        # Checked before either implementation runs: FlashMLA faults (illegal address) on it.
+        raise ValueError(
+            "the paged KV cache has no blocks (every sequence is empty); "
+            "this is outside FlashMLA's dense-decode domain"
+        )
     num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
     p = host_params(
         q, blocked_k, cache_seqlens, block_table, is_causal=config["is_causal"], num_sms=num_sms
