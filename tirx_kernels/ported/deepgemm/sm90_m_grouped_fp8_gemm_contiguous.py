@@ -92,6 +92,32 @@ def _from_masked_case(num_groups, expected_m_per_group, n, k, *, seed=0) -> dict
     }
 
 
+#: Coverage extension: one realistic MoE shape per specialization class the upstream tests do not
+#: reach (DeepSeek-V3 / Qwen3-MoE at EP 32-64, `sm90-probe/logs/dg90_reach.json`), each the exact
+#: instantiation of the reviewed line-info export (delta sketch appendix), every group `m` rows.
+_COVERAGE = [
+    # (num_groups, m per group, N, K, psum) -> class
+    (2, 64, 1536, 2048, False),  # 128x32
+    (2, 64, 1536, 2048, True),
+    (2, 64, 3072, 4096, False),  # 128x48, runtime predicate
+    (2, 64, 3072, 4096, True),
+    (2, 64, 4096, 1536, False),  # 128x64
+    (2, 64, 4096, 1536, True),
+    (4, 64, 7168, 2048, False),  # 128x112, multicast on A, runtime predicate
+    (4, 64, 7168, 2048, True),
+    (8, 64, 4096, 7168, False),  # 128x128, multicast on A
+    (8, 64, 4096, 7168, True),
+    (8, 64, 7168, 2048, False),  # 128x160, multicast on B, dispatched BLOCK_N > BLOCK_K
+    (4, 128, 6352, 2048, False),  # 128x112 on A, odd N-block count (57)
+]
+
+
+def _coverage_case(num_groups, m, n, k, psum, seed):
+    case = _case(num_groups, m, n, k, use_psum=psum, seed=seed)
+    case.update(label="cov_" + case["label"], group_ms=(m,) * num_groups)
+    return case
+
+
 CONFIGS = [
     *[
         _case(g, m, n, k, use_psum=psum, seed=i)
@@ -103,6 +129,7 @@ CONFIGS = [
         _from_masked_case(g, m, n, k, seed=100 + i)
         for i, ((g, m), (n, k)) in enumerate([(gm, nk) for gm in _MASKED_GROUPS for nk in _NK])
     ],
+    *[_coverage_case(*c, seed=200 + i) for i, c in enumerate(_COVERAGE)],
     # Edge shapes: an empty expert, one-row and near-full experts (partial and fully padded
     # 64-row bands, skipped by `is_computation_valid`), odd M/N block counts (the multicast
     # tail fix and `is_peer_cta_alive`), and empty PSUM groups.
@@ -112,6 +139,12 @@ CONFIGS = [
     ),
     _edge("odd_blocks", 4, 1300, 4032, 7168, (64, 100, 128, 5000), seed=63),
     _edge("odd_m_blocks_psum", 4, 1300, 4096, 7168, (64, 100, 128, 5000), psum=True, seed=64),
+    # Coverage extension edges: multicast on A with odd N- and M-block counts (the plain A/SFA branch
+    # and `is_peer_cta_alive` in the tail) and a partial last N block; the runtime-predicate BLOCK_N 48
+    # with a partial last N block (`num_full_iters < BLOCK_N / 8`).
+    _edge("on_a_odd_blocks", 4, 150, 5008, 2048, (128, 128, 100, 250), seed=66),
+    _edge("bn48_partial_n", 2, 64, 2992, 4096, (64, 64), seed=67),
+    _edge("bn48_partial_n_psum", 2, 64, 2992, 4096, (64, 64), psum=True, seed=68),
     _edge(
         "empty_groups_psum_from_masked",
         4,

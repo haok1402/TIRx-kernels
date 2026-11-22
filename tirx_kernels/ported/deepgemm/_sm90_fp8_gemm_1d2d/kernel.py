@@ -274,7 +274,7 @@ def build_kernel(spec: KernelSpec, *, backend_config=None):
     BM, BN, BK = spec.block_m, spec.block_n, spec.block_k
     stages, math_threads, mc = spec.num_stages, spec.num_math_threads, spec.num_tma_multicast
     num_threads = spec.num_tma_threads + math_threads
-    if BK != 128 or BM not in (64, 128) or spec.is_tma_multicast_on_a:
+    if BK != 128 or BM not in (64, 128):
         raise NotImplementedError(f"unported specialization {spec}")
     is_masked = spec.gemm_type == GemmType.M_GROUPED_MASKED
 
@@ -294,8 +294,11 @@ def build_kernel(spec: KernelSpec, *, backend_config=None):
     gcd = math.gcd(BK, BN)
     should_optimize = BK // gcd <= 4 and not uniform_sfb
     k_gap, k_end = gcd // 8, (BK // 8 if should_optimize else 0)
-    if not uniform_sfb and not should_optimize:
-        raise NotImplementedError("non-uniform B scales without the dispatched predicate")
+    # Non-uniform B scales without the dispatch use the runtime predicate (`.cuh:342`); its emitted
+    # form (shared i = 0/1 select, delta sketch Delta 3) relies on `num_former_iters` being even.
+    runtime_predicate = not uniform_sfb and not should_optimize
+    if runtime_predicate and BN not in (48, 112):
+        raise NotImplementedError(f"runtime-predicate promotion at BLOCK_N = {BN} is not ported")
     wgmma = f"wgmma.mma_async.sync.aligned.m64n{BN}k32.f32.e4m3.e4m3"
 
     # ---- shared memory, byte offsets of `.cuh:76-126` ----
@@ -457,6 +460,7 @@ def build_kernel(spec: KernelSpec, *, backend_config=None):
                         shape_k_scales=shape_k_scales,
                         shape_n_sfb=shape_n_sfb,
                         should_optimize=should_optimize,
+                        runtime_predicate=runtime_predicate,
                         k_gap=k_gap,
                         k_end=k_end,
                         wgmma=wgmma,
@@ -486,13 +490,15 @@ def _producer(spec, *, sched_args, smem, maps, full, empty, stage_idx, phase, ad
     sched.next()
     with txl.while_(sched.valid == txl.uint32(1)):
         m_block = sched.m_block_idx
-        # Multicast on B only (A and SFA are loaded per CTA in every ported specialization).
+        # `num_tma_multicast_a/b` (`.cuh:178-180`): the multicast side gets `kNumTMAMulticast` when valid.
+        on_a = spec.is_tma_multicast_on_a
+        mc_a = txl.local_scalar("uint32", init=txl.uint32(1))
         mc_b = txl.local_scalar("uint32", init=txl.uint32(1))
         if mc > 1:
             mc_valid = sched.is_tma_multicast_valid(m_block)
             with txl.if_(mc_valid == txl.uint32(1)):
                 with txl.then_():
-                    txl.assign(mc_b, txl.uint32(mc))
+                    txl.assign(mc_a if on_a else mc_b, txl.uint32(mc))
         k_block_idx = txl.local_scalar("uint32", init=txl.uint32(0))
         with txl.while_(k_block_idx < txl.uint32(shape_k_scales)):
             _wait(empty(stage_idx), phase ^ txl.uint32(1))
@@ -504,52 +510,64 @@ def _producer(spec, *, sched_args, smem, maps, full, empty, stage_idx, phase, ad
             n_idx = sched.group_offset(m_block) * txl.uint32(
                 spec.shape_n
             ) + sched.n_block_idx * txl.uint32(BN)
-            txl.ptx[_TMA_LOAD_HINT](
-                smem_a.ptr_to([stage_idx * txl.uint32(a_stage)]),
-                txl.address_of(tensor_map_a),
-                txl.cast(k_idx, "int32"),
-                txl.cast(m_idx, "int32"),
-                full(stage_idx),
-                txl.uint64(EVICT_NORMAL),
-            )
-            txl.ptx[_TMA_LOAD_HINT](
-                smem_sfa.ptr_to([stage_idx * txl.uint32(sfa_words)]),
-                txl.address_of(tensor_map_sfa),
-                txl.cast(m_block * txl.uint32(BM), "int32"),
-                txl.cast(sfa_k, "int32"),
-                full(stage_idx),
-                txl.uint64(EVICT_NORMAL),
-            )
-            b_dst = smem_b.ptr_to([stage_idx * txl.uint32(b_stage)])
 
-            def load_b():
-                txl.ptx[_TMA_LOAD_HINT](
-                    b_dst,
-                    txl.address_of(tensor_map_b),
-                    txl.cast(k_idx, "int32"),
-                    txl.cast(n_idx, "int32"),
-                    full(stage_idx),
-                    txl.uint64(EVICT_NORMAL),
-                )
+            def tma_copy(dst, tensor_map, inner, outer, num_multicast, may_multicast):
+                """`tma::copy` (`tma_copy.cuh:27-55`): plain when `num_tma_multicast == 1`, else the
+                cluster-rank-0 multicast into both CTAs."""
 
-            if mc == 1:  # `num_tma_multicast == 1` is a compile-time fact without a cluster
-                load_b()
-            else:
-                with txl.if_(mc_b == txl.uint32(1)):
+                def plain():
+                    txl.ptx[_TMA_LOAD_HINT](
+                        dst,
+                        txl.address_of(tensor_map),
+                        txl.cast(inner, "int32"),
+                        txl.cast(outer, "int32"),
+                        full(stage_idx),
+                        txl.uint64(EVICT_NORMAL),
+                    )
+
+                if not may_multicast:  # `num_tma_multicast == 1` is a compile-time fact here
+                    plain()
+                    return
+                with txl.if_(num_multicast == txl.uint32(1)):
                     with txl.then_():
-                        load_b()
+                        plain()
                     with txl.else_():
                         with txl.if_(_u32(txl.cuda.cluster_cta_id("x")) == txl.uint32(0)):
                             with txl.then_():
                                 txl.ptx[_TMA_LOAD_MULTICAST](
-                                    b_dst,
-                                    txl.address_of(tensor_map_b),
-                                    txl.cast(k_idx, "int32"),
-                                    txl.cast(n_idx, "int32"),
+                                    dst,
+                                    txl.address_of(tensor_map),
+                                    txl.cast(inner, "int32"),
+                                    txl.cast(outer, "int32"),
                                     full(stage_idx),
                                     txl.uint16((1 << mc) - 1),
                                     txl.uint64(EVICT_NORMAL),
                                 )
+
+            tma_copy(
+                smem_a.ptr_to([stage_idx * txl.uint32(a_stage)]),
+                tensor_map_a,
+                k_idx,
+                m_idx,
+                mc_a,
+                mc > 1 and on_a,
+            )
+            tma_copy(
+                smem_sfa.ptr_to([stage_idx * txl.uint32(sfa_words)]),
+                tensor_map_sfa,
+                m_block * txl.uint32(BM),
+                sfa_k,
+                mc_a,
+                mc > 1 and on_a,
+            )
+            tma_copy(
+                smem_b.ptr_to([stage_idx * txl.uint32(b_stage)]),
+                tensor_map_b,
+                k_idx,
+                n_idx,
+                mc_b,
+                mc > 1 and not on_a,
+            )
             txl.ptx["mbarrier.arrive.expect_tx.shared::cta.b64"](
                 full(stage_idx), txl.uint32(a_stage + b_stage + BM * 4)
             )
@@ -563,6 +581,36 @@ def _producer(spec, *, sched_args, smem, maps, full, empty, stage_idx, phase, ad
             _wait(empty(stage_idx), phase ^ txl.uint32(1))
             txl.assign(drained, drained + 1)
             advance()
+
+
+def _promote_runtime_predicate(final_accum, accum, scale, base, num_accum, num_former_iters):
+    """Promotion with the runtime predicate `i < num_former_iters` (`.cuh:333-346`), in the form nvcc
+    emits for the source (delta sketch Delta 3): the select is factored out of the products,
+    `(p ? sa*sb0 : sa*sb1) == sa*(p ? sb0 : sb1)` bit for bit, and since `num_former_iters` is even for
+    BLOCK_N 48/112, i = 0 and i = 1 share one select and product pair under `num_former_iters != 0`.
+    The products are explicit non-FTZ PTX (ISSUE-010), so the sharing is written out here."""
+    groups = num_accum // 4
+
+    def products(pred):
+        sb = txl.local_scalar("float32", init=txl.select(pred, scale[2], scale[3]))
+        lo = txl.local_scalar("float32")
+        hi = txl.local_scalar("float32")
+        txl.ptx["mul.f32"](lo, scale[0], sb)
+        txl.ptx["mul.f32"](hi, scale[1], sb)
+        return lo, hi
+
+    def fma4(i, lo, hi):
+        for j, s in ((0, lo), (1, lo), (2, hi), (3, hi)):
+            txl.ptx["fma.rn.f32"](
+                final_accum[base + 4 * i + j], s, accum[4 * i + j], final_accum[base + 4 * i + j]
+            )
+
+    lo, hi = products(num_former_iters != txl.uint32(0))
+    fma4(0, lo, hi)
+    fma4(1, lo, hi)
+    for i in range(2, groups):
+        lo, hi = products(txl.uint32(i) < num_former_iters)
+        fma4(i, lo, hi)
 
 
 def _math(
@@ -641,8 +689,13 @@ def _math(
                     )
                     txl.ptx["mbarrier.arrive.shared::cluster.b64"](remote)
 
-    def k_loop(former_iters):
-        """One copy of the `#pragma unroll 8` K loop (`.cuh:283-349`)."""
+    def k_loop(former_iters, runtime_former_iters=None):
+        """One copy of the `#pragma unroll 8` K loop (`.cuh:283-349`).
+
+        `former_iters` pins the dispatched copy's predicate to a constant; with
+        `runtime_former_iters` (undispatched non-uniform B scales) the predicate is the runtime
+        `i < num_former_iters` instead.
+        """
         with txl.serial(0, shape_k_scales, unroll=8) as k_block_idx:
             a_base = a_desc_lo + stage_idx * txl.uint32(c["a_stage"] // 16)
             b_base = b_desc_lo + stage_idx * txl.uint32(c["b_stage"] // 16)
@@ -676,29 +729,34 @@ def _math(
                 # PTX so the result does not depend on the backend's fast-math setting.
                 # Only the products this copy's (constant) predicate selects: the source compiler
                 # drops the others, e.g. scale_x_0 in the `num_former_iters == 0` copy.
-                groups = num_accum // 4
-                uses_former = uniform_sfb or former_iters > 0
-                uses_latter = not uniform_sfb and former_iters < groups
-                if uses_former:
-                    txl.ptx["mul.f32"](scale[4], scale[0], scale[2])
-                    txl.ptx["mul.f32"](scale[5], scale[1], scale[2])
-                if uses_latter:
-                    txl.ptx["mul.f32"](scale[6], scale[0], scale[3])
-                    txl.ptx["mul.f32"](scale[7], scale[1], scale[3])
                 base = num_accum * local_idx
-                for i in range(num_accum // 4):
-                    # `predicate ? scale_x_0 : scale_x_1` with `i < num_former_iters` pinned to a
-                    # constant by the dispatch branch this copy sits in (`.cuh:342`).
-                    former = uniform_sfb or i < former_iters
-                    lo = scale[4] if former else scale[6]
-                    hi = scale[5] if former else scale[7]
-                    for j, s in ((0, lo), (1, lo), (2, hi), (3, hi)):
-                        txl.ptx["fma.rn.f32"](
-                            final_accum[base + 4 * i + j],
-                            s,
-                            accum[4 * i + j],
-                            final_accum[base + 4 * i + j],
-                        )
+                if runtime_former_iters is not None:
+                    _promote_runtime_predicate(
+                        final_accum, accum, scale, base, num_accum, runtime_former_iters
+                    )
+                else:
+                    groups = num_accum // 4
+                    uses_former = uniform_sfb or former_iters > 0
+                    uses_latter = not uniform_sfb and former_iters < groups
+                    if uses_former:
+                        txl.ptx["mul.f32"](scale[4], scale[0], scale[2])
+                        txl.ptx["mul.f32"](scale[5], scale[1], scale[2])
+                    if uses_latter:
+                        txl.ptx["mul.f32"](scale[6], scale[0], scale[3])
+                        txl.ptx["mul.f32"](scale[7], scale[1], scale[3])
+                    for i in range(num_accum // 4):
+                        # `predicate ? scale_x_0 : scale_x_1` with `i < num_former_iters` pinned to a
+                        # constant by the dispatch branch this copy sits in (`.cuh:342`).
+                        former = uniform_sfb or i < former_iters
+                        lo = scale[4] if former else scale[6]
+                        hi = scale[5] if former else scale[7]
+                        for j, s in ((0, lo), (1, lo), (2, hi), (3, hi)):
+                            txl.ptx["fma.rn.f32"](
+                                final_accum[base + 4 * i + j],
+                                s,
+                                accum[4 * i + j],
+                                final_accum[base + 4 * i + j],
+                            )
             advance()
 
     sched.next()
@@ -762,6 +820,8 @@ def _math(
                         with txl.if_(num_former_iters == txl.uint32(former)):
                             with txl.then_():
                                 k_loop(former)
+                elif c["runtime_predicate"]:
+                    k_loop(0, runtime_former_iters=num_former_iters)
                 else:
                     k_loop(0)
             with txl.else_():

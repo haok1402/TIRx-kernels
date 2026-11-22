@@ -37,9 +37,10 @@ MK_ALIGNMENT = 128
 MAX_STAGES = 16
 BLOCK_K = 128
 WGMMA_M = 64
-#: BLOCK_N values the port implements: the dispatched non-uniform (96, 192) and uniform (128)
-#: B-scale cases the upstream SM90 tests select.
-PORTED_BLOCK_N = (96, 128, 192)
+#: BLOCK_N values the port implements, each with a reviewed line-info export: the upstream SM90
+#: tests' 96/128/192, and the coverage extension's 32/64 (uniform), 48/112 (runtime predicate) and
+#: 160 (dispatched, BLOCK_N > BLOCK_K) that realistic MoE shapes select.
+PORTED_BLOCK_N = (32, 48, 64, 96, 112, 128, 160, 192)
 
 
 class GemmType(enum.IntEnum):
@@ -337,10 +338,8 @@ def make_spec(desc: GemmDesc, config: GemmConfig) -> KernelSpec:
     layout, storage = config.layout, config.storage_config
     if storage.swizzle_a_mode != layout.block_k or storage.swizzle_b_mode != layout.block_k:
         raise AssertionError("SM90 1D2D requires no TMA splits")  # `sm90_fp8_gemm_1d2d.hpp`
-    # The port covers the specializations the upstream SM90 tests reach (and whose line-info
-    # PTX was reviewed); refuse a heuristic choice outside them rather than build it unverified.
-    if layout.cluster_n > 1:
-        raise NotImplementedError("TMA multicast on A (cluster_n = 2) is not ported")
+    # The port covers the specializations whose line-info PTX was reviewed (multicast on A or B,
+    # PORTED_BLOCK_N); refuse a heuristic choice outside them rather than build it unverified.
     if layout.block_n not in PORTED_BLOCK_N:
         raise NotImplementedError(f"BLOCK_N = {layout.block_n} is not ported ({PORTED_BLOCK_N})")
     return KernelSpec(

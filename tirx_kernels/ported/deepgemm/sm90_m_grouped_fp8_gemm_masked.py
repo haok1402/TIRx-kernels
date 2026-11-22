@@ -55,10 +55,38 @@ def _edge(label, num_groups, expected_m_per_group, n, k, group_ms, *, seed=0) ->
     return case
 
 
+def _coverage_case(num_groups, m, n, k, seed):
+    """The export's masked call: `max_m = max(128, align(4m, 128))`, `expected_m = m`, every group m
+    rows (`expected_m_per_group` is chosen so that `int(1.2 * it) == m`)."""
+    expected = next(e for e in range(1, 4 * m + 2) if int(e * 1.2) == m)
+    case = _case(num_groups, expected, n, k, seed=seed)
+    case.update(
+        label=f"cov_g{num_groups}_m{m}_n{n}_k{k}",
+        max_m=max(128, (4 * m + 127) // 128 * 128),
+        group_ms=(m,) * num_groups,
+    )
+    return case
+
+
 CONFIGS = [
     *[
         _case(g, m, n, k, seed=i)
         for i, ((g, m), (n, k)) in enumerate([(gm, nk) for gm in _GROUPS for nk in _NK], start=1)
+    ],
+    # Coverage extension: the exported masked instantiations (decode-sized groups at EP 32-64).
+    *[
+        _coverage_case(*c, seed=300 + i)
+        for i, c in enumerate(
+            [
+                # (num_groups, rows per group, N, K) -> class
+                (2, 1, 1536, 2048),  # 64x32
+                (2, 1, 3072, 4096),  # 64x48, runtime predicate
+                (2, 1, 4096, 1536),  # 64x64
+                (8, 1, 7168, 2048),  # 64x112, multicast on B
+                (4, 128, 7168, 2048),  # 128x112, multicast on A
+                (8, 128, 4096, 7168),  # 128x128, multicast on A
+            ]
+        )
     ],
     # Edge shapes: empty groups (the scheduler skips them), a full `max_m` group, one row, and
     # row counts that are not BLOCK_M multiples (partial and fully invalid WGMMA row bands).
