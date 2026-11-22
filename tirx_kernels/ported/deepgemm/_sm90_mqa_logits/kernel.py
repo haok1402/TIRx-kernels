@@ -558,11 +558,11 @@ def _reduce_and_store(
         # (row * stride + u64(kv_offset)) + u64(v0) with u64(v0) loop-invariant, so ptxas keeps the
         # warp-uniform row * stride + kv_offset on the uniform datapath (UIMAD.WIDE). NVRTC's reassociation
         # groups the loop-invariant row * stride with the per-thread v0 instead (vector IMAD.WIDE + an LDC
-        # per iteration, 3-5 % on this path), so the last add is one PTX add.u64.
-        # TODO(ISSUE-016): temporary workaround; on v4 use `txl.cuda.arithmetic_fence(uniform_base) + v_0_u64`.
-        uniform_base = txl.local_scalar("uint64", init=q_offset + txl.cast(kv_offset, "uint64"))
-        index = txl.local_scalar("uint64")
-        txl.ptx["add.u64"](index, uniform_base, v_0_u64)
+        # per iteration, 3-5 % on this path).
+        # `arithmetic_fence` (ISSUE-016) keeps the uniform sum whole, so the per-thread v0 is added last.
+        index = txl.local_scalar(
+            "uint64", init=txl.cuda.arithmetic_fence(q_offset + txl.cast(kv_offset, "uint64")) + v_0_u64
+        )
     ptr_0 = logits.ptr_to([txl.cast(index, "int64")])
     ptr_1 = txl.ptx.addr(ptr_0, 8 * (2 if is_bf16 else 4))
     for v, vo, ptr in ((v_0, v_offsets[0], ptr_0), (v_1, v_offsets[1], ptr_1)):

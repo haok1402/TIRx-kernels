@@ -580,10 +580,9 @@ def _reduce_and_store(
             txl.assign(v, v + txl.reinterpret(o, ty="float32"))
 
     # Store into the global memory: `[base]` and `[base + 8 elements]` (v_1_offset = v_0_offset + 8).
-    # The warp-uniform row offset first, the per-thread v0 last, as nvcc forms it for the source; the last
-    # add is one PTX add.u64 so NVRTC does not reassociate v0 into the uniform part (sm90-probe ISSUE-016).
-    index = txl.local_scalar("uint64")
-    txl.ptx["add.u64"](index, uniform_index, v_0_u64)
+    # The warp-uniform row offset first, the per-thread v0 last, as nvcc forms it for the source;
+    # `arithmetic_fence` (ISSUE-016) keeps NVRTC from reassociating v0 into the uniform part.
+    index = txl.local_scalar("uint64", init=txl.cuda.arithmetic_fence(uniform_index) + v_0_u64)
     ptr_0 = logits.ptr_to([txl.cast(index, "int64")])
     ptr_1 = txl.ptx.addr(ptr_0, 8 * elem)
     for v, ptr in ((v_0, ptr_0), (v_1, ptr_1)):
