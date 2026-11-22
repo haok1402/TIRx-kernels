@@ -414,6 +414,7 @@ def build_kernel(spec, *, backend_config=None):
                     "uint32", init=warp_idx % txl.uint32(4) * txl.uint32(16)
                 )
                 v_0_offset = txl.local_scalar("uint32", init=lane_idx // txl.uint32(4))
+                v_0_offset_u64 = txl.local_scalar("uint64", init=txl.cast(v_0_offset, "uint64"))
                 pool_lo = txl.local_scalar(
                     "uint32", init=_u32(txl.cuda.cvta_generic_to_shared(at(txl.uint32(0))))
                 )
@@ -522,9 +523,9 @@ def build_kernel(spec, *, backend_config=None):
                                     scale_kv_0,
                                     scale_kv_1,
                                     zero,
-                                    index=kv_offset
-                                    + txl.cast(txl.uint32(i), "uint64") * txl.cast(logits_stride, "uint64")
-                                    + txl.cast(v_0_offset, "uint64"),
+                                    uniform_index=kv_offset
+                                    + txl.cast(txl.uint32(i), "uint64") * txl.cast(logits_stride, "uint64"),
+                                    v_0_u64=v_0_offset_u64,
                                     logits=logits,
                                     is_bf16=is_bf16,
                                     elem=elem,
@@ -534,7 +535,7 @@ def build_kernel(spec, *, backend_config=None):
 
 
 def _reduce_and_store(
-    accum, a0, weights, w0, H, scale_kv_0, scale_kv_1, zero, *, index, logits, is_bf16, elem
+    accum, a0, weights, w0, H, scale_kv_0, scale_kv_1, zero, *, uniform_index, v_0_u64, logits, is_bf16, elem
 ):
     """One next_n row of `.cuh:295-328`, in the order nvcc emits (non-FTZ under `fp_mode="precise"`).
 
@@ -580,7 +581,11 @@ def _reduce_and_store(
             )
             txl.assign(v, v + txl.reinterpret(o, ty="float32"))
 
-    # Store into the global memory: `[base]` and `[base + 8 elements]` (v_1_offset = v_0_offset + 8)
+    # Store into the global memory: `[base]` and `[base + 8 elements]` (v_1_offset = v_0_offset + 8).
+    # The warp-uniform row offset first, the per-thread v0 last, as nvcc forms it for the source; the last
+    # add is one PTX add.u64 so NVRTC does not reassociate v0 into the uniform part (sm90-probe ISSUE-016).
+    index = txl.local_scalar("uint64")
+    txl.ptx["add.u64"](index, uniform_index, v_0_u64)
     ptr_0 = logits.ptr_to([txl.cast(index, "int64")])
     ptr_1 = txl.ptx.addr(ptr_0, 8 * elem)
     for v, ptr in ((v_0, ptr_0), (v_1, ptr_1)):
