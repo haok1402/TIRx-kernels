@@ -204,11 +204,7 @@ def build_main_kernel(dtype: str, *, backend_config=None):
 
         def wait_barrier(bar, phase):
             """`ClusterBarrier::wait`: try_wait.parity with the suspend hint, retried."""
-            done = txl.local_scalar("uint32", init=txl.uint32(0))
-            with txl.while_(done == txl.uint32(0)):
-                txl.ptx["mbarrier.try_wait.parity.shared::cta.b64"](
-                    done, bar, _u32(phase), txl.uint32(TRY_WAIT_TICKS)
-                )
+            txl.cuda.mbarrier_wait_parity(bar, _u32(phase), txl.uint32(TRY_WAIT_TICKS))
 
         def expect_tx(bar, nbytes):
             txl.ptx["mbarrier.arrive.expect_tx.shared::cta.b64"](bar, txl.uint32(nbytes))
@@ -754,11 +750,14 @@ def build_main_kernel(dtype: str, *, backend_config=None):
                     txl.cuda.warp_sync()
                     txl.assign(rL[0], lds(OFF_L + 4 * row0))
                     txl.assign(rL[1], lds(OFF_L + 4 * (row0 + 8)))
-            # rL = (rL == 0 || rL != rL) ? 1 : rL  (setp.equ: equal or unordered)
+            # rL = (rL == 0 || rL != rL) ? 1 : rL
             for r in range(2):
-                zero_or_nan = txl.local_scalar("uint32")
-                txl.ptx["setp.equ.ftz.f32"](zero_or_nan, rL[r], txl.float32(0.0))
-                txl.ptx["selp.f32"](rL[r], txl.float32(1.0), rL[r], txl.ptx.pred(zero_or_nan))
+                txl.assign(
+                    rL[r],
+                    txl.if_then_else(
+                        txl.Or(rL[r] == txl.float32(0.0), rL[r] != rL[r]), txl.float32(1.0), rL[r]
+                    ),
+                )
             with txl.if_(batch + 1 <= end_req):
                 with txl.then_():
                     launch_q_copy(batch + 1)
@@ -802,9 +801,9 @@ def build_main_kernel(dtype: str, *, backend_config=None):
                     with txl.if_(tid < num_valid), txl.then_():
                         cur_l = lds(OFF_L + 4 * tid)
                         lse = txl.local_scalar("float32", init=txl.float32(float("inf")))
-                        zero_or_nan = txl.local_scalar("uint32")
-                        txl.ptx["setp.equ.ftz.f32"](zero_or_nan, cur_l, txl.float32(0.0))
-                        with txl.if_(zero_or_nan == txl.uint32(0)), txl.then_():
+                        with txl.if_(
+                            txl.Not(txl.Or(cur_l == txl.float32(0.0), cur_l != cur_l))
+                        ), txl.then_():
                             lg = txl.local_scalar("float32")
                             txl.ptx["lg2.approx.ftz.f32"](lg, cur_l)
                             mdiv = txl.local_scalar("float32")
@@ -852,9 +851,9 @@ def build_main_kernel(dtype: str, *, backend_config=None):
                     with txl.if_(tid < num_valid), txl.then_():
                         cur_l = lds(OFF_L + 4 * tid)
                         lse = txl.local_scalar("float32", init=txl.float32(-float("inf")))
-                        zero_or_nan = txl.local_scalar("uint32")
-                        txl.ptx["setp.equ.ftz.f32"](zero_or_nan, cur_l, txl.float32(0.0))
-                        with txl.if_(zero_or_nan == txl.uint32(0)), txl.then_():
+                        with txl.if_(
+                            txl.Not(txl.Or(cur_l == txl.float32(0.0), cur_l != cur_l))
+                        ), txl.then_():
                             txl.ptx["lg2.approx.ftz.f32"](lse, cur_l)
                             fadd(lse, lse, lds(OFF_M + 4 * tid))
                         txl.ptx.st.global_.f32(softmax_lseaccum.ptr_to([acc_row + tid]), lse)
