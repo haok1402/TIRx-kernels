@@ -578,11 +578,7 @@ def _producer_load(locals_):
     m_min = txl.local_scalar("int32", init=L["m_min_of"](n_block))
     m_max = L["m_max_c"]
     leader = L["thread_idx"] % 128 == 0  # PipelineParams::is_leader
-    # gLSE / gdPsum row base of this (bidb, bidh): built once per tile, as the source's local_tile of
-    # mLSE / mdPsum (both have the (b, h, s_q_rounded) stride), then indexed by m_block.
-    stat_row = txl.local_scalar("int64", init=L["stat_base"](bidb, bidh))  # int64, as upstream's strides
-
-    def load_q(m):
+    def load_q(m, stat_row):
         q_dst = OFF["q"] + stage * L["Q_TILE"]
         for half in range(2):
             _tma_load(L["b16"](q_dst + half * L["HALF"]), L["tma_q"], 64 * half, m * BM, bidh, bidb,
@@ -594,7 +590,7 @@ def _producer_load(locals_):
             bar_s(L["b_full_q"], stage),
         )
 
-    def load_do(m):
+    def load_do(m, stat_row):
         do_dst = OFF["do"] + stage * L["Q_TILE"]
         for half in range(2):
             _tma_load(L["b16"](do_dst + half * L["HALF"]), L["tma_do"], 64 * half, m * BM, bidh, bidb,
@@ -612,12 +608,20 @@ def _producer_load(locals_):
             txl.ptx["mbarrier.arrive.expect_tx.shared::cta.b64"](bar_s(full_fn, stage), txl.uint32(L["TX_Q"]))
 
     def body():
+        # gLSE / gdPsum row base of this (bidb, bidh), int64 as upstream's strides (local_tile of mLSE /
+        # mdPsum). The 24-register producer is sensitive to how it is held: causal binds it once per
+        # tile (re-deriving it spilled 32 B), non-causal re-derives it per use (binding it spilled 4 B
+        # and made ptxas rematerialize threadIdx in the MMA loop). Both forms are spill-free.
+        if L["is_causal"]:
+            stat_row = txl.local_scalar("int64", init=L["stat_base"](bidb, bidh))
+        else:
+            stat_row = L["stat_base"](bidb, bidh)
         lane = txl.local_scalar("uint32")
         lane_e = txl.local_scalar("uint32")
         txl.ptx.elect_sync(lane_e, lane, txl.uint32(0xFFFFFFFF))
         with txl.if_(lane == txl.uint32(1)), txl.then_():
             acquire(L["b_empty_q"], L["b_full_q"])
-            load_q(m_min)
+            load_q(m_min, stat_row)
         with txl.if_(lane == txl.uint32(1)), txl.then_():
             txl.ptx["mbarrier.arrive.expect_tx.shared::cta.b64"](bar(L["B_KV"]), txl.uint32(65536))
             for half in range(2):
@@ -628,13 +632,13 @@ def _producer_load(locals_):
                           bidh, bidb, bar(L["B_KV"]), EVICT_NORMAL)
             with txl.serial(m_min, m_max - 1, unroll=2) as m:
                 acquire(L["b_empty_do"], L["b_full_do"])
-                load_do(m)
+                load_do(m, stat_row)
                 advance(stage, phase)
                 acquire(L["b_empty_q"], L["b_full_q"])
-                load_q(m + 1)
+                load_q(m + 1, stat_row)
         with txl.if_(lane == txl.uint32(1)), txl.then_():
             acquire(L["b_empty_do"], L["b_full_do"])
-            load_do(m_max - 1)
+            load_do(m_max - 1, stat_row)
             advance(stage, phase)
 
     if L["is_causal"]:
