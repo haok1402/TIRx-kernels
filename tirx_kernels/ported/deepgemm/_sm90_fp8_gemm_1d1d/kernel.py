@@ -100,13 +100,20 @@ class _Scheduler:
         self.current_iter = txl.local_scalar("int32", init=-1)
         self.num_blocks_in_group = txl.local_scalar("uint32", init=txl.uint32(0))
         self.is_peer_cta_alive = txl.local_scalar("uint32", init=txl.uint32(1))
-        self.current_group_idx = txl.local_scalar("uint32", init=txl.uint32(0))
-        self.current_shape_k = txl.local_scalar("uint32", init=_u32(shape_k))
-        self.current_num_valid_groups = txl.local_scalar("uint32", init=txl.uint32(0))
-        self.current_k_cumsum = txl.local_scalar("uint32", init=txl.uint32(0))
-        self.current_sf_k_cumsum = txl.local_scalar("uint32", init=txl.uint32(0))
-        self.next_group_idx = txl.local_scalar("uint32", init=txl.uint32(0))
-        self.next_shape_k = txl.local_scalar("uint32", init=txl.uint32(0))
+        if self.is_k_grouped:
+            self.current_group_idx = txl.local_scalar("uint32", init=txl.uint32(0))
+            self.current_shape_k = txl.local_scalar("uint32", init=_u32(shape_k))
+            self.current_num_valid_groups = txl.local_scalar("uint32", init=txl.uint32(0))
+            self.current_k_cumsum = txl.local_scalar("uint32", init=txl.uint32(0))
+            self.current_sf_k_cumsum = txl.local_scalar("uint32", init=txl.uint32(0))
+            self.next_group_idx = txl.local_scalar("uint32", init=txl.uint32(0))
+            self.next_shape_k = txl.local_scalar("uint32", init=txl.uint32(0))
+        else:
+            # The k-group members are never written for `Normal`: their initializers are constants
+            # (`current_sf_k_cumsum = 0`, `current_shape_k = shape_k`), which nvcc folds into every use.
+            self.current_group_idx = txl.uint32(0)
+            self.current_shape_k = _u32(shape_k)
+            self.current_sf_k_cumsum = txl.uint32(0)
         self.m_block_idx = txl.local_scalar("uint32", init=txl.uint32(0))
         self.n_block_idx = txl.local_scalar("uint32", init=txl.uint32(0))
         self.valid = txl.local_scalar("uint32", init=txl.uint32(0))
@@ -114,6 +121,12 @@ class _Scheduler:
         self.num_m_blocks = (_u32(shape_m) + txl.uint32(bm - 1)) // txl.uint32(bm)
         self.num_n_blocks = (_u32(shape_n) + txl.uint32(bn - 1)) // txl.uint32(bn)
         self.num_blocks = txl.local_scalar("uint32", init=self.num_m_blocks * self.num_n_blocks)
+        # The block-group size when it is a compile-time constant (see `_swizzle`), else None.
+        per = _num_1d_blocks_per_group(spec)
+        on_a = spec.is_tma_multicast_on_a
+        primary_const = spec.shape_n if on_a else spec.shape_m
+        primary_blocks = _ceil_div(primary_const, bn if on_a else bm)
+        self.const_group_size = per if primary_const and primary_blocks % per == 0 else None
         if self.is_k_grouped:
             self._get_next_k_group(self.current_group_idx, self.current_shape_k)
             txl.assign(self.next_group_idx, self.current_group_idx + txl.uint32(1))
@@ -147,8 +160,17 @@ class _Scheduler:
         blocks_per_group = txl.local_scalar("uint32", init=secondary * txl.uint32(per))
         first = txl.local_scalar("uint32", init=block_idx // blocks_per_group * txl.uint32(per))
         in_group = txl.local_scalar("uint32", init=block_idx % blocks_per_group)
-        txl.assign(self.num_blocks_in_group, txl.min(txl.uint32(per), primary - first))
-        if spec.num_tma_multicast > 1:
+        # With the primary extent compiled in (SHAPE_M for multicast on B, SHAPE_N on A) and a
+        # multiple of `kNum1DBlocksPerGroup`, `primary - first` is a positive multiple of it for every
+        # in-range block, so `min` is the constant `per` (even, as `per % kNumTMAMulticast == 0`) and the
+        # odd-size fix-up is dead.  nvcc proves this from the compiled shape; it is written as the
+        # constant here because NVRTC keeps the runtime `min` (and with it `is_tma_multicast_valid` and
+        # the plain-B/SFB load path) alive.
+        if self.const_group_size is not None:
+            txl.assign(self.num_blocks_in_group, txl.uint32(per))
+        else:
+            txl.assign(self.num_blocks_in_group, txl.min(txl.uint32(per), primary - first))
+        if spec.num_tma_multicast > 1 and self.const_group_size is None:
             with txl.if_(self.num_blocks_in_group % txl.uint32(2) != txl.uint32(0)):
                 with txl.then_():
                     even = txl.local_scalar("uint32", init=self.num_blocks_in_group ^ txl.uint32(1))
@@ -159,12 +181,16 @@ class _Scheduler:
                             txl.assign(in_group, in_group - even * secondary)
                             txl.assign(first, first + even)
                             txl.assign(self.num_blocks_in_group, txl.uint32(1))
-        if on_a:
-            txl.assign(self.m_block_idx, in_group // self.num_blocks_in_group)
-            txl.assign(self.n_block_idx, first + in_group % self.num_blocks_in_group)
+        if self.const_group_size is not None:
+            group_size = txl.uint32(per)
         else:
-            txl.assign(self.m_block_idx, first + in_group % self.num_blocks_in_group)
-            txl.assign(self.n_block_idx, in_group // self.num_blocks_in_group)
+            group_size = self.num_blocks_in_group
+        if on_a:
+            txl.assign(self.m_block_idx, in_group // group_size)
+            txl.assign(self.n_block_idx, first + in_group % group_size)
+        else:
+            txl.assign(self.m_block_idx, first + in_group % group_size)
+            txl.assign(self.n_block_idx, in_group // group_size)
 
     def next(self):
         """`get_next_block`; sets `valid` and, if valid, `m_block_idx` / `n_block_idx`."""
@@ -231,7 +257,10 @@ class _Scheduler:
                     self._swizzle(next_block_idx)
 
     def is_tma_multicast_valid(self):
-        """`is_tma_multicast_valid` for `Normal` / k-grouped: only the group-size test."""
+        """`is_tma_multicast_valid` for `Normal` / k-grouped: only the group-size test.  A Python bool
+        when the group size is a compile-time constant."""
+        if self.const_group_size is not None:
+            return self.const_group_size != 1
         return self.num_blocks_in_group != txl.uint32(1)
 
 
@@ -382,8 +411,11 @@ def build_kernel(spec: KernelSpec, *, backend_config=None):
             txl.ptx.bar.sync(txl.uint32(0))
         txl.ptx.griddepcontrol.wait()
 
-        # `get_pipeline(iter_idx)`: (iter % kNumStages, (iter / kNumStages) & 1), one counter per role.
-        iter_idx = txl.local_scalar("uint32", init=txl.uint32(0))
+        # `get_pipeline(iter_idx)`: (iter % kNumStages, (iter / kNumStages) & 1), one state per role.
+        iter_idx = (
+            txl.local_scalar("uint32", init=txl.uint32(0)),  # stage = iter_idx % kNumStages
+            txl.local_scalar("uint32", init=txl.uint32(0)),  # phase = (iter_idx / kNumStages) & 1
+        )
         roles = dict(
             spec=spec,
             grouped_layout=grouped_layout,
@@ -472,25 +504,35 @@ def _copy_param_tensor_map_to_smem(tmap, smem_tmap, word_offset):
 
 
 def _copy_smem_tensor_map_to_gmem(smem_tmap, word_offset, dst):
-    """`*(gmem_tensor_map_a) = *(smem_tensor_map_a)` (`.cuh:208-209`): 8 x 16-byte shared loads,
-    then 8 x 16-byte global stores."""
-    words = txl.alloc_local((32,), "uint32")
+    """`*(gmem_tensor_map_a) = *(smem_tensor_map_a)` (`.cuh:208-209`): 8 x 16-byte shared loads and
+    8 x 16-byte global stores.
+
+    Each 16-byte chunk is stored right after it is loaded, the order the source's SASS ends up in
+    (ptxas interleaves nvcc's load-all-then-store-all PTX): this copy runs in the 40-register producer,
+    and holding all 32 words live (the PTX order, which NVRTC's `asm volatile` copies keep) spills."""
+    words = txl.alloc_local((4,), "uint32")
     for j in range(8):
         txl.ptx["ld.shared.v4.u32"](
-            words[4 * j], words[4 * j + 1], words[4 * j + 2], words[4 * j + 3],
-            smem_tmap.ptr_to([word_offset + 4 * j]),
-        )  # fmt: skip
-    for j in reversed(range(8)):
-        txl.ptx["st.global.v4.u32"](
-            _byte_address(dst, 16 * j),
-            words[4 * j], words[4 * j + 1], words[4 * j + 2], words[4 * j + 3],
-        )  # fmt: skip
+            words[0], words[1], words[2], words[3], smem_tmap.ptr_to([word_offset + 4 * j])
+        )
+        txl.ptx["st.global.v4.u32"](_byte_address(dst, 16 * j), words[0], words[1], words[2], words[3])
 
 
-def _pipeline(iter_idx, stages):
-    """`get_pipeline(iter_idx)` (`.cuh:165-167`): the stage and phase of one ring slot."""
-    stage_idx = txl.local_scalar("uint32", init=iter_idx % txl.uint32(stages))
-    phase = txl.local_scalar("uint32", init=(iter_idx // txl.uint32(stages)) & txl.uint32(1))
+def _pipeline(pipe, stages):
+    """`get_pipeline(iter_idx ++)` (`.cuh:165-167`): this ring slot's stage and phase, then advance.
+
+    `pipe` is the role's `(stage, phase)` pair, i.e. `(iter_idx % kNumStages, (iter_idx / kNumStages) & 1)`
+    kept incrementally (stage wraps, phase flips on the wrap) instead of re-derived from the counter.
+    The two are equal for every iteration; the counter form's per-copy divisions, once a K loop is
+    unrolled, are all hoisted to the loop top and spill the 24/40-register producer (nvcc on the same
+    generated source spills identically, so this is the expression shape, not the compiler)."""
+    stage, phase_bit = pipe
+    stage_idx = txl.local_scalar("uint32", init=stage)
+    phase = txl.local_scalar("uint32", init=phase_bit)
+    # Bound before `stage` is rewritten: an unbound expression would re-read the updated stage.
+    wrap = txl.local_scalar("uint32", init=txl.cast(stage == txl.uint32(stages - 1), "uint32"))
+    txl.assign(stage, txl.select(wrap == txl.uint32(1), txl.uint32(0), stage + txl.uint32(1)))
+    txl.assign(phase_bit, phase_bit ^ wrap)
     return stage_idx, phase
 
 
@@ -523,10 +565,15 @@ def _producer(
     with txl.while_(sched.valid == txl.uint32(1)):
         m_block, n_block = sched.m_block_idx, sched.n_block_idx
         # `num_tma_multicast_a/b` (`.cuh:179-181`): the multicast side gets `kNumTMAMulticast`.
-        mc_a = txl.local_scalar("uint32", init=txl.uint32(1))
-        mc_b = txl.local_scalar("uint32", init=txl.uint32(1))
-        if mc > 1:
-            with txl.if_(sched.is_tma_multicast_valid()):
+        valid = sched.is_tma_multicast_valid() if mc > 1 else False
+        if isinstance(valid, bool):
+            # Compile-time: one TMA path per operand.
+            mc_a = mc if (on_a and valid) else 1
+            mc_b = mc if (not on_a and valid) else 1
+        else:
+            mc_a = txl.local_scalar("uint32", init=txl.uint32(1))
+            mc_b = txl.local_scalar("uint32", init=txl.uint32(1))
+            with txl.if_(valid):
                 with txl.then_():
                     txl.assign(mc_a if on_a else mc_b, txl.uint32(mc))
         num_k_blocks = txl.local_scalar(
@@ -573,7 +620,6 @@ def _producer(
         with txl.serial(0, num_k_blocks, unroll=unroll, dtype="uint32") as k_block_idx:
             # Wait consumer release (`.cuh:220-221`).
             stage_idx, phase = _pipeline(iter_idx, stages)
-            txl.assign(iter_idx, iter_idx + txl.uint32(1))
             _wait(empty(stage_idx), phase ^ txl.uint32(1))
             k_idx = k_block_idx * txl.uint32(BK)
             sf_k_idx = sched.current_sf_k_cumsum + k_block_idx
@@ -592,8 +638,21 @@ def _producer(
                         txl.uint64(EVICT_NORMAL),
                     )
 
-                if not may_multicast:  # `num_tma_multicast == 1` is a compile-time fact here
-                    plain()
+                if not may_multicast or (isinstance(num_multicast, int) and num_multicast == 1):
+                    plain()  # `num_tma_multicast == 1` is a compile-time fact here
+                    return
+                if isinstance(num_multicast, int):  # compile-time multicast
+                    with txl.if_(_u32(txl.cuda.cluster_cta_id("x")) == txl.uint32(0)):
+                        with txl.then_():
+                            txl.ptx[_TMA_LOAD_MULTICAST](
+                                dst,
+                                tmap,
+                                txl.cast(inner, "int32"),
+                                txl.cast(outer, "int32"),
+                                full(stage_idx),
+                                txl.uint16((1 << mc) - 1),
+                                txl.uint64(EVICT_NORMAL),
+                            )
                     return
                 with txl.if_(num_multicast == txl.uint32(1)):
                     with txl.then_():
@@ -637,7 +696,6 @@ def _producer(
         # waits" (`.cuh:237-244`).
         for _ in range(stages):
             stage_idx, phase = _pipeline(iter_idx, stages)
-            txl.assign(iter_idx, iter_idx + txl.uint32(1))
             _wait(empty(stage_idx), phase ^ txl.uint32(1))
 
 
@@ -718,7 +776,6 @@ def _math(
         with txl.serial(0, num_k_blocks, unroll=unroll, dtype="uint32"):
             # Wait TMA arrivals (`.cuh:277-279`).
             stage_idx, phase = _pipeline(iter_idx, stages)
-            txl.assign(iter_idx, iter_idx + txl.uint32(1))
             _wait(full(stage_idx), phase)
 
             # Read A / B scales: "all shared memory read must be prior to `warpgroup_arrive`"
