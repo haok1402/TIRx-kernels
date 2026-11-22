@@ -119,29 +119,31 @@ def scale_log2(softmax_scale: float) -> float:
     return f32(f32(softmax_scale) * 1.44269504088896340736)
 
 
-def build_kernels(head_dim: int, is_causal: bool, *, gqa: bool = False, backend_config=None):
+def build_kernels(head_dim: int, is_causal: bool, *, gqa: bool = False, varlen: bool = False,
+                  backend_config=None):
     """preprocess, main, dQ convert (+ the dK / dV convert for GQA: ``run_flash_bwd``'s
-    ``PostprocessKerneldKV``, launched twice)."""
+    ``PostprocessKerneldKV``, launched twice). ``varlen``: the ``Varlen = true`` instantiations
+    (cu_seqlens / seqused inputs)."""
     from .kernel import build_main_kernel, build_postprocess, build_postprocess_dkv, build_preprocess
 
     bm = block_m(head_dim, is_causal)
     kernels = (
-        build_preprocess(head_dim, bm, backend_config=backend_config),
-        build_main_kernel(head_dim, is_causal, gqa=gqa, backend_config=backend_config),
-        build_postprocess(head_dim, is_causal, backend_config=backend_config),
+        build_preprocess(head_dim, bm, varlen=varlen, backend_config=backend_config),
+        build_main_kernel(head_dim, is_causal, gqa=gqa, varlen=varlen, backend_config=backend_config),
+        build_postprocess(head_dim, is_causal, varlen=varlen, backend_config=backend_config),
     )
     if gqa:
-        kernels += (build_postprocess_dkv(head_dim, backend_config=backend_config),)
+        kernels += (build_postprocess_dkv(head_dim, varlen=varlen, backend_config=backend_config),)
     return kernels
 
 
 @cache_backend_config
-def _compile(head_dim: int, is_causal: bool, gqa: bool, *, backend_config=None):
+def _compile(head_dim: int, is_causal: bool, gqa: bool, varlen: bool = False, *, backend_config=None):
     from tirx_kernels.runner import compile_kernel
 
     return tuple(
         compile_kernel(k, backend_config=backend_config)
-        for k in build_kernels(head_dim, is_causal, gqa=gqa, backend_config=backend_config)
+        for k in build_kernels(head_dim, is_causal, gqa=gqa, varlen=varlen, backend_config=backend_config)
     )
 
 
@@ -154,11 +156,32 @@ class Executables:
     post: Any
     gqa: bool = False
     post_dkv: Any = None
+    varlen: bool = False
 
 
-def compile_kernels(head_dim: int, is_causal: bool, *, gqa: bool = False, backend_config=None) -> Executables:
-    built = _compile(head_dim, is_causal, gqa, backend_config=backend_config)
-    return Executables(head_dim, is_causal, *built[:3], gqa=gqa, post_dkv=built[3] if gqa else None)
+def compile_kernels(head_dim: int, is_causal: bool, *, gqa: bool = False, varlen: bool = False,
+                    backend_config=None) -> Executables:
+    built = _compile(head_dim, is_causal, gqa, varlen, backend_config=backend_config)
+    return Executables(head_dim, is_causal, *built[:3], gqa=gqa, post_dkv=built[3] if gqa else None,
+                       varlen=varlen)
+
+
+def _null_i32():
+    """A null ``int const*`` (cu_seqlens / seqused absent): a 0-element tensor, data pointer 0."""
+    import torch
+
+    return torch.empty(0, dtype=torch.int32, device="cuda")
+
+
+def _varlen_args(p):
+    """(cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k); seqused each possibly null. The port covers
+    both cu_seqlens given (flash_attn_varlen_func's case): seqused without cu_seqlens, or one-sided
+    cu_seqlens, take other upstream host paths (padded workspaces on the fixed-length kernels; batch
+    strides set from cu_seqlens_q only) and are rejected."""
+    if p.get("cu_seqlens_q") is None or p.get("cu_seqlens_k") is None:
+        raise ValueError("varlen needs both cu_seqlens_q and cu_seqlens_k (seqused_q / seqused_k optional)")
+    return tuple(p[n] if p.get(n) is not None else _null_i32()
+                 for n in ("cu_seqlens_q", "cu_seqlens_k", "seqused_q", "seqused_k"))
 
 
 def _args(p, ours):
@@ -173,14 +196,18 @@ def _args(p, ours):
     # The GQA epilogue reduces into fp32 dK / dV accumulators instead of storing bf16 dK / dV.
     dk_acc = ours.get("dk_accum")
     dv_acc = ours.get("dv_accum")
+    varlen = bool(p.get("varlen"))
+    # varlen: (total, h, d) as the 4-D (d, total, h, 1) map (batch extent 1, run_flash_bwd's batch_q = 1).
+    as4 = (lambda t: t.unsqueeze(0)) if varlen else (lambda t: t)
     maps = (
-        _encode_bshd(p["q"], bm),
-        _encode_bshd(p["dout"], bm),
-        _encode_bshd(p["k"], bn),
-        _encode_bshd(p["v"], bn),
-        _encode_bshd(ours["dk"], bn),
-        _encode_bshd(ours["dv"], bn),
+        _encode_bshd(as4(p["q"]), bm),
+        _encode_bshd(as4(p["dout"]), bm),
+        _encode_bshd(as4(p["k"]), bn),
+        _encode_bshd(as4(p["v"]), bn),
     )
+    if not varlen:  # the varlen MHA epilogue stores without TMA (Use_TMA = !Varlen)
+        maps += (_encode_bshd(ours["dk"], bn), _encode_bshd(ours["dv"], bn))
+    vptr = _varlen_args(p) if varlen else ()
     pre_args = (
         p["out"].reshape(-1),
         p["dout"].reshape(-1),
@@ -194,8 +221,12 @@ def _args(p, ours):
         h,
         b,
     )
-    n_blocks = (s_k + bn - 1) // bn
-    lpt = lpt_params(n_blocks, h, b, s_q, d)
+    if varlen:  # cu_seqlens_q, seqused_q, grid rows (max_seqlen_q), shape_dPsum[0]
+        pre_args += (vptr[0], vptr[2], p["max_seqlen_q"], p["s_q_rounded"])
+    # Grid and LPT swizzle use the maximum lengths (params.seqlen_q / seqlen_k = max_seqlen_*).
+    msq, msk = (p["max_seqlen_q"], p["max_seqlen_k"]) if varlen else (s_q, s_k)
+    n_blocks = (msk + bn - 1) // bn
+    lpt = lpt_params(n_blocks, h, b, msq, d)
     sched = (
         lpt["total_blocks"],
         *lpt["block"],
@@ -213,6 +244,8 @@ def _args(p, ours):
         *sched,
         *fast_divmod((h + h_k - 1) // h_k),  # qhead_per_khead_divmod (divisor 1 for MHA)
     )
+    if varlen:  # cu_seqlens / seqused, the scheduler's seqlen (and grid), shape_LSE[0], dKaccum rows
+        tail += (*vptr, msk, p["s_q_rounded"], p["s_k_rounded"])
     if gqa:  # dK / dV fp32 accumulators instead of the bf16 outputs; only the Q, dO, K, V TensorMaps
         main_args = (
             ours["lse_log2"].reshape(-1), ours["softmax_d"].reshape(-1), ours["dq_accum"].reshape(-1),
@@ -223,13 +256,14 @@ def _args(p, ours):
             ours["lse_log2"].reshape(-1), ours["softmax_d"].reshape(-1), ours["dq_accum"].reshape(-1),
             ours["dk"].reshape(-1), ours["dv"].reshape(-1), *head, *tail, *(m.ptr for m in maps),
         )
-    post_args = (ours["dq_accum"].reshape(-1), ours["dq"].reshape(-1), s_q, d, h, b, f32(p["softmax_scale"]))
+    post_args = (ours["dq_accum"].reshape(-1), ours["dq"].reshape(-1), *_post_tail(p, "q"), f32(p["softmax_scale"]))
+    post_args += _post_varlen(p, "q")
     dkv_args = ()
     if gqa:
         # PostprocessKerneldKV: TileShape (kBlockN, d), softmax_scale 1.f, (seqlen_k, h_k) heads.
         dkv_args = (
-            (ours["dk_accum"].reshape(-1), ours["dk"].reshape(-1), s_k, d, h_k, b, 1.0),
-            (ours["dv_accum"].reshape(-1), ours["dv"].reshape(-1), s_k, d, h_k, b, 1.0),
+            (ours["dk_accum"].reshape(-1), ours["dk"].reshape(-1), *_post_tail(p, "k"), 1.0, *_post_varlen(p, "k")),
+            (ours["dv_accum"].reshape(-1), ours["dv"].reshape(-1), *_post_tail(p, "k"), 1.0, *_post_varlen(p, "k")),
         )
     cache[key] = (maps, pre_args, main_args, post_args, dkv_args)
     return cache[key]
@@ -237,12 +271,25 @@ def _args(p, ours):
 
 def launch_backward(ex: Executables, p, ours) -> None:
     """preprocess, main, postprocess (no PDL: ``launch_with_pdl`` is false upstream)."""
-    _, pre_args, main_args, post_args, dkv_args = _args(p, ours)
     if ex.gqa:
         # mha_bwd zero-fills dk_accum / dv_accum with torch fill_(0.0) (flash_api_stable.cpp:1565, :1567),
         # an elementwise fill kernel; zero_() would be a cudaMemsetAsync, which a kernel trace omits.
         ours["dk_accum"].fill_(0.0)
         ours["dv_accum"].fill_(0.0)
+    # mha_bwd (flash_api_stable.cpp:1629-1643): no kernel runs on an empty side; it zeroes the outputs
+    # instead (torch zero_), e.g. a varlen batch whose sequences all have length 0.
+    total_q, total_k = p["q"].shape[0] * (1 if p.get("varlen") else p["q"].shape[1]), \
+        p["k"].shape[0] * (1 if p.get("varlen") else p["k"].shape[1])
+    if not (total_q > 0 and total_k > 0):
+        if total_k > 0:
+            ours["dk"].zero_()
+            ours["dv"].zero_()
+            ours["softmax_d"].zero_()
+        elif total_q > 0:
+            ours["dq"].zero_()
+            ours["softmax_d"].zero_()
+        return
+    _, pre_args, main_args, post_args, dkv_args = _args(p, ours)
     ex.pre.mod(*pre_args)
     ex.main.mod(*main_args)
     ex.post.mod(*post_args)
@@ -250,12 +297,28 @@ def launch_backward(ex: Executables, p, ours) -> None:
         ex.post_dkv.mod(*args)
 
 
+def _post_tail(p, side):
+    """(seqlen, d, heads, b) of the dQ (side "q") or dK / dV (side "k") convert."""
+    return (p[f"s_{side}"], p["d"], p["h"] if side == "q" else p["h_k"], p["b"])
+
+
+def _post_varlen(p, side):
+    """The varlen convert's extra arguments: cu_seqlens, seqused, grid rows (max_seqlen), shape[0] of
+    the accumulator (the padded total)."""
+    if not p.get("varlen"):
+        return ()
+    cu_q, cu_k, su_q, su_k = _varlen_args(p)
+    cu, su = (cu_q, su_q) if side == "q" else (cu_k, su_k)
+    return (cu, su, p[f"max_seqlen_{side}"], p[f"s_{side}_rounded"])
+
+
 def launch_postprocess(ex: Executables, p, dq_accum, dq) -> None:
     """The dQ convert alone, on a given accumulator."""
-    ex.post.mod(dq_accum.reshape(-1), dq.reshape(-1), p["s_q"], p["d"], p["h"], p["b"], f32(p["softmax_scale"]))
+    ex.post.mod(dq_accum.reshape(-1), dq.reshape(-1), *_post_tail(p, "q"), f32(p["softmax_scale"]),
+                *_post_varlen(p, "q"))
 
 
 def launch_postprocess_dkv(ex: Executables, p, dk_accum, dk, dv_accum, dv) -> None:
     """The dK and dV converts alone, on given fp32 accumulators (GQA)."""
     for acc, out in ((dk_accum, dk), (dv_accum, dv)):
-        ex.post_dkv.mod(acc.reshape(-1), out.reshape(-1), p["s_k"], p["d"], p["h_k"], p["b"], 1.0)
+        ex.post_dkv.mod(acc.reshape(-1), out.reshape(-1), *_post_tail(p, "k"), 1.0, *_post_varlen(p, "k"))

@@ -26,6 +26,8 @@ Float math is the PTX the source's ``--use_fast_math`` build emits (``.ftz``, ``
 contractable ``mul``/``sub``).
 """
 
+import inspect
+
 import tirx_kernels.tirx_lite as txl
 
 HEAD_DIM = 128
@@ -88,32 +90,90 @@ def _block_m(is_causal):
     return 64 if is_causal else 80
 
 
+def _annot(a):
+    """A fresh kernel-parameter annotation: 1-D tensors of a dtype, a TensorMap pointer, or a scalar."""
+    if isinstance(a, tuple) and a[0] == "tensor":
+        return txl.Tensor((txl.int64(),), a[1])
+    if a == ("tensormap",):
+        return txl.Ptr(txl.TensorMap)
+    return a
+
+
+def _add(off, x):
+    """``off + x``, or ``x`` itself when there is no offset (the fixed-length builds)."""
+    return x if off is None else off + x
+
+
+class _Varlen:
+    """``seqlen.h``'s SeqlenInfo fields with the source's runtime null tests. A null ``int const*``
+    is passed as a 0-element tensor (data pointer 0); cu_seqlens / seqused are read with plain
+    ``ld.global.u32`` as nvcc emits them."""
+
+    def __init__(self, cu_q, cu_k, su_q, su_k):
+        self.cu_q, self.cu_k, self.su_q, self.su_k = cu_q, cu_k, su_q, su_k
+
+    @staticmethod
+    def nonnull(t):
+        return txl.reinterpret(t.data, ty="uint64") != txl.uint64(0)
+
+    @staticmethod
+    def ld(t, i):
+        raw = txl.local_scalar("uint32")
+        txl.ptx.ld.global_.u32(raw, t.ptr_to([i]))
+        return txl.reinterpret(raw, ty="int32")
+
+    def offset(self, bidb, cu, kblock=None):
+        """``cu == nullptr ? 0 : cu[bidb]``, or offset_padded
+        ``(cu[bidb] + bidb * kBlock) / kBlock * kBlock`` with ``kblock``."""
+        o = txl.local_scalar("int32", init=txl.int32(0))
+        with txl.if_(self.nonnull(cu)), txl.then_():
+            c = self.ld(cu, bidb)
+            txl.assign(o, c if kblock is None else txl.truncdiv(c + bidb * kblock, kblock) * kblock)
+        return o
+
+    def seqlen(self, bidb, cu, su, static):
+        """``seqused ? seqused[bidb] : (cu ? cu[bidb + 1] - cu[bidb] : seqlen_static)``."""
+        n = txl.local_scalar("int32")
+        with txl.if_(self.nonnull(su)):
+            with txl.then_():
+                txl.assign(n, self.ld(su, bidb))
+            with txl.else_():
+                with txl.if_(self.nonnull(cu)):
+                    with txl.then_():
+                        txl.assign(n, self.ld(cu, bidb + 1) - self.ld(cu, bidb))
+                    with txl.else_():
+                        txl.assign(n, static)
+        return n
+
+    def batch(self, bidb, cu):
+        """The batch coordinate of a tensor whose side is varlen: ``is_varlen ? 0 : bidb``."""
+        return txl.local_scalar("int32", init=txl.if_then_else(self.nonnull(cu), txl.int32(0), bidb))
+
+
 # =====================================================================================
 # Kernel 1: FlashAttnBwdPreprocess (flash_bwd_preprocess_kernel.h:143-245)
 # =====================================================================================
 
 
-def build_preprocess(head_dim, block_m, *, backend_config=None):
+def build_preprocess(head_dim, block_m, *, varlen=False, backend_config=None):
+    """FlashAttnBwdPreprocess<TileShape_MK, bf16, float, Sm90, Clear_dQaccum = true, Varlen>."""
     assert head_dim == HEAD_DIM
     BM = block_m
     ROWS = BM // 16  # GmemTiledCopy (16 x 16) x 8: rows per thread
+    # One annotation object per parameter: a shared one would tie the parameters' extents together.
+    T_F32, T_BF16, T_I32 = ("tensor", "float32"), ("tensor", "bfloat16"), ("tensor", "int32")
+    abi = [("o", T_BF16), ("do", T_BF16), ("lse", T_F32), ("dpsum", T_F32), ("lse_log2", T_F32),
+           ("dq_accum", T_F32), ("dq_semaphore", T_I32), ("s_q", "int32"), ("d", "int32"), ("h", "int32"),
+           ("b", "int32")]
+    if varlen:  # cu_seqlens, seqused, grid rows (max_seqlen_q), shape_dPsum[0] (mha_bwd's padded total)
+        abi += [("cu_seqlens", T_I32), ("seqused", T_I32), ("max_seqlen", "int32"), ("s_q_rounded_in", "int32")]
+    names = [n for n, _ in abi]
 
-    @txl.kernel()
-    def flash_bwd_preprocess(
-        o: txl.Tensor((txl.int64(),), "bfloat16"),
-        do: txl.Tensor((txl.int64(),), "bfloat16"),
-        lse: txl.Tensor((txl.int64(),), "float32"),
-        dpsum: txl.Tensor((txl.int64(),), "float32"),
-        lse_log2: txl.Tensor((txl.int64(),), "float32"),
-        dq_accum: txl.Tensor((txl.int64(),), "float32"),
-        dq_semaphore: txl.Tensor((txl.int64(),), "int32"),
-        s_q: "int32",
-        d: "int32",
-        h: "int32",
-        b: "int32",
-    ):
+    def _pre(*, o, do, lse, dpsum, lse_log2, dq_accum, dq_semaphore, s_q, d, h, b, cu_seqlens=None,
+             seqused=None, max_seqlen=None, s_q_rounded_in=None):
         txl.device_entry(
-            launch=txl.cuda.LaunchConfig(grid=((s_q + BM - 1) // BM, h, b), block=256),
+            launch=txl.cuda.LaunchConfig(grid=(((max_seqlen if varlen else s_q) + BM - 1) // BM, h, b),
+                                         block=256),
             # __launch_bounds__(256, 2)
             kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=2),
             backend_config=backend_config,
@@ -123,97 +183,127 @@ def build_preprocess(head_dim, block_m, *, backend_config=None):
         bidh = txl.cuda.block_idx("y")
         bidb = txl.cuda.block_idx("z")
         t = txl.thread_id()
-        rows_left = txl.local_scalar("int32", init=s_q - m_block * BM)  # seqlen_o - m_block*kBlockM
-        s_q_rounded = (s_q + BM - 1) // BM * BM
 
-        # lse = thread_idx < seqlen_o - m_block*kBlockM && thread_idx < kBlockM ? gLSE(t) : INFINITY
-        lse_v = txl.local_scalar("float32", init=txl.float32(float("inf")))
-        with txl.if_(txl.And(t < rows_left, t < BM)), txl.then_():
-            txl.ptx.ld.global_.f32(
-                lse_v, lse.ptr_to([_i64(bidb * h + bidh) * _i64(s_q) + _i64(m_block * BM + t)])
-            )
+        def body(seqlen_o, off, off_p, bb, s_q_rounded, seqlen_rounded):
+            """off / off_p: the SeqlenInfo offsets (None for fixed length); bb: the batch coordinate of
+            O, dO, LSE and the workspaces (0 when varlen); seqlen_rounded: round_up(seqlen_o, kBlockM)."""
+            rows_left = txl.local_scalar("int32", init=seqlen_o - m_block * BM)  # seqlen_o - m_block*kBlockM
+            # gdPsum / gLSElog2: domain_offset(offset_padded) of the (s_q_rounded, h, b) workspaces
+            stat = _i64(bb * h + bidh) * _i64(s_q_rounded)
+            if off_p is not None:
+                stat = stat + _i64(off_p)
 
-        row0 = t // 16
-        col8 = (t % 16) * 8
-        pcol = col8 < d  # tOpO(0): the one K iteration (128 = 16 x 8)
-        # O / dO rows: (b, s, h, d) contiguous; row stride h*d, head stride d, batch stride s*h*d.
-        row_base = _i64(bidb) * _i64(s_q) + _i64(m_block * BM)
+            # lse = thread_idx < seqlen_o - m_block*kBlockM && thread_idx < kBlockM ? gLSE(t) : INFINITY
+            lse_v = txl.local_scalar("float32", init=txl.float32(float("inf")))
+            with txl.if_(txl.And(t < rows_left, t < BM)), txl.then_():
+                txl.ptx.ld.global_.f32(
+                    lse_v, lse.ptr_to([_i64(bb * h + bidh) * _i64(s_q) + _i64(_add(off, m_block * BM + t))])
+                )
 
-        def gaddr(t_, r):
-            idx = ((row_base + _i64(r)) * _i64(h) + _i64(bidh)) * _i64(d) + _i64(col8)
-            return t_.view("uint32").ptr_to([idx // 2])
+            row0 = t // 16
+            col8 = (t % 16) * 8
+            pcol = col8 < d  # tOpO(0): the one K iteration (128 = 16 x 8)
+            # O / dO rows: (b, s, h, d) contiguous; row stride h*d, head stride d, batch stride s*h*d.
+            row_base = _i64(bb) * _i64(s_q) + _i64(_add(off, m_block * BM))
 
-        rO = txl.alloc_local((4 * ROWS,), "uint32")
-        rdO = txl.alloc_local((4 * ROWS,), "uint32")
+            def gaddr(t_, r):
+                idx = ((row_base + _i64(r)) * _i64(h) + _i64(bidh)) * _i64(d) + _i64(col8)
+                return t_.view("uint32").ptr_to([idx // 2])
 
-        def load_rows(dst, src):
-            # flash::copy<Is_even_MN=false, Is_even_K=false, Clear_OOB_MN, Clear_OOB_K>: zero, then
-            # the 128-bit load under (row < max_MN) && pred(k).
+            rO = txl.alloc_local((4 * ROWS,), "uint32")
+            rdO = txl.alloc_local((4 * ROWS,), "uint32")
+
+            def load_rows(dst, src):
+                # flash::copy<Is_even_MN=false, Is_even_K=false, Clear_OOB_MN, Clear_OOB_K>: zero, then
+                # the 128-bit load under (row < max_MN) && pred(k).
+                for i in range(ROWS):
+                    for j in range(4):
+                        txl.assign(dst[4 * i + j], txl.uint32(0))
+                    with txl.if_(txl.And(row0 + 16 * i < rows_left, pcol)), txl.then_():
+                        txl.ptx.ld.global_.v4.u32(
+                            dst[4 * i], dst[4 * i + 1], dst[4 * i + 2], dst[4 * i + 3], gaddr(src, row0 + 16 * i)
+                        )
+
+            load_rows(rO, o)
+            load_rows(rdO, do)
+
+            def bf16_lo(w):
+                return txl.reinterpret(w << txl.uint32(16), ty="float32")
+
+            def bf16_hi(w):
+                return txl.reinterpret(w & txl.uint32(0xFFFF0000), ty="float32")
+
             for i in range(ROWS):
-                for j in range(4):
-                    txl.assign(dst[4 * i + j], txl.uint32(0))
-                with txl.if_(txl.And(row0 + 16 * i < rows_left, pcol)), txl.then_():
-                    txl.ptx.ld.global_.v4.u32(
-                        dst[4 * i], dst[4 * i + 1], dst[4 * i + 2], dst[4 * i + 3], gaddr(src, row0 + 16 * i)
+                acc = txl.local_scalar("float32")
+                for e in range(8):
+                    w = 4 * i + e // 2
+                    ov = bf16_lo(rO[w]) if e % 2 == 0 else bf16_hi(rO[w])
+                    gv = bf16_lo(rdO[w]) if e % 2 == 0 else bf16_hi(rdO[w])
+                    if e == 0:
+                        txl.ptx["mul.ftz.f32"](acc, gv, ov)
+                    else:
+                        txl.ptx["fma.rn.ftz.f32"](acc, gv, ov, acc)
+                # Allreduce<16> with SumOp: butterfly 8, 4, 2, 1.
+                for off in (8, 4, 2, 1):
+                    peer = txl.local_scalar("float32")
+                    txl.ptx.shfl_sync.bfly.b32(
+                        peer, acc, txl.uint32(off), txl.uint32(0x1F), txl.uint32(0xFFFFFFFF)
+                    )
+                    txl.ptx["add.ftz.f32"](acc, acc, peer)
+                r = row0 + 16 * i
+                with txl.if_(col8 == 0), txl.then_():
+                    val = txl.if_then_else(r < rows_left, acc, txl.float32(0.0))
+                    txl.ptx.st.global_.f32(
+                        dpsum.ptr_to([stat + _i64(m_block * BM + r)]),
+                        val,
                     )
 
-        load_rows(rO, o)
-        load_rows(rdO, do)
-
-        def bf16_lo(w):
-            return txl.reinterpret(w << txl.uint32(16), ty="float32")
-
-        def bf16_hi(w):
-            return txl.reinterpret(w & txl.uint32(0xFFFF0000), ty="float32")
-
-        for i in range(ROWS):
-            acc = txl.local_scalar("float32")
-            for e in range(8):
-                w = 4 * i + e // 2
-                ov = bf16_lo(rO[w]) if e % 2 == 0 else bf16_hi(rO[w])
-                gv = bf16_lo(rdO[w]) if e % 2 == 0 else bf16_hi(rdO[w])
-                if e == 0:
-                    txl.ptx["mul.ftz.f32"](acc, gv, ov)
-                else:
-                    txl.ptx["fma.rn.ftz.f32"](acc, gv, ov, acc)
-            # Allreduce<16> with SumOp: butterfly 8, 4, 2, 1.
-            for off in (8, 4, 2, 1):
-                peer = txl.local_scalar("float32")
-                txl.ptx.shfl_sync.bfly.b32(
-                    peer, acc, txl.uint32(off), txl.uint32(0x1F), txl.uint32(0xFFFFFFFF)
-                )
-                txl.ptx["add.ftz.f32"](acc, acc, peer)
-            r = row0 + 16 * i
-            with txl.if_(col8 == 0), txl.then_():
-                val = txl.if_then_else(r < rows_left, acc, txl.float32(0.0))
+            with txl.if_(txl.And(t < seqlen_rounded - m_block * BM, t < BM)), txl.then_():
+                scaled = txl.local_scalar("float32")
+                txl.ptx["mul.ftz.f32"](scaled, lse_v, txl.float32(LOG2E_F32))
                 txl.ptx.st.global_.f32(
-                    dpsum.ptr_to([_i64(bidb * h + bidh) * _i64(s_q_rounded) + _i64(m_block * BM + r)]),
-                    val,
+                    lse_log2.ptr_to([stat + _i64(m_block * BM + t)]),
+                    txl.if_then_else(lse_v == txl.float32(-float("inf")), txl.float32(0.0), scaled),
                 )
 
-        with txl.if_(txl.And(t < s_q_rounded - m_block * BM, t < BM)), txl.then_():
-            scaled = txl.local_scalar("float32")
-            txl.ptx["mul.ftz.f32"](scaled, lse_v, txl.float32(LOG2E_F32))
-            txl.ptx.st.global_.f32(
-                lse_log2.ptr_to([_i64(bidb * h + bidh) * _i64(s_q_rounded) + _i64(m_block * BM + t)]),
-                txl.if_then_else(lse_v == txl.float32(-float("inf")), txl.float32(0.0), scaled),
-            )
+            # Clear_dQaccum: GmemTiledCopyAccum 256 threads x 4 floats.
+            acc_base = (_i64(bb * h + bidh) * _i64(s_q_rounded * HEAD_DIM) if off_p is None else
+                        (_i64(bb * h + bidh) * _i64(s_q_rounded) + _i64(off_p)) * _i64(HEAD_DIM)) + _i64(m_block * BM * HEAD_DIM)
+            for i in range(BM * HEAD_DIM // 1024):
+                txl.ptx.st.global_.v4.u32(
+                    dq_accum.view("uint32").ptr_to([acc_base + _i64(t * 4 + 1024 * i)]),
+                    txl.uint32(0), txl.uint32(0), txl.uint32(0), txl.uint32(0),
+                )
 
-        # Clear_dQaccum: GmemTiledCopyAccum 256 threads x 4 floats.
-        acc_base = _i64(bidb * h + bidh) * _i64(s_q_rounded * HEAD_DIM) + _i64(m_block * BM * HEAD_DIM)
-        for i in range(BM * HEAD_DIM // 1024):
-            txl.ptx.st.global_.v4.u32(
-                dq_accum.view("uint32").ptr_to([acc_base + _i64(t * 4 + 1024 * i)]),
-                txl.uint32(0), txl.uint32(0), txl.uint32(0), txl.uint32(0),
-            )
+            # params.dq_semaphore != nullptr && thread_idx == 0 (mha_bwd always passes one).
+            sem_ptr = txl.reinterpret(dq_semaphore.data, ty="uint64")
+            with txl.if_(txl.And(sem_ptr != txl.uint64(0), t == 0)), txl.then_():
+                txl.ptx.st.global_.u32(
+                    dq_semaphore.view("uint32").ptr_to([bidh + bidb * h + m_block * h * b]), txl.uint32(0)
+                )
 
-        # params.dq_semaphore != nullptr && thread_idx == 0 (mha_bwd always passes one).
-        sem_ptr = txl.reinterpret(dq_semaphore.data, ty="uint64")
-        with txl.if_(txl.And(sem_ptr != txl.uint64(0), t == 0)), txl.then_():
-            txl.ptx.st.global_.u32(
-                dq_semaphore.view("uint32").ptr_to([bidh + bidb * h + m_block * h * b]), txl.uint32(0)
-            )
 
+        if not varlen:
+            s_q_rounded = (s_q + BM - 1) // BM * BM
+            body(s_q, None, None, bidb, s_q_rounded, s_q_rounded)
+        else:
+            # SeqlenInfo<Varlen, kBlockM>(bidb, shape_O[0], cu_seqlens, seqused) (:153-156)
+            V = _Varlen(cu_seqlens, None, seqused, None)
+            off = V.offset(bidb, cu_seqlens)
+            off_p = V.offset(bidb, cu_seqlens, BM)
+            seqlen_o = V.seqlen(bidb, cu_seqlens, seqused, s_q)
+            # if (is_varlen && m_block * kBlockM >= seqlen_o) return;
+            with txl.if_(txl.Not(txl.And(V.nonnull(cu_seqlens), m_block * BM >= seqlen_o))), txl.then_():
+                bb = V.batch(bidb, cu_seqlens)
+                body(seqlen_o, off, off_p, bb, s_q_rounded_in, (seqlen_o + BM - 1) // BM * BM)
+
+    def flash_bwd_preprocess(*args):
+        _pre(**dict(zip(names, args)))
+
+    flash_bwd_preprocess.__signature__ = inspect.Signature(
+        [inspect.Parameter(n, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=_annot(a)) for n, a in abi]
+    )
+    flash_bwd_preprocess = txl.kernel()(flash_bwd_preprocess)
     return flash_bwd_preprocess.func
 
 
@@ -222,7 +312,7 @@ def build_preprocess(head_dim, block_m, *, backend_config=None):
 # =====================================================================================
 
 
-def build_postprocess(head_dim, is_causal, *, dkv=False, backend_config=None):
+def build_postprocess(head_dim, is_causal, *, dkv=False, varlen=False, backend_config=None):
     """The dQ convert (TileShape (kBlockM, d), TiledMmadQ), or with ``dkv`` the dK / dV convert of the
     GQA build (TileShape (kBlockN, d) = (128, 128), TiledMmadKV, dKV_swapAB false: run_flash_bwd's
     PostprocessKerneldKV, softmax_scale 1)."""
@@ -236,18 +326,19 @@ def build_postprocess(head_dim, is_causal, *, dkv=False, backend_config=None):
     OFF_BAR = SMEM_ACC + SMEM_DQ
     SMEM_BYTES = OFF_BAR + 128  # sizeof(SharedStorage): 49280 / 61568 / 98432 (dK, dV)
 
-    @txl.kernel()
-    def flash_bwd_convert_dq(
-        dq_accum: txl.Tensor((txl.int64(),), "float32"),
-        dq: txl.Tensor((txl.int64(),), "bfloat16"),
-        s_q: "int32",
-        d: "int32",
-        h: "int32",
-        b: "int32",
-        softmax_scale: "float32",
-    ):
+    # One annotation object per parameter: a shared one would tie the parameters' extents together.
+    T_F32, T_BF16, T_I32 = ("tensor", "float32"), ("tensor", "bfloat16"), ("tensor", "int32")
+    abi = [("dq_accum", T_F32), ("dq", T_BF16), ("s_q", "int32"), ("d", "int32"), ("h", "int32"), ("b", "int32"),
+           ("softmax_scale", "float32")]
+    if varlen:  # cu_seqlens, seqused, grid rows (max_seqlen), shape_dQaccum[0] / d (the padded total)
+        abi += [("cu_seqlens", T_I32), ("seqused", T_I32), ("max_seqlen", "int32"), ("s_q_rounded_in", "int32")]
+    names = [n for n, _ in abi]
+
+    def _post(*, dq_accum, dq, s_q, d, h, b, softmax_scale, cu_seqlens=None, seqused=None, max_seqlen=None,
+              s_q_rounded_in=None):
+        """s_q / h: shape_dQ[0] (seqlen, or the total when varlen) and the heads of this convert."""
         txl.device_entry(
-            launch=txl.cuda.LaunchConfig(grid=((s_q + BM - 1) // BM, h, b), block=256),
+            launch=txl.cuda.LaunchConfig(grid=(((max_seqlen if varlen else s_q) + BM - 1) // BM, h, b), block=256),
             kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=2),
             backend_config=backend_config,
         )
@@ -261,92 +352,117 @@ def build_postprocess(head_dim, is_causal, *, dkv=False, backend_config=None):
         bidh = txl.cuda.block_idx("y")
         bidb = txl.cuda.block_idx("z")
         t = txl.thread_id()
-        s_q_rounded = (s_q + BM - 1) // BM * BM
         bar = pool_u64.ptr_to([OFF_BAR // 8])
 
-        acc_base = _i64(bidb * h + bidh) * _i64(s_q_rounded * HEAD_DIM) + _i64(m_block * BM * HEAD_DIM)
-        with txl.if_(t == 0), txl.then_():
-            txl.ptx["mbarrier.init.shared::cta.b64"](bar, txl.uint32(1))
-            txl.ptx["mbarrier.arrive.expect_tx.shared::cta.b64"](bar, txl.uint32(SMEM_ACC))
-            txl.ptx[_BULK_G2S](
-                pool_f32.ptr_to([0]), dq_accum.ptr_to([acc_base]), txl.uint32(SMEM_ACC), bar
-            )
-        txl.cuda.cta_sync()
-        txl.cuda.mbarrier_wait_parity(bar, txl.uint32(0), txl.uint32(TRY_WAIT_TICKS))
+        def body(seqlen, off, off_p, bb, s_q_rounded):
 
-        w = t // 128
-        tt = t % 128
-        racc = txl.alloc_local((NREG,), "float32")
-        for i in range(NREG // 4):
-            txl.ptx.ld.shared.v4.f32(
-                racc[4 * i], racc[4 * i + 1], racc[4 * i + 2], racc[4 * i + 3],
-                pool_f32.ptr_to([w * (BM * 64) + (i * 128 + tt) * 4]),
-            )
-        for i in range(NREG):
-            txl.ptx["mul.ftz.f32"](racc[i], racc[i], softmax_scale)
-        r16 = txl.alloc_local((NREG // 2,), "uint32")
-        for wd in range(NREG // 2):
-            txl.ptx["cvt.rn.bf16x2.f32"](r16[wd], racc[2 * wd + 1], racc[2 * wd])
+            if off_p is None:
+                acc_base = _i64(bb * h + bidh) * _i64(s_q_rounded * HEAD_DIM) + _i64(m_block * BM * HEAD_DIM)
+            else:  # domain_offset(offset_padded * kHeadDim) of mdQaccum(_, bidh, bb)
+                acc_base = ((_i64(bb * h + bidh) * _i64(s_q_rounded) + _i64(off_p)) * _i64(HEAD_DIM)
+                            + _i64(m_block * BM * HEAD_DIM))
+            with txl.if_(t == 0), txl.then_():
+                txl.ptx["mbarrier.init.shared::cta.b64"](bar, txl.uint32(1))
+                txl.ptx["mbarrier.arrive.expect_tx.shared::cta.b64"](bar, txl.uint32(SMEM_ACC))
+                txl.ptx[_BULK_G2S](
+                    pool_f32.ptr_to([0]), dq_accum.ptr_to([acc_base]), txl.uint32(SMEM_ACC), bar
+                )
+            txl.cuda.cta_sync()
+            txl.cuda.mbarrier_wait_parity(bar, txl.uint32(0), txl.uint32(TRY_WAIT_TICKS))
 
-        warp = tt // 32
-        lane = t % 32
-        k_ = lane % 8  # stmatrix: lanes 8j..8j+7 give the 8 row addresses of matrix j
-        jm = lane // 8
-        i_j = jm % 2  # matrix j of instruction p covers (c = 2p + j // 2, row half i = j % 2)
+            w = t // 128
+            tt = t % 128
+            racc = txl.alloc_local((NREG,), "float32")
+            for i in range(NREG // 4):
+                txl.ptx.ld.shared.v4.f32(
+                    racc[4 * i], racc[4 * i + 1], racc[4 * i + 2], racc[4 * i + 3],
+                    pool_f32.ptr_to([w * (BM * 64) + (i * 128 + tt) * 4]),
+                )
+            for i in range(NREG):
+                txl.ptx["mul.ftz.f32"](racc[i], racc[i], softmax_scale)
+            r16 = txl.alloc_local((NREG // 2,), "uint32")
+            for wd in range(NREG // 2):
+                txl.ptx["cvt.rn.bf16x2.f32"](r16[wd], racc[2 * wd + 1], racc[2 * wd])
 
-        def sdq_byte(m, col):
-            """Byte of element (row m, column col) of sdQ (col a multiple of 8)."""
-            if swz333:  # Swizzle<3,3,3> o ((8,8),(64,2)):((64,512),(1,4096)) (dQ; dK, dV: (8,16) rows)
-                return SMEM_ACC + (col // 64) * (BM * 128) + m * 128 + ((((col % 64) // 8) ^ (m % 8)) * 16)
-            # Swizzle<1,3,3> o ((8,10),(16,8)):((16,128),(1,1280))
-            return (
-                SMEM_ACC + (col // 16) * 2560 + (m // 8) * 256 + (m % 8) * 32
-                + ((((col % 16) // 8) ^ ((m % 8) // 4)) % 2) * 16
-            )
+            warp = tt // 32
+            lane = t % 32
+            k_ = lane % 8  # stmatrix: lanes 8j..8j+7 give the 8 row addresses of matrix j
+            jm = lane // 8
+            i_j = jm % 2  # matrix j of instruction p covers (c = 2p + j // 2, row half i = j % 2)
 
-        for p in range(NREG // 8):
-            c_j = 2 * p + jm // 2
-            if dkv:
-                # dK / dV fragment (KV rows 64w + 16*warp + 8i + .., d cols 8c + ..): STSM_N.
-                m = w * 64 + warp * 16 + i_j * 8 + k_
-                col = c_j * 8
-                txl.ptx[_STSM](pool.ptr_to([sdq_byte(m, col) // 2]), *[r16[4 * p + j] for j in range(4)])
-            elif is_causal:
-                # dQ fragment (q rows 16*warp + 8i + .., d cols 64w + 8c + ..): STSM_N.
-                m = warp * 16 + i_j * 8 + k_
-                col = w * 64 + c_j * 8
-                txl.ptx[_STSM](pool.ptr_to([sdq_byte(m, col) // 2]), *[r16[4 * p + j] for j in range(4)])
-            else:
-                # dQ^T fragment (d rows 64w + 16*warp + 8i + .., q cols 8c + ..): STSM_T into (q, d).
-                m = c_j * 8 + k_
-                col = w * 64 + warp * 16 + i_j * 8
-                txl.ptx[_STSM_T](pool.ptr_to([sdq_byte(m, col) // 2]), *[r16[4 * p + j] for j in range(4)])
-        txl.cuda.cta_sync()
-
-        col8 = (t % 16) * 8
-        pcol = col8 < d
-        rows = BM // 16
-        v = txl.alloc_local((4 * rows,), "uint32")
-        pool_u32 = pool.view("uint32")
-        for i in range(rows):  # flash::copy smem -> regs (EvenM, Is_even_K): no predicate
-            m = t // 16 + 16 * i
-            txl.ptx.ld.shared.v4.u32(
-                v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3], pool_u32.ptr_to([sdq_byte(m, col8) // 4])
-            )
-        limit = txl.min(s_q - m_block * BM, BM)
-        for i in range(rows):
-            m = t // 16 + 16 * i
-            with txl.if_(txl.And(m < limit, pcol)), txl.then_():
-                idx = ((_i64(bidb) * _i64(s_q) + _i64(m_block * BM + m)) * _i64(h) + _i64(bidh)) * _i64(d) + _i64(col8)
-                txl.ptx.st.global_.v4.u32(
-                    dq.view("uint32").ptr_to([idx // 2]), v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]
+            def sdq_byte(m, col):
+                """Byte of element (row m, column col) of sdQ (col a multiple of 8)."""
+                if swz333:  # Swizzle<3,3,3> o ((8,8),(64,2)):((64,512),(1,4096)) (dQ; dK, dV: (8,16) rows)
+                    return SMEM_ACC + (col // 64) * (BM * 128) + m * 128 + ((((col % 64) // 8) ^ (m % 8)) * 16)
+                # Swizzle<1,3,3> o ((8,10),(16,8)):((16,128),(1,1280))
+                return (
+                    SMEM_ACC + (col // 16) * 2560 + (m // 8) * 256 + (m % 8) * 32
+                    + ((((col % 16) // 8) ^ ((m % 8) // 4)) % 2) * 16
                 )
 
+            for p in range(NREG // 8):
+                c_j = 2 * p + jm // 2
+                if dkv:
+                    # dK / dV fragment (KV rows 64w + 16*warp + 8i + .., d cols 8c + ..): STSM_N.
+                    m = w * 64 + warp * 16 + i_j * 8 + k_
+                    col = c_j * 8
+                    txl.ptx[_STSM](pool.ptr_to([sdq_byte(m, col) // 2]), *[r16[4 * p + j] for j in range(4)])
+                elif is_causal:
+                    # dQ fragment (q rows 16*warp + 8i + .., d cols 64w + 8c + ..): STSM_N.
+                    m = warp * 16 + i_j * 8 + k_
+                    col = w * 64 + c_j * 8
+                    txl.ptx[_STSM](pool.ptr_to([sdq_byte(m, col) // 2]), *[r16[4 * p + j] for j in range(4)])
+                else:
+                    # dQ^T fragment (d rows 64w + 16*warp + 8i + .., q cols 8c + ..): STSM_T into (q, d).
+                    m = c_j * 8 + k_
+                    col = w * 64 + warp * 16 + i_j * 8
+                    txl.ptx[_STSM_T](pool.ptr_to([sdq_byte(m, col) // 2]), *[r16[4 * p + j] for j in range(4)])
+            txl.cuda.cta_sync()
+
+            col8 = (t % 16) * 8
+            pcol = col8 < d
+            rows = BM // 16
+            v = txl.alloc_local((4 * rows,), "uint32")
+            pool_u32 = pool.view("uint32")
+            for i in range(rows):  # flash::copy smem -> regs (EvenM, Is_even_K): no predicate
+                m = t // 16 + 16 * i
+                txl.ptx.ld.shared.v4.u32(
+                    v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3], pool_u32.ptr_to([sdq_byte(m, col8) // 4])
+                )
+            limit = txl.min(seqlen - m_block * BM, BM)
+            for i in range(rows):
+                m = t // 16 + 16 * i
+                with txl.if_(txl.And(m < limit, pcol)), txl.then_():
+                    idx = ((_i64(bb) * _i64(s_q) + _i64(_add(off, m_block * BM + m))) * _i64(h) + _i64(bidh)) * _i64(d) + _i64(col8)
+                    txl.ptx.st.global_.v4.u32(
+                        dq.view("uint32").ptr_to([idx // 2]), v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]
+                    )
+
+
+        if not varlen:
+            body(s_q, None, None, bidb, (s_q + BM - 1) // BM * BM)
+        else:
+            # SeqlenInfo<true, kBlockM>(bidb, shape_dQ[0], cu_seqlens, seqused) (:170-172)
+            V = _Varlen(cu_seqlens, None, seqused, None)
+            off = V.offset(bidb, cu_seqlens)
+            off_p = V.offset(bidb, cu_seqlens, BM)
+            seqlen = V.seqlen(bidb, cu_seqlens, seqused, s_q)
+            # if (is_varlen && m_block * kBlockM >= seqlen) return;
+            with txl.if_(txl.Not(txl.And(V.nonnull(cu_seqlens), m_block * BM >= seqlen))), txl.then_():
+                body(seqlen, off, off_p, V.batch(bidb, cu_seqlens), s_q_rounded_in)
+
+    def flash_bwd_convert_dq(*args):
+        _post(**dict(zip(names, args)))
+
+    flash_bwd_convert_dq.__signature__ = inspect.Signature(
+        [inspect.Parameter(n, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=_annot(a)) for n, a in abi]
+    )
+    flash_bwd_convert_dq = txl.kernel()(flash_bwd_convert_dq)
     return flash_bwd_convert_dq.func
 
 
-def build_postprocess_dkv(head_dim, *, backend_config=None):
-    return build_postprocess(head_dim, True, dkv=True, backend_config=backend_config)
+def build_postprocess_dkv(head_dim, *, varlen=False, backend_config=None):
+    return build_postprocess(head_dim, True, dkv=True, varlen=varlen, backend_config=backend_config)
 
 
 # =====================================================================================
@@ -354,7 +470,7 @@ def build_postprocess_dkv(head_dim, *, backend_config=None):
 # =====================================================================================
 
 
-def build_main_kernel(head_dim, is_causal, *, gqa=False, backend_config=None):
+def build_main_kernel(head_dim, is_causal, *, gqa=False, varlen=False, backend_config=None):
     assert head_dim == HEAD_DIM
     BM = _block_m(is_causal)
     NC = BM // 8  # 8-column groups of the S^T / dP^T fragment
@@ -384,10 +500,15 @@ def build_main_kernel(head_dim, is_causal, *, gqa=False, backend_config=None):
     def b_empty_do(s):
         return OFF["bars"] + 64 + 8 * s
 
-    def _body(lse_log2, dpsum, dq_accum, dk, dv, dk_accum, dv_accum, s_q, s_k, d, h, h_k, b, window_size_right, softmax_scale, scale_log2, lpt_total, blk_div, blk_mul, blk_shr, head_div, head_mul, head_shr, l2min_div, l2min_mul, l2min_shr, l2maj_div, l2maj_mul, l2maj_shr, l2res_div, l2res_mul, l2res_shr, num_hb_quotient, qhkh_div, qhkh_mul, qhkh_shr, tma_q, tma_do, tma_k, tma_v, tma_dk, tma_dv):
-        """FlashAttnBwdSm90::operator(); the GQA build passes dk / dv / tma_dk / tma_dv = None and the MHA
-        build dk_accum / dv_accum / h_k = None."""
-        n_blocks = (s_k + BLOCK_N - 1) // BLOCK_N
+    def _body(*, lse_log2, dpsum, dq_accum, s_q, s_k, d, h, b, window_size_right, softmax_scale, scale_log2,
+              lpt_total, blk_div, blk_mul, blk_shr, head_div, head_mul, head_shr, l2min_div, l2min_mul,
+              l2min_shr, l2maj_div, l2maj_mul, l2maj_shr, l2res_div, l2res_mul, l2res_shr, num_hb_quotient,
+              qhkh_div, qhkh_mul, qhkh_shr, tma_q, tma_do, tma_k, tma_v, dk=None, dv=None, dk_accum=None,
+              dv_accum=None, h_k=None, tma_dk=None, tma_dv=None, cu_seqlens_q=None, cu_seqlens_k=None,
+              seqused_q=None, seqused_k=None, max_seqlen_k=None, s_q_rounded_in=None, s_k_rounded_in=None):
+        """FlashAttnBwdSm90::operator(). Absent per build: GQA dk / dv / tma_dk / tma_dv; MHA dk_accum /
+        dv_accum / h_k; varlen MHA tma_dk / tma_dv; fixed-length builds every varlen input."""
+        n_blocks = ((max_seqlen_k if varlen else s_k) + BLOCK_N - 1) // BLOCK_N
         grid = (lpt_total,) if is_causal else (n_blocks, h, b)
         txl.device_entry(
             launch=txl.cuda.LaunchConfig(grid=grid, block=NUM_THREADS),
@@ -427,8 +548,9 @@ def build_main_kernel(head_dim, is_causal, *, gqa=False, backend_config=None):
             warp, _u32(thread_idx) // txl.uint32(32), txl.uint32(0), txl.uint32(31), txl.uint32(0xFFFFFFFF)
         )
         with txl.if_(txl.And(warp == txl.uint32(0), lane_pred == txl.uint32(1))), txl.then_():
-            # The GQA epilogue prefetches nothing (CollectiveEpilogueBwdGQA::prefetch_tma_descriptors).
-            for m in (tma_q, tma_do, tma_k, tma_v) + (() if gqa else (tma_dk, tma_dv)):
+            # The GQA epilogue, and the MHA one without TMA (varlen), prefetch nothing
+            # (CollectiveEpilogueBwd{,GQA}::prefetch_tma_descriptors).
+            for m in (tma_q, tma_do, tma_k, tma_v) + (() if (gqa or varlen) else (tma_dk, tma_dv)):
                 txl.ptx.prefetch.tensormap(txl.address_of(m))
         wg = txl.local_scalar("uint32")
         txl.ptx.shfl_sync.idx.b32(
@@ -482,17 +604,46 @@ def build_main_kernel(head_dim, is_causal, *, gqa=False, backend_config=None):
                 return nb, hh, bb
             return txl.cuda.block_idx("x"), txl.cuda.block_idx("y"), txl.cuda.block_idx("z")
 
-        m_max_c = (s_q + BM - 1) // BM
+        # ---------------- varlen: SeqlenInfo / SeqlenInfoQK (seqlen.h) and tile validity --------------
+        V = _Varlen(cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k) if varlen else None
 
-        def m_min_of(n_block):
+        def tile_valid(n_block, bidb):
+            """get_initial_work's Varlen test (tile_scheduler.hpp:104-117 / :455-466), or None."""
+            if not varlen:
+                return None
+            n = V.seqlen(bidb, cu_seqlens_k, seqused_k, max_seqlen_k)
+            if is_causal:  # SingleTileBwdLPTScheduler: block < ceil_div(seqlen, kBlock)
+                return n_block < (n + BLOCK_N - 1) // BLOCK_N
+            return n_block * BLOCK_N < n  # SingleTileScheduler: block_idx * kBlock < seqlen
+
+        def seqinfo(bidb):
+            """SeqlenInfoQK<Varlen, kBlockM>(bidb, shape_Q[0], shape_K[0], cu_seqlens_q, cu_seqlens_k,
+            seqused_q, seqused_k); the batch index of the Q-side / K-side tensors (0 when varlen)."""
+            if not varlen:
+                return dict(off_q=None, off_k=None, off_qp=None, sq=s_q, sk=s_k, bb_q=bidb, bb_k=bidb)
+            off_q = V.offset(bidb, cu_seqlens_q)
+            off_k = V.offset(bidb, cu_seqlens_k)
+            off_qp = V.offset(bidb, cu_seqlens_q, BM)
+            sq = V.seqlen(bidb, cu_seqlens_q, seqused_q, s_q)
+            sk = V.seqlen(bidb, cu_seqlens_k, seqused_k, s_k)
+            return dict(off_q=off_q, off_k=off_k, off_qp=off_qp, sq=sq, sk=sk,
+                        bb_q=V.batch(bidb, cu_seqlens_q), bb_k=V.batch(bidb, cu_seqlens_k))
+
+        def m_max_of(si):  # get_m_block_min_max (block.h:83-100)
+            return (si["sq"] + BM - 1) // BM
+
+        def m_min_of(n_block, si):
             if not is_causal:
                 return txl.int32(0)
-            return txl.max(0, txl.truncdiv(n_block * BLOCK_N + s_q - s_k - window_size_right, BM))
+            return txl.max(0, txl.truncdiv(n_block * BLOCK_N + si["sq"] - si["sk"] - window_size_right, BM))
 
-        s_q_rounded = (s_q + BM - 1) // BM * BM
+        # shape_LSE[0] / shape_dQaccum[0] / 128: seqlen_q_rounded, or mha_bwd's padded total (varlen)
+        s_q_rounded = s_q_rounded_in if varlen else (s_q + BM - 1) // BM * BM
 
-        def stat_base(bidb, bidh):  # (b, h, s_q_rounded) float index
-            return _i64(bidb * h + bidh) * _i64(s_q_rounded)
+        def stat_base(bidb, bidh, si):  # (b, h, s_q_rounded) float index of the (bidb, bidh) row block
+            if not varlen:
+                return _i64(bidb * h + bidh) * _i64(s_q_rounded)
+            return _i64(si["bb_q"] * h + bidh) * _i64(s_q_rounded) + _i64(si["off_qp"])
 
         def wait(bar_ptr, phase):
             txl.cuda.mbarrier_wait_parity(bar_ptr, _u32(phase), txl.uint32(TRY_WAIT_TICKS))
@@ -517,7 +668,8 @@ def build_main_kernel(head_dim, is_causal, *, gqa=False, backend_config=None):
                 with txl.if_(wiw == txl.uint32(0)):
                     with txl.then_():
                         _producer_load(locals_=dict(
-                            tile=tile, m_min_of=m_min_of, m_max_c=m_max_c, wait=wait, advance=advance,
+                            tile=tile, m_min_of=m_min_of, m_max_of=m_max_of, wait=wait, advance=advance,
+                            tile_valid=tile_valid, seqinfo=seqinfo, varlen=varlen,
                             bar=bar, bar_s=bar_s, b_full_q=b_full_q, b_empty_q=b_empty_q,
                             b_full_do=b_full_do, b_empty_do=b_empty_do, B_KV=B_KV, b16=b16, f32p=f32p,
                             OFF=OFF, Q_TILE=Q_TILE, HALF=HALF, TX_Q=TX_Q, LSE_STRIDE=LSE_STRIDE, BM=BM,
@@ -528,7 +680,8 @@ def build_main_kernel(head_dim, is_causal, *, gqa=False, backend_config=None):
                     with txl.else_():
                         with txl.if_(wiw == txl.uint32(1)), txl.then_():
                             _dq_store(locals_=dict(
-                                tile=tile, m_min_of=m_min_of, m_max_c=m_max_c, OFF=OFF, BM=BM, b16=b16,
+                                tile=tile, m_min_of=m_min_of, m_max_of=m_max_of, OFF=OFF, BM=BM, b16=b16,
+                                tile_valid=tile_valid, seqinfo=seqinfo, varlen=varlen,
                                 f32p=f32p, dq_accum=dq_accum, s_q_rounded=s_q_rounded, h=h,
                                 is_causal=is_causal,
                             ))
@@ -536,7 +689,8 @@ def build_main_kernel(head_dim, is_causal, *, gqa=False, backend_config=None):
             with txl.else_():
                 txl.ptx["setmaxnreg.inc.sync.aligned.u32"](txl.uint32(240))
                 _mma(locals_=dict(
-                    tile=tile, m_min_of=m_min_of, m_max_c=m_max_c, wait=wait, advance=advance, bar=bar,
+                    tile=tile, m_min_of=m_min_of, m_max_of=m_max_of, wait=wait, advance=advance, bar=bar,
+                    tile_valid=tile_valid, seqinfo=seqinfo, varlen=varlen, V=V, s_k_rounded_in=s_k_rounded_in,
                     bar_s=bar_s, b_full_q=b_full_q, b_empty_q=b_empty_q, b_full_do=b_full_do,
                     b_empty_do=b_empty_do, B_KV=B_KV, b16=b16, f32p=f32p, pool_base=pool_base, OFF=OFF,
                     Q_TILE=Q_TILE, HALF=HALF, LSE_STRIDE=LSE_STRIDE, BM=BM, NC=NC, KM=KM, NQ=NQ,
@@ -547,101 +701,34 @@ def build_main_kernel(head_dim, is_causal, *, gqa=False, backend_config=None):
                 ))
 
 
-    if not gqa:
+    # The host ABI of each build (MHA / GQA x fixed / varlen), in launch.py's argument order. The
+    # source's Params always carry every pointer; a build here declares the ones its code reads.
+    # One annotation object per parameter: a shared one would tie the parameters' extents together.
+    T_F32, T_BF16, T_I32 = ("tensor", "float32"), ("tensor", "bfloat16"), ("tensor", "int32")
+    T_MAP = ("tensormap",)
+    abi = [("lse_log2", T_F32), ("dpsum", T_F32), ("dq_accum", T_F32)]
+    abi += [("dk_accum", T_F32), ("dv_accum", T_F32)] if gqa else [("dk", T_BF16), ("dv", T_BF16)]
+    abi += [("s_q", "int32"), ("s_k", "int32"), ("d", "int32"), ("h", "int32")]
+    abi += [("h_k", "int32")] if gqa else []
+    abi += [("b", "int32"), ("window_size_right", "int32"), ("softmax_scale", "float32"),
+            ("scale_log2", "float32"), ("lpt_total", "int32")]
+    for name in ("blk", "head", "l2min", "l2maj", "l2res"):  # FastDivmod (divisor, multiplier, shift)
+        abi += [(f"{name}_div", "int32"), (f"{name}_mul", "uint32"), (f"{name}_shr", "uint32")]
+    abi += [("num_hb_quotient", "int32"), ("qhkh_div", "int32"), ("qhkh_mul", "uint32"), ("qhkh_shr", "uint32")]
+    if varlen:
+        abi += [("cu_seqlens_q", T_I32), ("cu_seqlens_k", T_I32), ("seqused_q", T_I32), ("seqused_k", T_I32),
+                ("max_seqlen_k", "int32"), ("s_q_rounded_in", "int32"), ("s_k_rounded_in", "int32")]
+    abi += [("tma_q", T_MAP), ("tma_do", T_MAP), ("tma_k", T_MAP), ("tma_v", T_MAP)]
+    abi += [] if (gqa or varlen) else [("tma_dk", T_MAP), ("tma_dv", T_MAP)]
+    names = [n for n, _ in abi]
 
-        @txl.kernel()
-        def flash_bwd_sm90(
-            lse_log2: txl.Tensor((txl.int64(),), "float32"),
-            dpsum: txl.Tensor((txl.int64(),), "float32"),
-            dq_accum: txl.Tensor((txl.int64(),), "float32"),
-            dk: txl.Tensor((txl.int64(),), "bfloat16"),
-            dv: txl.Tensor((txl.int64(),), "bfloat16"),
-            s_q: "int32",
-            s_k: "int32",
-            d: "int32",
-            h: "int32",
-            b: "int32",
-            window_size_right: "int32",
-            softmax_scale: "float32",
-            scale_log2: "float32",
-            lpt_total: "int32",
-            blk_div: "int32",
-            blk_mul: "uint32",
-            blk_shr: "uint32",
-            head_div: "int32",
-            head_mul: "uint32",
-            head_shr: "uint32",
-            l2min_div: "int32",
-            l2min_mul: "uint32",
-            l2min_shr: "uint32",
-            l2maj_div: "int32",
-            l2maj_mul: "uint32",
-            l2maj_shr: "uint32",
-            l2res_div: "int32",
-            l2res_mul: "uint32",
-            l2res_shr: "uint32",
-            num_hb_quotient: "int32",
-            qhkh_div: "int32",
-            qhkh_mul: "uint32",
-            qhkh_shr: "uint32",
-            tma_q: txl.Ptr(txl.TensorMap),
-            tma_do: txl.Ptr(txl.TensorMap),
-            tma_k: txl.Ptr(txl.TensorMap),
-            tma_v: txl.Ptr(txl.TensorMap),
-            tma_dk: txl.Ptr(txl.TensorMap),
-            tma_dv: txl.Ptr(txl.TensorMap),
-        ):
-            _body(lse_log2, dpsum, dq_accum, dk, dv, None, None, s_q, s_k, d, h, None, b, window_size_right,
-                  softmax_scale, scale_log2, lpt_total, blk_div, blk_mul, blk_shr, head_div, head_mul, head_shr, l2min_div, l2min_mul, l2min_shr, l2maj_div, l2maj_mul, l2maj_shr, l2res_div, l2res_mul, l2res_shr, num_hb_quotient,
-                  qhkh_div, qhkh_mul, qhkh_shr, tma_q, tma_do, tma_k, tma_v, tma_dk, tma_dv)
+    def flash_bwd_sm90(*args):
+        _body(**dict(zip(names, args)))
 
-    else:
-
-        @txl.kernel()
-        def flash_bwd_sm90(
-            lse_log2: txl.Tensor((txl.int64(),), "float32"),
-            dpsum: txl.Tensor((txl.int64(),), "float32"),
-            dq_accum: txl.Tensor((txl.int64(),), "float32"),
-            dk_accum: txl.Tensor((txl.int64(),), "float32"),
-            dv_accum: txl.Tensor((txl.int64(),), "float32"),
-            s_q: "int32",
-            s_k: "int32",
-            d: "int32",
-            h: "int32",
-            h_k: "int32",
-            b: "int32",
-            window_size_right: "int32",
-            softmax_scale: "float32",
-            scale_log2: "float32",
-            lpt_total: "int32",
-            blk_div: "int32",
-            blk_mul: "uint32",
-            blk_shr: "uint32",
-            head_div: "int32",
-            head_mul: "uint32",
-            head_shr: "uint32",
-            l2min_div: "int32",
-            l2min_mul: "uint32",
-            l2min_shr: "uint32",
-            l2maj_div: "int32",
-            l2maj_mul: "uint32",
-            l2maj_shr: "uint32",
-            l2res_div: "int32",
-            l2res_mul: "uint32",
-            l2res_shr: "uint32",
-            num_hb_quotient: "int32",
-            qhkh_div: "int32",
-            qhkh_mul: "uint32",
-            qhkh_shr: "uint32",
-            tma_q: txl.Ptr(txl.TensorMap),
-            tma_do: txl.Ptr(txl.TensorMap),
-            tma_k: txl.Ptr(txl.TensorMap),
-            tma_v: txl.Ptr(txl.TensorMap),
-        ):
-            _body(lse_log2, dpsum, dq_accum, None, None, dk_accum, dv_accum, s_q, s_k, d, h, h_k, b,
-                  window_size_right, softmax_scale, scale_log2, lpt_total, blk_div, blk_mul, blk_shr, head_div, head_mul, head_shr, l2min_div, l2min_mul, l2min_shr, l2maj_div, l2maj_mul, l2maj_shr, l2res_div, l2res_mul, l2res_shr, num_hb_quotient,
-                  qhkh_div, qhkh_mul, qhkh_shr, tma_q, tma_do, tma_k, tma_v, None, None)
-
+    flash_bwd_sm90.__signature__ = inspect.Signature(
+        [inspect.Parameter(n, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=_annot(a)) for n, a in abi]
+    )
+    flash_bwd_sm90 = txl.kernel()(flash_bwd_sm90)
     return flash_bwd_sm90.func
 
 
@@ -658,14 +745,15 @@ def _producer_load(locals_):
     stage = txl.local_scalar("int32", init=txl.int32(0))
     phase = txl.local_scalar("int32", init=txl.int32(1))  # make_producer_start_state
     n_block, bidh, bidb = L["tile"]()
-    m_min = txl.local_scalar("int32", init=L["m_min_of"](n_block))
-    m_max = L["m_max_c"]
+    valid = L["tile_valid"](n_block, bidb)
     leader = L["thread_idx"] % 128 == 0  # PipelineParams::is_leader
+    si = {}
+
     def load_q(m, stat_row):
         q_dst = OFF["q"] + stage * L["Q_TILE"]
         for half in range(2):
-            _tma_load(L["b16"](q_dst + half * L["HALF"]), L["tma_q"], 64 * half, m * BM, bidh, bidb,
-                      bar_s(L["b_full_q"], stage), EVICT_LAST)
+            _tma_load(L["b16"](q_dst + half * L["HALF"]), L["tma_q"], 64 * half, _add(si["off_q"], m * BM),
+                      bidh, si["bb_q"], bar_s(L["b_full_q"], stage), EVICT_LAST)
         txl.ptx[_BULK_G2S](
             L["f32p"](OFF["lse"] + stage * (L["LSE_STRIDE"] * 4)),
             L["lse_log2"].ptr_to([stat_row + _i64(m * BM)]),
@@ -676,8 +764,8 @@ def _producer_load(locals_):
     def load_do(m, stat_row):
         do_dst = OFF["do"] + stage * L["Q_TILE"]
         for half in range(2):
-            _tma_load(L["b16"](do_dst + half * L["HALF"]), L["tma_do"], 64 * half, m * BM, bidh, bidb,
-                      bar_s(L["b_full_do"], stage), EVICT_LAST)
+            _tma_load(L["b16"](do_dst + half * L["HALF"]), L["tma_do"], 64 * half, _add(si["off_q"], m * BM),
+                      bidh, si["bb_q"], bar_s(L["b_full_do"], stage), EVICT_LAST)
         txl.ptx[_BULK_G2S](
             L["f32p"](OFF["dpsum"] + stage * (L["LSE_STRIDE"] * 4)),
             L["dpsum"].ptr_to([stat_row + _i64(m * BM)]),
@@ -700,9 +788,9 @@ def _producer_load(locals_):
         # and made ptxas rematerialize threadIdx in the MMA loop). Both forms are spill-free. The
         # sensitivity is a codegen issue: sm90-probe ISSUE-022 (A).
         if L["is_causal"]:
-            stat_row = txl.local_scalar("int64", init=L["stat_base"](bidb, bidh))
+            stat_row = txl.local_scalar("int64", init=L["stat_base"](bidb, bidh, si))
         else:
-            stat_row = L["stat_base"](bidb, bidh)
+            stat_row = L["stat_base"](bidb, bidh, si)
         lane = txl.local_scalar("uint32")
         lane_e = txl.local_scalar("uint32")
         txl.ptx.elect_sync(lane_e, lane, txl.uint32(0xFFFFFFFF))
@@ -712,11 +800,11 @@ def _producer_load(locals_):
         with txl.if_(lane == txl.uint32(1)), txl.then_():
             txl.ptx["mbarrier.arrive.expect_tx.shared::cta.b64"](bar(L["B_KV"]), txl.uint32(65536))
             for half in range(2):
-                _tma_load(L["b16"](OFF["k"] + half * 16384), L["tma_k"], 64 * half, n_block * BLOCK_N,
-                          bidh_kv, bidb, bar(L["B_KV"]), EVICT_NORMAL)
+                _tma_load(L["b16"](OFF["k"] + half * 16384), L["tma_k"], 64 * half,
+                          _add(si["off_k"], n_block * BLOCK_N), bidh_kv, si["bb_k"], bar(L["B_KV"]), EVICT_NORMAL)
             for half in range(2):
-                _tma_load(L["b16"](OFF["v"] + half * 16384), L["tma_v"], 64 * half, n_block * BLOCK_N,
-                          bidh_kv, bidb, bar(L["B_KV"]), EVICT_NORMAL)
+                _tma_load(L["b16"](OFF["v"] + half * 16384), L["tma_v"], 64 * half,
+                          _add(si["off_k"], n_block * BLOCK_N), bidh_kv, si["bb_k"], bar(L["B_KV"]), EVICT_NORMAL)
             with txl.serial(m_min, m_max - 1, unroll=2) as m:
                 acquire(L["b_empty_do"], L["b_full_do"])
                 load_do(m, stat_row)
@@ -728,11 +816,25 @@ def _producer_load(locals_):
             load_do(m_max - 1, stat_row)
             advance(stage, phase)
 
-    if L["is_causal"]:
-        with txl.if_(m_max > m_min), txl.then_():
+    def work():
+        # SeqlenInfo and the m-block range (mainloop :434-441), then the early return when empty
+        # (Is_causal || Is_local || Varlen, :442-447).
+        si.update(L["seqinfo"](bidb))
+        nonlocal m_min, m_max
+        m_min = txl.local_scalar("int32", init=L["m_min_of"](n_block, si))
+        m_max = L["m_max_of"](si) if not L["varlen"] else txl.local_scalar("int32", init=L["m_max_of"](si))
+        if L["is_causal"] or L["varlen"]:
+            with txl.if_(m_max > m_min), txl.then_():
+                body()
+        else:
             body()
-    else:
-        body()
+
+    m_min = m_max = None
+    if valid is None:
+        work()
+    else:  # an invalid varlen tile skips the work loop (load_tail still runs)
+        with txl.if_(valid), txl.then_():
+            work()
     # load_tail: producer_tail of pipeline_q, then of pipeline_do, from the same state.
     lt = txl.local_scalar("uint32")
     lt_e = txl.local_scalar("uint32")
@@ -753,15 +855,17 @@ def _dq_store(locals_):
     L = locals_
     BM, OFF = L["BM"], L["OFF"]
     n_block, bidh, bidb = L["tile"]()
-    m_min = txl.local_scalar("int32", init=L["m_min_of"](n_block))
-    m_max = L["m_max_c"]
+    valid = L["tile_valid"](n_block, bidb)
     half_bytes = BM * 64 * 4
+    si = {}
 
     def body():
         lane = txl.local_scalar("uint32")
         lane_e = txl.local_scalar("uint32")
         txl.ptx.elect_sync(lane_e, lane, txl.uint32(0xFFFFFFFF))
-        base = _i64(bidb * L["h"] + bidh) * _i64(L["s_q_rounded"] * HEAD_DIM)
+        # gdQaccum: domain_offset(offset_q_padded * kHeadDim) of mdQaccum(_, bidh, bb_q)
+        base = _add(None if si["off_qp"] is None else _i64(si["off_qp"]) * _i64(HEAD_DIM),
+                    _i64(si["bb_q"] * L["h"] + bidh) * _i64(L["s_q_rounded"] * HEAD_DIM))
         with txl.serial(m_min, m_max, unroll=2) as m:
             for w in range(2):
                 txl.ptx["bar.sync"](txl.uint32(BAR_DQ_FULL + w), txl.uint32(160))
@@ -778,11 +882,23 @@ def _dq_store(locals_):
                     txl.ptx.cp.async_.bulk.wait_group.read(1 - w)
                 txl.ptx["bar.arrive"](txl.uint32(BAR_DQ_EMPTY + w), txl.uint32(160))
 
-    if L["is_causal"]:
-        with txl.if_(m_max > m_min), txl.then_():
+    def work():
+        si.update(L["seqinfo"](bidb))  # mainloop :602-612
+        nonlocal m_min, m_max
+        m_min = txl.local_scalar("int32", init=L["m_min_of"](n_block, si))
+        m_max = L["m_max_of"](si) if not L["varlen"] else txl.local_scalar("int32", init=L["m_max_of"](si))
+        if L["is_causal"] or L["varlen"]:
+            with txl.if_(m_max > m_min), txl.then_():
+                body()
+        else:
             body()
+
+    m_min = m_max = None
+    if valid is None:
+        work()
     else:
-        body()
+        with txl.if_(valid), txl.then_():
+            work()
 
 
 def _mma(locals_):
@@ -811,8 +927,8 @@ def _mma(locals_):
         txl.ptx["bar.arrive"](BAR_DQ_EMPTY - 1 + L["wg"], txl.uint32(160))
 
     n_block, bidh, bidb = L["tile"]()
-    m_min = txl.local_scalar("int32", init=L["m_min_of"](n_block))
-    m_max = L["m_max_c"]
+    valid = L["tile_valid"](n_block, bidb)
+    si = {}
 
     def mainloop_and_epilogue():
         stage = txl.local_scalar("int32", init=txl.int32(0))
@@ -824,27 +940,43 @@ def _mma(locals_):
             txl.assign(rdV[i], txl.float32(0.0))
         # barrier_KV: try_wait (work_idx % 2 == 0), then the blocking wait if not ready.
         _consumer_wait(bar(L["B_KV"]), txl.int32(0))
+        # The mask's seqlen_q / seqlen_k are the tile's SeqlenInfo lengths (mainloop :798-799).
+        Lt = L if not L["varlen"] else dict(L, s_q=si["sq"], s_k=si["sk"])
         with txl.serial(m_min, m_max, unroll=False) as m:
-            _bwd_step(L, m, stage, phase, rdK, rdV, n_block, w, tid, r0, q0, warp4, lane)
+            _bwd_step(Lt, m, stage, phase, rdK, rdV, n_block, w, tid, r0, q0, warp4, lane)
         for i in range(64):
             txl.ptx["mul.ftz.f32"](rdK[i], rdK[i], L["softmax_scale"])
         if L["gqa"]:
             _epilogue_store_gqa(L, rdK, rdV, n_block, bidh, bidb, w, tid)
+        elif L["varlen"]:
+            _epilogue_store_varlen(L, rdK, rdV, n_block, bidh, bidb, w, tid, warp4, lane)
         else:
             _epilogue_store(L, rdK, rdV, n_block, bidh, bidb, w, tid, r0, warp4, lane)
 
-    if is_causal:
-        if L["gqa"]:  # CollectiveEpilogueBwdGQA::store_zero is empty (the accumulators are zero-filled)
-            with txl.if_(m_max > m_min), txl.then_():
-                mainloop_and_epilogue()
-        else:
-            with txl.if_(m_max <= m_min):
-                with txl.then_():
-                    _store_zero(L, n_block, bidh, bidb, tid)
-                with txl.else_():
+    def work():
+        si.update(L["seqinfo"](bidb))  # mainloop :700-705
+        nonlocal m_min, m_max
+        m_min = txl.local_scalar("int32", init=L["m_min_of"](n_block, si))
+        m_max = L["m_max_of"](si) if not L["varlen"] else txl.local_scalar("int32", init=L["m_max_of"](si))
+        if is_causal or L["varlen"]:  # mma() returns false when empty (:708-710)
+            if L["gqa"]:  # CollectiveEpilogueBwdGQA::store_zero is empty (the accumulators are zero-filled)
+                with txl.if_(m_max > m_min), txl.then_():
                     mainloop_and_epilogue()
-    else:
-        mainloop_and_epilogue()
+            else:
+                with txl.if_(m_max <= m_min):
+                    with txl.then_():
+                        _store_zero(L, n_block, bidh, bidb, tid)
+                    with txl.else_():
+                        mainloop_and_epilogue()
+        else:
+            mainloop_and_epilogue()
+
+    m_min = m_max = None
+    if valid is None:
+        work()
+    else:  # an invalid varlen tile skips the work loop (no store_zero)
+        with txl.if_(valid), txl.then_():
+            work()
 
 
 def _consumer_wait(bar_ptr, phase):
@@ -1112,6 +1244,63 @@ def _epilogue_store(L, rdK, rdV, n_block, bidh, bidb, w, tid, r0, warp4, lane):
     txl.ptx.cp.async_.bulk.wait_group.read(0)
 
 
+def _epilogue_store_varlen(L, rdK, rdV, n_block, bidh, bidb, w, tid, warp4, lane):
+    """CollectiveEpilogueBwd::store, Use_TMA = false (Varlen; epilogue_bwd.hpp:163-276): the TMA build's
+    bf16 conversion and STSM into sdV / sdK (SmemLayoutAtomdKVSTG, Swizzle<3,3,3> o (8,64) tiled M
+    first: the same bytes as the TMA build's SW128 layout), a named barrier, then GmemTiledCopydKV
+    (16 rows x 16 threads x 8 bf16): every shared read of dV and dK, then the predicated gmem stores of
+    dV, then dK, at the batch's cu_seqlens_k offset."""
+    OFF, b16 = L["OFF"], L["b16"]
+    w_i = _i32(w)
+    rV16 = txl.alloc_local((32,), "uint32")
+    rK16 = txl.alloc_local((32,), "uint32")
+    for wd in range(32):
+        txl.ptx["cvt.rn.bf16x2.f32"](rV16[wd], rdV[2 * wd + 1], rdV[2 * wd])
+    for wd in range(32):
+        txl.ptx["cvt.rn.bf16x2.f32"](rK16[wd], rdK[2 * wd + 1], rdK[2 * wd])
+    txl.ptx["bar.sync"](txl.uint32(BAR_EPILOGUE), txl.uint32(NUM_MMA_THREADS))  # K and V reads done
+    kk = lane % 8
+    jm = lane // 8
+    for base_off, regs in ((OFF["v"], rV16), (OFF["k"], rK16)):  # dV first, then dK
+        for p in range(8):
+            c_j = 2 * p + jm // 2
+            i_j = jm % 2
+            row = w_i * 64 + warp4 * 16 + i_j * 8 + kk  # KV row
+            byte = base_off + (c_j // 8) * 16384 + _sw128(row, c_j % 8)
+            txl.ptx[_STSM](b16(byte), *[regs[4 * p + j] for j in range(4)])
+    txl.ptx["bar.sync"](txl.uint32(BAR_EPILOGUE), txl.uint32(NUM_MMA_THREADS))
+    V = L["V"]
+    off = V.offset(bidb, V.cu_k)  # SeqlenInfo<Varlen, kBlockN>(bidb, shape_dK[0], cu_seqlens_k, seqused_k)
+    n = V.seqlen(bidb, V.cu_k, V.su_k, L["s_k"])
+    bb = V.batch(bidb, V.cu_k)
+    col8 = (tid % 16) * 8
+    chunk = tid % 16  # 16-byte chunk of the 256-byte row; half = chunk // 8
+    regs = {}
+    for name, base_off in (("v", OFF["v"]), ("k", OFF["k"])):  # flash::copy smem -> registers (EvenN)
+        regs[name] = []
+        for k in range(BLOCK_N // 16):
+            r = tid // 16 + 16 * k
+            lo = txl.local_scalar("uint64")
+            hi = txl.local_scalar("uint64")
+            byte = base_off + (chunk // 8) * 16384 + _sw128(r, chunk % 8)
+            txl.ptx.ld.shared.v2.u64(lo, hi, L["bar"](byte))
+            regs[name].append((lo, hi))
+    rows = txl.local_scalar("int32", init=txl.min(n - n_block * BLOCK_N, BLOCK_N))
+    pcol = col8 < L["d"]
+    # tdKVgdV / tdKVgdK: this thread's first element (row tid / 16 of the tile, column col8), then a
+    # fixed 16-row stride per pass (the partition's (k) mode), as cute's partition_D addresses them.
+    base = txl.local_scalar("int64", init=(
+        ((_i64(bb) * _i64(L["s_k"]) + _i64(off + n_block * BLOCK_N + tid // 16)) * _i64(L["h"]) + _i64(bidh))
+        * _i64(L["d"]) + _i64(col8)) // 4)  # in 16-byte (2 x u64) units of 8 bf16
+    pass_stride = txl.local_scalar("int64", init=_i64(16) * _i64(L["h"]) * _i64(L["d"]) // 4)
+    r0 = tid // 16
+    for name, out in (("v", L["dv_out"]), ("k", L["dk_out"])):  # registers -> gmem, dV first
+        for k in range(BLOCK_N // 16):
+            with txl.if_(txl.And(r0 + 16 * k < rows, pcol)), txl.then_():
+                lo, hi = regs[name][k]
+                txl.ptx.st.global_.v2.u64(out.view("uint64").ptr_to([base + pass_stride * k]), lo, hi)
+
+
 def _epilogue_store_gqa(L, rdK, rdV, n_block, bidh, bidb, w, tid):
     """CollectiveEpilogueBwdGQA::store, Use_TMA, not Deterministic (epilogue_bwd.hpp:414-518): the fp32
     dV, then dK, fragment of each MMA warpgroup into sdKV (R2STiledCopydKVaccum: 128 threads x float4 per
@@ -1120,8 +1309,15 @@ def _epilogue_store_gqa(L, rdK, rdV, n_block, bidh, bidb, w, tid):
     w_i = _i32(w)
     t = tid % 128
     bidh_kv = txl.local_scalar("int32", init=L["fdiv"](bidh, *L["qhkh"]))
-    s_k_rounded = (L["s_k"] + BLOCK_N - 1) // BLOCK_N * BLOCK_N
-    tile = (_i64(bidb * L["h_k"] + bidh_kv) * _i64(s_k_rounded) + _i64(n_block * BLOCK_N)) * _i64(HEAD_DIM)
+    if not L["varlen"]:
+        s_k_rounded = (L["s_k"] + BLOCK_N - 1) // BLOCK_N * BLOCK_N
+        tile = (_i64(bidb * L["h_k"] + bidh_kv) * _i64(s_k_rounded) + _i64(n_block * BLOCK_N)) * _i64(HEAD_DIM)
+    else:  # SeqlenInfo<Varlen, kBlockN>(bidb, shape_dKaccum[0], cu_seqlens_k, seqused_k): offset_padded
+        V = L["V"]
+        off_p = V.offset(bidb, V.cu_k, BLOCK_N)
+        bb = V.batch(bidb, V.cu_k)
+        tile = (_i64(bb * L["h_k"] + bidh_kv) * _i64(L["s_k_rounded_in"]) + _i64(off_p)
+                + _i64(n_block * BLOCK_N)) * _i64(HEAD_DIM)
     txl.ptx["bar.sync"](txl.uint32(BAR_EPILOGUE), txl.uint32(NUM_MMA_THREADS))  # K and V reads done
     for regs, accum in ((rdV, L["dv_accum"]), (rdK, L["dk_accum"])):
         if regs is rdK:
@@ -1146,12 +1342,20 @@ def _store_zero(L, n_block, bidh, bidb, tid):
     16 threads x 8 elements), 128-bit zero stores under the row and column predicates, dK then dV."""
     col8 = (tid % 16) * 8
     pcol = col8 < L["d"]
-    rows_left = L["s_k"] - n_block * BLOCK_N
+    off, bb = None, bidb
+    if not L["varlen"]:
+        rows_left = L["s_k"] - n_block * BLOCK_N
+    else:  # SeqlenInfo<Varlen, kBlockN>(bidb, shape_dK[0], cu_seqlens_k, seqused_k)
+        V = L["V"]
+        off = V.offset(bidb, V.cu_k)
+        rows_left = V.seqlen(bidb, V.cu_k, V.su_k, L["s_k"]) - n_block * BLOCK_N
+        bb = V.batch(bidb, V.cu_k)
     for out in (L["dk_out"], L["dv_out"]):
         for k in range(BLOCK_N // 16):
             r = tid // 16 + 16 * k
             with txl.if_(txl.And(r < rows_left, pcol)), txl.then_():
-                idx = ((_i64(bidb) * _i64(L["s_k"]) + _i64(n_block * BLOCK_N + r)) * _i64(L["h"]) + _i64(bidh)) * _i64(L["d"]) + _i64(col8)
+                row = _i64(n_block * BLOCK_N + r) if off is None else _i64(off + n_block * BLOCK_N + r)
+                idx = ((_i64(bb) * _i64(L["s_k"]) + row) * _i64(L["h"]) + _i64(bidh)) * _i64(L["d"]) + _i64(col8)
                 txl.ptx.st.global_.v4.u32(
                     out.view("uint32").ptr_to([idx // 2]), txl.uint32(0), txl.uint32(0), txl.uint32(0), txl.uint32(0)
                 )

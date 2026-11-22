@@ -22,3 +22,12 @@ configs:
   - {config: bench_b4_sq4096_sk4096_h32_hk8_d128_causal, default: true, selection_role: medium}
   - {config: bench_b2_sq8192_sk8192_h32_hk8_d128_noncausal, default: false}
   - {config: bench_b2_sq8192_sk8192_h32_hk8_d128_causal, default: false}
+  # varlen (packed batches, cu_seqlens only): ~16k tokens as 16 x ~1024 or 4 x ~4096 sequences.
+  - {config: bench_varlen_noseqused_b16_sq1024_sk1024_h16_d128_noncausal, default: false}
+  - {config: bench_varlen_noseqused_b16_sq1024_sk1024_h16_d128_causal, default: false}
+  - {config: bench_varlen_noseqused_b16_sq1024_sk1024_h32_hk8_d128_noncausal, default: false}
+  - {config: bench_varlen_noseqused_b16_sq1024_sk1024_h32_hk8_d128_causal, default: false}
+  - {config: bench_varlen_noseqused_b4_sq4096_sk4096_h16_d128_noncausal, default: false}
+  - {config: bench_varlen_noseqused_b4_sq4096_sk4096_h16_d128_causal, default: false}
+  - {config: bench_varlen_noseqused_b4_sq4096_sk4096_h32_hk8_d128_noncausal, default: false}
+  - {config: bench_varlen_noseqused_b4_sq4096_sk4096_h32_hk8_d128_causal, default: false}

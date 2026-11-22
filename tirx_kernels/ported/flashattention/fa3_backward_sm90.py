@@ -71,11 +71,44 @@ UPSTREAM_SEQLENS = [
 ]
 
 
-def _case(b, s_q, s_k, h, d, causal, *, h_k=None, seed=0, prefix="") -> dict:
-    """One config; ``h_k`` (KV heads) set only for GQA / MQA, which selects upstream's GQA path."""
+#: ``hopper/test_flash_attn.py::test_flash_attn_varlen_output`` (seqlen_q, seqlen_k) axis.
+UPSTREAM_VARLEN_SEQLENS = [
+    (1, 1),
+    (1, 3),
+    (2, 1),
+    (511, 1),
+    (3, 513),
+    (64, 128),
+    (128, 128),
+    (256, 256),
+    (113, 203),
+    (128, 217),
+    (113, 211),
+    (108, 256),
+    (256, 512),
+    (307, 256),
+    (640, 128),
+    (512, 256),
+    (1024, 1024),
+    (1023, 1024),
+    (1024, 1023),
+    (1024, 1024),
+    (2048, 2048),
+    (4096, 4096),
+]
+
+
+def _case(b, s_q, s_k, h, d, causal, *, h_k=None, seed=0, prefix="", varlen=None) -> dict:
+    """One config; ``h_k`` (KV heads) set only for GQA / MQA, which selects upstream's GQA path.
+    ``varlen``: None for fixed length, else the varlen options (``add_unused_qkv``, ``seqused``,
+    ``zero_lengths_k``); s_q / s_k are then the padded maximum lengths of the generated batch."""
     gqa = h_k is not None and h_k != h
+    vtag = ""
+    if varlen is not None:
+        vtag = "varlen_" + ("unused_" if varlen.get("add_unused_qkv") else "") + (
+            "noseqused_" if varlen.get("seqused") is False else "")
     label = (
-        f"{prefix}b{b}_sq{s_q}_sk{s_k}_h{h}{f'_hk{h_k}' if gqa else ''}_d{d}_"
+        f"{prefix}{vtag}b{b}_sq{s_q}_sk{s_k}_h{h}{f'_hk{h_k}' if gqa else ''}_d{d}_"
         f"{'causal' if causal else 'noncausal'}"
     )
     config = {
@@ -90,6 +123,9 @@ def _case(b, s_q, s_k, h, d, causal, *, h_k=None, seed=0, prefix="") -> dict:
     }
     if gqa:
         config["num_heads_k"] = h_k
+    if varlen is not None:
+        config["varlen"] = True
+        config.update(varlen)
     return config
 
 
@@ -101,6 +137,21 @@ def upstream_test_cases(head_dim=128, mha_type="mha") -> list[dict]:
         _case(9 if s_k <= 2048 else 2, s_q, s_k, 6, head_dim, causal, h_k=h_k)
         for s_q, s_k in UPSTREAM_SEQLENS
         for causal in (False, True)
+    ]
+
+
+def upstream_varlen_test_cases(head_dim=128, mha_type="mha") -> list[dict]:
+    """The bf16 backward cases of ``test_flash_attn_varlen_output`` for one ``mha_type``: batch 9 (2
+    when seqlen_q > 2048), 6 heads, KV heads 6 / 2 / 1, add_unused_qkv in {False, True}, seed
+    seqlen_q + seqlen_k + d + 2 * causal as upstream's (no local, no softcap, no qv)."""
+    h_k = {"mha": None, "gqa": 2, "mqa": 1}[mha_type]
+    return [
+        _case(9 if s_q <= 2048 else 2, s_q, s_k, 6, head_dim, causal, h_k=h_k,
+              seed=s_q + s_k + head_dim + 2 * int(causal), prefix=f"{mha_type}_" if h_k else "",
+              varlen={"add_unused_qkv": unused})
+        for s_q, s_k in UPSTREAM_VARLEN_SEQLENS
+        for causal in (False, True)
+        for unused in (False, True)
     ]
 
 
@@ -129,12 +180,26 @@ _EDGE_GQA = [
     _case(2, 500, 700, 16, 128, True, h_k=1, seed=15, prefix="edge_"),
 ]
 
+#: Varlen edges: cu_seqlens without seqused (the other SeqlenInfo branch), many sequences and heads
+#: (LPT swizzle remainder), long sequences (more than two KV blocks per row), GQA 32 / 8.
+_EDGE_VARLEN = [
+    _case(9, 300, 700, 6, 128, False, seed=21, prefix="edge_", varlen={"seqused": False}),
+    _case(9, 700, 300, 6, 128, True, seed=22, prefix="edge_", varlen={"seqused": False}),
+    _case(17, 1000, 1000, 13, 128, True, seed=23, prefix="edge_", varlen={"add_unused_qkv": True}),
+    _case(3, 3000, 3000, 32, 128, True, h_k=8, seed=24, prefix="edge_", varlen={}),
+    _case(3, 3000, 3000, 32, 128, False, h_k=8, seed=25, prefix="edge_", varlen={"seqused": False}),
+]
+
 CONFIGS = [
     *upstream_test_cases(128),
     *_EDGE,
     *upstream_test_cases(128, "gqa"),
     *upstream_test_cases(128, "mqa"),
     *_EDGE_GQA,
+    *upstream_varlen_test_cases(128),
+    *upstream_varlen_test_cases(128, "gqa"),
+    *upstream_varlen_test_cases(128, "mqa"),
+    *_EDGE_VARLEN,
 ]
 
 #: ``hopper/benchmark_attn.py``-style shapes: 16k tokens per batch, hidden 2048 (16 heads of 128).
@@ -147,6 +212,14 @@ BENCH_CONFIGS = [
     _case(16384 // s, s, s, 32, 128, causal, h_k=8, prefix="bench_")
     for s in (1024, 4096, 8192)
     for causal in (False, True)
+] + [
+    # Packed (varlen) batches of about 16k tokens: 16 / 4 sequences of max length 1024 / 4096 (lengths
+    # in [max - 20, max], no empty sequences), MHA 16 heads and Llama-3 8B GQA 32 / 8.
+    _case(16384 // s, s, s, h, 128, causal, h_k=hk, prefix="bench_",
+          varlen={"zero_lengths_k": False, "seqused": False})
+    for s in (1024, 4096)
+    for h, hk in ((16, None), (32, 8))
+    for causal in (False, True)
 ]
 
 
@@ -157,7 +230,8 @@ def get_kernel(*, backend_config=None, **config):
     config.pop("label", None)
     gqa = config.get("num_heads_k", config["num_heads"]) != config["num_heads"]
     return list(
-        build_kernels(config["head_dim"], config["is_causal"], gqa=gqa, backend_config=backend_config)
+        build_kernels(config["head_dim"], config["is_causal"], gqa=gqa, varlen=bool(config.get("varlen")),
+                      backend_config=backend_config)
     )
 
 
@@ -204,4 +278,5 @@ __all__ = [
     "run_bench",
     "run_test",
     "upstream_test_cases",
+    "upstream_varlen_test_cases",
 ]
