@@ -37,10 +37,24 @@ MK_ALIGNMENT = 128
 MAX_STAGES = 16
 BLOCK_K = 128
 WGMMA_M = 64
-#: BLOCK_N values the port implements, each with a reviewed line-info export: the upstream SM90
-#: tests' 96/128/192, and the coverage extension's 32/64 (uniform), 48/112 (runtime predicate) and
-#: 160 (dispatched, BLOCK_N > BLOCK_K) that realistic MoE shapes select.
-PORTED_BLOCK_N = (32, 48, 64, 96, 112, 128, 160, 192)
+#: The specializations the port implements and has checked instruction for instruction against
+#: the source's: (gemm type, BLOCK_M, BLOCK_N, TMA multicast, multicast on A). The upstream SM90
+#: tests reach the BLOCK_N 96/128/192 ones; realistic MoE shapes (DeepSeek-V3 / Qwen3-MoE at
+#: EP 8-64) reach the rest.
+_C, _P, _M = "contiguous", "psum", "masked"
+PORTED_CLASSES = frozenset(
+    {
+        (_P, 128, 192, 1, False), (_P, 128, 192, 2, False), (_C, 128, 192, 2, False),
+        (_M, 128, 192, 2, False), (_M, 64, 96, 2, False), (_M, 64, 128, 2, False),
+        (_M, 64, 192, 1, False), (_M, 64, 192, 2, False),
+        (_C, 128, 32, 1, False), (_P, 128, 32, 1, False), (_M, 64, 32, 1, False),
+        (_C, 128, 48, 1, False), (_P, 128, 48, 1, False), (_M, 64, 48, 1, False),
+        (_C, 128, 64, 1, False), (_P, 128, 64, 1, False), (_M, 64, 64, 1, False),
+        (_M, 64, 112, 2, False), (_C, 128, 160, 2, False),
+        (_C, 128, 112, 2, True), (_P, 128, 112, 2, True), (_M, 128, 112, 2, True),
+        (_C, 128, 128, 2, True), (_P, 128, 128, 2, True), (_M, 128, 128, 2, True),
+    }
+)  # fmt: skip
 
 
 class GemmType(enum.IntEnum):
@@ -339,9 +353,15 @@ def make_spec(desc: GemmDesc, config: GemmConfig) -> KernelSpec:
     if storage.swizzle_a_mode != layout.block_k or storage.swizzle_b_mode != layout.block_k:
         raise AssertionError("SM90 1D2D requires no TMA splits")  # `sm90_fp8_gemm_1d2d.hpp`
     # The port covers the specializations whose line-info PTX was reviewed (multicast on A or B,
-    # PORTED_BLOCK_N); refuse a heuristic choice outside them rather than build it unverified.
-    if layout.block_n not in PORTED_BLOCK_N:
-        raise NotImplementedError(f"BLOCK_N = {layout.block_n} is not ported ({PORTED_BLOCK_N})")
+    # PORTED_CLASSES); refuse a heuristic choice outside them rather than build it unverified.
+    kind = {
+        GemmType.M_GROUPED_CONTIGUOUS: _C,
+        GemmType.M_GROUPED_CONTIGUOUS_WITH_PSUM_LAYOUT: _P,
+        GemmType.M_GROUPED_MASKED: _M,
+    }[desc.gemm_type]
+    key = (kind, layout.block_m, layout.block_n, layout.cluster_size, layout.cluster_n > 1)
+    if key not in PORTED_CLASSES:
+        raise NotImplementedError(f"specialization {key} is not ported")
     return KernelSpec(
         gemm_type=desc.gemm_type,
         shape_m=compiled(desc.m, "m"),

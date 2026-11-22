@@ -93,8 +93,8 @@ def _from_masked_case(num_groups, expected_m_per_group, n, k, *, seed=0) -> dict
 
 
 #: Coverage extension: one realistic MoE shape per specialization class the upstream tests do not
-#: reach (DeepSeek-V3 / Qwen3-MoE at EP 32-64, `sm90-probe/logs/dg90_reach.json`), each the exact
-#: instantiation of the reviewed line-info export (delta sketch appendix), every group `m` rows.
+#: reach (DeepSeek-V3 / Qwen3-MoE at EP 32-64), each one specialization's exact template
+#: instantiation, every group `m` rows.
 _COVERAGE = [
     # (num_groups, m per group, N, K, psum) -> class
     (2, 64, 1536, 2048, False),  # 128x32
@@ -144,6 +144,8 @@ CONFIGS = [
     # with a partial last N block (`num_full_iters < BLOCK_N / 8`).
     _edge("on_a_odd_blocks", 4, 150, 5008, 2048, (128, 128, 100, 250), seed=66),
     _edge("bn48_partial_n", 2, 64, 2992, 4096, (64, 64), seed=67),
+    # 128x160 with multicast on B taken: two m blocks per group, so peers share a group.
+    _edge("bn160_multicast_b", 4, 256, 7168, 2048, (256, 256, 256, 200), seed=69),
     _edge("bn48_partial_n_psum", 2, 64, 2992, 4096, (64, 64), psum=True, seed=68),
     _edge(
         "empty_groups_psum_from_masked",

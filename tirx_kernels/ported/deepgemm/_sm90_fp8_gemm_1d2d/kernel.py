@@ -295,7 +295,7 @@ def build_kernel(spec: KernelSpec, *, backend_config=None):
     should_optimize = BK // gcd <= 4 and not uniform_sfb
     k_gap, k_end = gcd // 8, (BK // 8 if should_optimize else 0)
     # Non-uniform B scales without the dispatch use the runtime predicate (`.cuh:342`); its emitted
-    # form (shared i = 0/1 select, delta sketch Delta 3) relies on `num_former_iters` being even.
+    # form (one select shared by i = 0 and 1) relies on `num_former_iters` being even.
     runtime_predicate = not uniform_sfb and not should_optimize
     if runtime_predicate and BN not in (48, 112):
         raise NotImplementedError(f"runtime-predicate promotion at BLOCK_N = {BN} is not ported")
@@ -585,10 +585,10 @@ def _producer(spec, *, sched_args, smem, maps, full, empty, stage_idx, phase, ad
 
 def _promote_runtime_predicate(final_accum, accum, scale, base, num_accum, num_former_iters):
     """Promotion with the runtime predicate `i < num_former_iters` (`.cuh:333-346`), in the form nvcc
-    emits for the source (delta sketch Delta 3): the select is factored out of the products,
+    emits for the source: the select is factored out of the products,
     `(p ? sa*sb0 : sa*sb1) == sa*(p ? sb0 : sb1)` bit for bit, and since `num_former_iters` is even for
     BLOCK_N 48/112, i = 0 and i = 1 share one select and product pair under `num_former_iters != 0`.
-    The products are explicit non-FTZ PTX (ISSUE-010), so the sharing is written out here."""
+    The products are explicit non-FTZ PTX, so the sharing is written out here."""
     groups = num_accum // 4
 
     def products(pred):

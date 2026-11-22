@@ -88,6 +88,8 @@ CONFIGS = [
             ]
         )
     ],
+    # 64x112 with multicast on B taken: groups of more than one 64-row m block.
+    _edge("bn112_multicast_b", 8, 54, 7168, 2048, (128, 100, 64, 65, 200, 10, 0, 70), seed=54),
     # Edge shapes: empty groups (the scheduler skips them), a full `max_m` group, one row, and
     # row counts that are not BLOCK_M multiples (partial and fully invalid WGMMA row bands).
     _edge("empty_one_full", 4, 300, 4096, 4096, (0, 1, 4096, 777), seed=51),
