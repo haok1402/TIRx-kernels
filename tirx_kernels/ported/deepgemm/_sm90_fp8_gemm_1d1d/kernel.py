@@ -302,6 +302,10 @@ def build_kernel(spec: KernelSpec, *, backend_config=None):
         raise NotImplementedError(f"gemm type {spec.gemm_type!r} is not a 1D1D type")
     if BK != 128 or BM not in (64, 128) or spec.num_tma_threads != 128:
         raise NotImplementedError(f"unported specialization {spec}")
+    if mc > 1 and spec.is_tma_multicast_on_a and not is_k_grouped:
+        # Multicast on A is exported and checked for KGroupedContiguous only (no realistic dense wgrad
+        # shape selects it for Normal); refuse rather than build an unverified variant.
+        raise NotImplementedError("TMA multicast on A is ported for KGroupedContiguous only")
 
     # ---- template constants (`.cuh:56-75, 150-155`) ----
     num_accum = BN // 2  # WGMMA m64nBNk32 f32 accumulators per thread

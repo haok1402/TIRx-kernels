@@ -160,6 +160,8 @@ Grouped by the FlashInfer Python entry point each port backs.
   [`deepgemm_sm100_m_grouped_fp8_gemm_contiguous`](tirx_kernels/ported/deepgemm/m_grouped_fp8_gemm_contiguous.py),
   [`deepgemm_sm100_m_grouped_fp8_gemm_masked`](tirx_kernels/ported/deepgemm/m_grouped_fp8_gemm_masked.py),
   [`deepgemm_sm100_k_grouped_fp8_gemm_contiguous`](tirx_kernels/ported/deepgemm/k_grouped_fp8_gemm_contiguous.py),
+  [`deepgemm_sm90_k_grouped_fp8_gemm_contiguous`](tirx_kernels/ported/deepgemm/sm90_k_grouped_fp8_gemm_contiguous.py) ⟨sm_90a⟩,
+  [`deepgemm_sm90_fp8_gemm_1d1d`](tirx_kernels/ported/deepgemm/sm90_fp8_gemm_1d1d.py) ⟨sm_90a⟩,
   [`deepgemm_sm100_fp8_bmm`](tirx_kernels/ported/deepgemm/fp8_bmm.py),
   [`deepgemm_sm100_tf32_hc_prenorm_gemm`](tirx_kernels/ported/deepgemm/tf32_hc_prenorm_gemm.py)
 - **MQA logits:**

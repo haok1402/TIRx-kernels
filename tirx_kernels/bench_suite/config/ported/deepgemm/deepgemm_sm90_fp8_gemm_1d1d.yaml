@@ -1,0 +1,10 @@
+kernel: deepgemm_sm90_fp8_gemm_1d1d
+selection_rationale: The defaults cover the 64x152 (6 stages), 128x136 and 128x152 B-multicast classes of the FP32-accumulate wgrad shapes.
+configs:
+  - {config: m2112_n4096_k7168, default: true, selection_role: medium}
+  - {config: m576_n4096_k7168, default: true, selection_role: small}
+  - {config: m24576_n4096_k1536, default: false}
+  - {config: m32768_n4096_k512, default: false}
+  - {config: m7168_n4096_k16384, default: true, selection_role: large}
+  - {config: m4096_n4096_k7168, default: false}
+  - {config: m7168_n4096_k2048, default: false}

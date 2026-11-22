@@ -1,0 +1,13 @@
+kernel: deepgemm_sm90_k_grouped_fp8_gemm_contiguous
+selection_rationale: The defaults cover the many-small-groups tensor-map-rewrite stress shape, the B-multicast (4 groups) and no-cluster (8/16 groups) 128x152 classes, and a multicast-on-A down-projection shape.
+configs:
+  - {config: g8_m768_n2048_k128, default: true, selection_role: small}
+  - {config: g4_m4096_n7168_k8192, default: true, selection_role: large}
+  - {config: g4_m7168_n2048_k8192, default: false}
+  - {config: g8_m4096_n7168_k4096, default: false}
+  - {config: g8_m7168_n2048_k4096, default: false}
+  - {config: g16_m4096_n7168_k2048, default: true, selection_role: medium}
+  - {config: g16_m7168_n2048_k2048, default: false}
+  - {config: cov_onA_g2_m2048_n768_k2048, default: false}
+  - {config: cov_onA_g4_m4096_n1536_k512, default: false}
+  - {config: cov_g8_m4096_n1536_k512, default: false}
