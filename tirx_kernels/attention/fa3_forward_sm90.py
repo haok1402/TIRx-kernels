@@ -7,7 +7,13 @@ Layout: FlashInfer's ragged NHD. Q, K, V and O are ``[total_tokens, heads, 128]`
 at rows ``cu_seqlens[b] : cu_seqlens[b + 1]``. This is self-attention prefill (q_len == kv_len per
 sequence); a causal row attends to keys at or before its own position.
 
-**CTA:** one 128-row Q tile of one (sequence, head) per CTA, 3 warpgroups, 384 threads.
+**Grid.** Each tile is one 128-row Q block of one (sequence, head); a CTA has 3 warpgroups, 384 threads.
+- **Non-causal: one tile per CTA.** Every tile has the same length.
+- **Causal: persistent.** One CTA per SM runs a host-planned tile list, using FlashInfer's
+  ``PrefillSM90Plan`` (longest first, least-loaded CTA; see ``work_lists``). This balances the
+  1..n-block causal tiles, and it overlaps each tile's epilogue with the next tile's first K and Q loads.
+
+**Warpgroups.**
 - **WG0, producer:** ``setmaxnreg`` 24. One thread issues the Q tile, then K and V blocks of 128
   rows into 2-stage rings. K and V have separate full (TMA) and empty (consumer) barriers, so QKᵀ can
   start before V lands.
@@ -16,7 +22,8 @@ sequence); a causal row attends to keys at or before its own position.
 
 **Consumer loop** (FA3's intra-warpgroup overlap; see sm90-probe ``b3/B3-design.md``). KV blocks
 run in descending order. The first block is the only one that needs masking: the causal diagonal,
-or the non-causal KV tail. It is peeled. Then for each following block:
+or the non-causal KV tail. It is peeled, and masked with one compare per register against a per-row
+limit (no ``T.Or``; see ``mask_first_block``). Then for each following block:
 
     S = Q Kᵀ (in flight) ; rescale O ; O += P_prev V_prev (rs) ; wait 1 ; release K ;
     softmax(S) ; wait 0 ; release V_prev ; P = bf16(S)
@@ -30,15 +37,19 @@ multiplies that 0 by V. A NaN or inf in a masked V row (e.g. a causal row's futu
 block) therefore turns the output row into NaN, exactly as FA3 does. Review checked this matches FA3
 element for element.
 
-**For a future persistent version** (one CTA looping over tiles), two things here assume one tile per
-CTA:
-- The ping-pong leaves one unmatched ``bar.arrive``: warpgroup 2's last arrive on warpgroup 1's
-  barrier is never consumed. That is harmless at CTA exit, but would skew the next tile's ping-pong.
-- The epilogue stages O in the Q tile. The producer must not load the next Q until both
-  warpgroups' TMA stores have finished reading it (a Q-empty barrier after ``wait_group.read``).
+**Persistent mode** (causal default, ``persistent=``):
+- **K/V rings:** they continue across tiles; ``kv_base`` is the ring position of the tile's first block.
+- **Q tile:** the producer issues the next tile's first K, then waits on ``q_empty`` before loading
+  its Q. Both consumer warpgroups arrive there once their last QK^T of the tile has retired.
+- **O staging:** O has its own 32 KB staging tile, not the Q tile. Each warpgroup's TMA-store leader
+  waits for its previous store to finish reading before the slice is rewritten.
+- **Ping-pong:** both warpgroups run the same GEMM sections per tile. Warpgroup 2's last ``bar.arrive``
+  of a tile is therefore the opening arrive of the next tile. Only the last tile's arrive is left
+  unconsumed, which is harmless at CTA exit.
 """
 
 import ctypes
+import heapq
 import math
 from typing import Any
 
@@ -117,13 +128,19 @@ class _Regs4:
         return 4
 
 
-def make_kernel(num_heads: int, causal: bool, *, backend_config=None, pingpong=None):
+def make_kernel(
+    num_heads: int, causal: bool, *, backend_config=None, pingpong=None, persistent=None
+):
     bc = resolve_backend_config(backend_config)
     H = num_heads
     if pingpong is None:
         # Measured on H200 (sm90-probe logs/b3/v3.log): ping-pong helps causal slightly and costs
         # non-causal 1-2%, where the intra-warpgroup overlap already hides softmax.
         pingpong = causal
+    if persistent is None:
+        # Measured on H200 (sm90-probe fa3c/logs/v5*.log, v6.log): +3-6% causal; non-causal tiles
+        # are all the same length and the persistent body costs 4-10% there.
+        persistent = causal
     # Inter-warpgroup ping-pong (FA3's WarpScheduler): one barrier per consumer warpgroup, 256 threads
     # (its own 128 syncing + the other's 128 arriving). A warpgroup syncs on its own barrier before
     # issuing a block's GEMMs and arrives on the other's after, so one issues GEMMs while the other
@@ -146,6 +163,7 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None, pingpong=N
         O: txl.Tensor((txl.int64(),), "bfloat16"),
         cu_seqlens: txl.Tensor((txl.int64(),), "int32"),
         tiles: txl.Tensor((txl.int64(),), "int32"),
+        work_ptr: txl.Tensor((txl.int64(),), "int32"),
         num_ctas: "int32",
     ):
         txl.device_entry(
@@ -163,16 +181,22 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None, pingpong=N
         q_s = smem.alloc([BM * HEAD_DIM], "bfloat16", align=1024)
         k_s = smem.alloc([STAGES * BN * HEAD_DIM], "bfloat16", align=1024)
         v_s = smem.alloc([STAGES * BN * HEAD_DIM], "bfloat16", align=1024)
+        # O staging: its own tile when persistent (the next tile's Q loads while this one stores),
+        # else the Q tile, which is dead by the epilogue.
+        o_s = smem.alloc([BM * HEAD_DIM], "bfloat16", align=1024) if persistent else q_s
         q_full = txl.TMABar(smem, 1)
         k_full = txl.TMABar(smem, STAGES)
         v_full = txl.TMABar(smem, STAGES)
         k_empty = txl.MBarrier(smem, STAGES)
         v_empty = txl.MBarrier(smem, STAGES)
+        q_empty = txl.MBarrier(smem, 1) if persistent else None
         q_full.init(1)
         k_full.init(1)
         v_full.init(1)
         k_empty.init(8)  # one arrival per consumer warp
         v_empty.init(8)
+        if persistent:
+            q_empty.init(8)
         txl.ptx.fence.proxy.async_.shared__cta()
         txl.cuda.cta_sync()
 
@@ -182,17 +206,47 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None, pingpong=N
             return value
 
         cta = txl.cta_id()
-        batch = ldg_i32(tiles.ptr_to([3 * cta]))
-        head = ldg_i32(tiles.ptr_to([3 * cta + 1]))
-        m_blk = ldg_i32(tiles.ptr_to([3 * cta + 2]))
-        seq0 = ldg_i32(cu_seqlens.ptr_to([batch]))
+        head = txl.local_scalar("int32")
+        m_blk = txl.local_scalar("int32")
+        seq0 = txl.local_scalar("int32")
         seq_len = txl.local_scalar("int32")
-        txl.assign(seq_len, ldg_i32(cu_seqlens.ptr_to([batch + 1])) - seq0)
         n_blocks = txl.local_scalar("int32")
-        if causal:
-            txl.assign(n_blocks, m_blk + 1)  # BM == BN: KV blocks 0..m_blk
+        if persistent:
+            # This CTA's tiles are work_ptr[cta] .. work_ptr[cta + 1] of the table; ``kv_base`` is the
+            # K/V ring position of the current tile's first block (the rings run on across tiles).
+            w_begin = ldg_i32(work_ptr.ptr_to([cta]))
+            w_count = txl.local_scalar("int32")
+            txl.assign(w_count, ldg_i32(work_ptr.ptr_to([cta + 1])) - w_begin)
+            kv_base = txl.local_scalar("int32")
+            txl.assign(kv_base, 0)
         else:
-            txl.assign(n_blocks, (seq_len + BN - 1) // BN)
+            kv_base = 0
+
+        def load_tile(w):
+            batch = ldg_i32(tiles.ptr_to([3 * w]))
+            txl.assign(head, ldg_i32(tiles.ptr_to([3 * w + 1])))
+            txl.assign(m_blk, ldg_i32(tiles.ptr_to([3 * w + 2])))
+            txl.assign(seq0, ldg_i32(cu_seqlens.ptr_to([batch])))
+            txl.assign(seq_len, ldg_i32(cu_seqlens.ptr_to([batch + 1])) - seq0)
+            if causal:
+                txl.assign(n_blocks, m_blk + 1)  # BM == BN: KV blocks 0..m_blk
+            else:
+                txl.assign(n_blocks, (seq_len + BN - 1) // BN)
+
+        if not persistent:
+            # The one tile, read here by every warp before the role split (as its loads overlap the
+            # barrier setup); reading it after setmaxnreg cost non-causal about 1%.
+            load_tile(cta)
+
+        def for_each_tile(body):
+            """``body(t)`` for this CTA's t-th tile: every tile of its list, or tile ``cta`` only."""
+            if persistent:
+                with txl.serial(w_count) as t:
+                    load_tile(w_begin + t)
+                    body(t)
+                    txl.assign(kv_base, kv_base + n_blocks)
+            else:
+                body(0)
 
         def stage_phase(n):
             return n % STAGES, (n // STAGES) & 1
@@ -202,34 +256,52 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None, pingpong=N
             with txl.then_():
                 txl.ptx["setmaxnreg.dec.sync.aligned.u32"](24)
                 with txl.if_(tid == 0), txl.then_():
-                    q_full.arrive(0, tx_count=BM * HEAD_DIM * 2)
-                    for a in range(HEAD_DIM // E):
-                        txl.ptx[TMA3D](
-                            q_s.ptr_to([a * BM * E]),
-                            txl.address_of(Q_map),
-                            txl.int32(a * E),
-                            head,
-                            seq0 + m_blk * BM,
-                            q_full.ptr_to([0]),
-                        )
-                    with txl.serial(n_blocks) as n:
-                        st, ph = stage_phase(n)
+
+                    def load_q(t):
+                        if persistent:
+                            # the previous tile's consumers have retired their last QK^T on q_s
+                            q_empty.wait(0, (t & 1) ^ 1)
+                        q_full.arrive(0, tx_count=BM * HEAD_DIM * 2)
+                        for a in range(HEAD_DIM // E):
+                            txl.ptx[TMA3D](
+                                q_s.ptr_to([a * BM * E]),
+                                txl.address_of(Q_map),
+                                txl.int32(a * E),
+                                head,
+                                seq0 + m_blk * BM,
+                                q_full.ptr_to([0]),
+                            )
+
+                    def load_kv(ring, full, empty, gmap, n):
+                        st, ph = stage_phase(kv_base + n)
                         row = seq0 + (n_blocks - 1 - n) * BN
-                        for ring, full, empty, gmap in (
-                            (k_s, k_full, k_empty, K_map),
-                            (v_s, v_full, v_empty, V_map),
-                        ):
-                            empty.wait(st, ph ^ 1)
-                            full.arrive(st, tx_count=TILE_BYTES)
-                            for a in range(HEAD_DIM // E):
-                                txl.ptx[TMA3D](
-                                    ring.ptr_to([st * BN * HEAD_DIM + a * BN * E]),
-                                    txl.address_of(gmap),
-                                    txl.int32(a * E),
-                                    head,
-                                    row,
-                                    full.ptr_to([st]),
-                                )
+                        empty.wait(st, ph ^ 1)
+                        full.arrive(st, tx_count=TILE_BYTES)
+                        for a in range(HEAD_DIM // E):
+                            txl.ptx[TMA3D](
+                                ring.ptr_to([st * BN * HEAD_DIM + a * BN * E]),
+                                txl.address_of(gmap),
+                                txl.int32(a * E),
+                                head,
+                                row,
+                                full.ptr_to([st]),
+                            )
+
+                    def produce(t):
+                        if persistent:  # FA3's order: the first K can go before the Q tile is free
+                            load_kv(k_s, k_full, k_empty, K_map, 0)
+                            load_q(t)
+                            load_kv(v_s, v_full, v_empty, V_map, 0)
+                            with txl.serial(n_blocks - 1) as i:
+                                load_kv(k_s, k_full, k_empty, K_map, i + 1)
+                                load_kv(v_s, v_full, v_empty, V_map, i + 1)
+                        else:
+                            load_q(t)
+                            with txl.serial(n_blocks) as n:
+                                load_kv(k_s, k_full, k_empty, K_map, n)
+                                load_kv(v_s, v_full, v_empty, V_map, n)
+
+                    for_each_tile(produce)
             # ------------------------------------------------------------ consumers
             with txl.else_():
                 txl.ptx["setmaxnreg.inc.sync.aligned.u32"](240)
@@ -247,7 +319,10 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None, pingpong=N
                             txl.cast(sched[0].barrier_id + 1 - cw, "uint32"), txl.uint32(256)
                         )
 
-                if pingpong:  # warpgroup 1 issues first
+                # Warpgroup 1 issues first. Both warpgroups run the same GEMM sections per tile, so
+                # warpgroup 2's last arrive of one tile is the opening arrive of the next; after the
+                # last tile it is left unconsumed, which is harmless at CTA exit.
+                if pingpong:
                     with txl.if_(cw == 1), txl.then_():
                         txl.ptx["bar.arrive"](txl.uint32(sched[0].barrier_id), txl.uint32(256))
                 tw = tid & 127
@@ -261,6 +336,7 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None, pingpong=N
                 alpha = txl.alloc_local([2], "float32")
                 mx = txl.alloc_local([2], "float32")
                 mc = txl.alloc_local([2], "float32")  # m * c
+                lim = txl.alloc_local([2], "int32")
                 q_tile = W.SmemTile(q_s.ptr_to([cw * 64 * E]), rows=BM)
 
                 def k_tile(st):
@@ -313,117 +389,151 @@ def make_kernel(num_heads: int, causal: bool, *, backend_config=None, pingpong=N
                     for r in range(PV.num_acc):
                         txl.assign(o_acc[r], o_acc[r] * alpha[(r % 4) // 2])
 
-                for r in range(PV.num_acc):
-                    txl.assign(o_acc[r], T.float32(0.0))
-                q_full.wait(0, 0)
+                def mask_first_block():
+                    # Register r sits at row 16 warp + lane / 4 + 8 h, column 8 (r / 4) + r % 2 +
+                    # 2 (lane % 4) of the block (W.acc_coord). It is masked iff its column is past the
+                    # row's last visible key (the diagonal, and the sequence end). Folding the lane part
+                    # and the block offset into a per-row limit leaves one compare against a constant
+                    # per register: ISETP + FSEL. The same mask as T.Or(k_col >= seq_len, k_col > q_row),
+                    # whose short-circuit `||` NVRTC compiled into a branch per register (ISSUE-017).
+                    lane = tw & 31
+                    j0 = n_blocks - 1
+                    for h in range(2):
+                        last = seq_len - 1
+                        if causal:
+                            q_row = m_blk * BM + cw * 64 + (tw >> 5) * 16 + (lane >> 2) + 8 * h
+                            last = T.min(q_row, last)
+                        txl.assign(lim[h], last - j0 * BN - 2 * (lane & 3))
+                    for r in range(QK.num_acc):
+                        masked = T.int32(8 * (r // 4) + r % 2) > lim[(r % 4) // 2]
+                        txl.assign(s_acc[r], T.Select(masked, T.float32(-math.inf), s_acc[r]))
 
-                # first (highest) KV block: the only one masked (causal diagonal / KV tail)
-                k_full.wait(0, 0)
-                sched_sync()
-                qk_chain(0)
-                sched_arrive()
-                W.wait(0, (s_acc, QK.num_acc))
-                release(k_empty, 0)
-                j0 = n_blocks - 1
-                for r in range(QK.num_acc):
-                    row, col = W.acc_coord(tw, r)
-                    q_row = m_blk * BM + cw * 64 + row
-                    k_col = j0 * BN + col
-                    masked = k_col >= seq_len
-                    if causal:
-                        masked = T.Or(masked, k_col > q_row)
-                    txl.assign(s_acc[r], T.Select(masked, T.float32(-math.inf), s_acc[r]))
-                softmax(True)
+                def consume(t):
+                    for r in range(PV.num_acc):
+                        txl.assign(o_acc[r], T.float32(0.0))
+                    q_full.wait(0, t & 1 if persistent else 0)
 
-                with txl.serial(n_blocks - 1) as i:
-                    n = i + 1
-                    st, ph = stage_phase(n)
-                    pst, pph = stage_phase(n - 1)
-                    k_full.wait(st, ph)
+                    # first (highest) KV block: the only one masked (causal diagonal / KV tail)
+                    st0, ph0 = stage_phase(kv_base)
+                    k_full.wait(st0, ph0)
                     sched_sync()
-                    qk_chain(st)
-                    rescale_o()
-                    v_full.wait(pst, pph)
-                    pv_chain(pst)
+                    qk_chain(st0)
                     sched_arrive()
-                    W.wait(1, (s_acc, QK.num_acc))
-                    release(k_empty, st)
-                    softmax(False)
+                    W.wait(0, (s_acc, QK.num_acc))
+                    release(k_empty, st0)
+                    mask_first_block()
+                    softmax(True)
+
+                    with txl.serial(n_blocks - 1) as i:
+                        n = kv_base + i + 1
+                        st, ph = stage_phase(n)
+                        pst, pph = stage_phase(n - 1)
+                        k_full.wait(st, ph)
+                        sched_sync()
+                        qk_chain(st)
+                        rescale_o()
+                        v_full.wait(pst, pph)
+                        pv_chain(pst)
+                        sched_arrive()
+                        W.wait(1, (s_acc, QK.num_acc))
+                        release(k_empty, st)
+                        softmax(False)
+                        W.wait(0, (o_acc, PV.num_acc))
+                        release(v_empty, pst)
+
+                    if persistent:  # every QK^T of this tile has retired: the next Q may load
+                        release(q_empty, 0)
+                    lst, lph = stage_phase(kv_base + n_blocks - 1)
+                    rescale_o()
+                    v_full.wait(lst, lph)
+                    pv_chain(lst)
                     W.wait(0, (o_acc, PV.num_acc))
-                    release(v_empty, pst)
+                    release(v_empty, lst)
+                    epilogue()
 
-                lst, lph = stage_phase(n_blocks - 1)
-                rescale_o()
-                v_full.wait(lst, lph)
-                pv_chain(lst)
-                W.wait(0, (o_acc, PV.num_acc))
-                release(v_empty, lst)
+                def epilogue():
+                    # quad-reduce l, normalize, store the rows inside the sequence
+                    for h in range(2):
+                        for d in (1, 2):
+                            txl.assign(
+                                l_run[h],
+                                l_run[h] + T.cuda.__shfl_xor_sync(T.uint32(FULL), l_run[h], d, 32),
+                            )
+                        txl.assign(alpha[h], T.float32(1.0) / l_run[h])
+                    row0 = m_blk * BM + cw * 64  # this warpgroup's first Q row in the sequence
+                    with txl.if_(row0 + 64 <= seq_len):
+                        # Whole 64 rows inside the sequence: stmatrix into this warpgroup's own 64-row
+                        # slice of the staging tile, then one TMA store per 64-column atom. Single tile:
+                        # the slice is the Q tile's, which only this warpgroup reads and whose last
+                        # QK^T has retired. Persistent: the O tile, once this warpgroup's previous
+                        # store has read it. A ragged tile's tail rows belong to the next sequence, so
+                        # partial tiles take the masked direct path below.
+                        with txl.then_():
+                            if persistent:
+                                with txl.if_(tw == 0), txl.then_():
+                                    txl.ptx.cp.async_.bulk.wait_group.read(0)
+                                txl.ptx["bar.sync"](
+                                    txl.cast(epi[0].barrier_id + cw, "uint32"), txl.uint32(128)
+                                )
+                            lane = tw & 31
+                            mat = lane >> 3
+                            srow = (tw >> 5) * 16 + (mat & 1) * 8 + (lane & 7)
+                            words = txl.alloc_local([4], "uint32")
+                            for p in range(PV.num_acc // 8):  # two 8-column chunks per stmatrix.x4
+                                for hh in range(2):
+                                    r = (2 * p + hh) * 4
+                                    txl.ptx["cvt.rn.bf16x2.f32"](
+                                        words[2 * hh], o_acc[r + 1] * alpha[0], o_acc[r] * alpha[0]
+                                    )
+                                    txl.ptx["cvt.rn.bf16x2.f32"](
+                                        words[2 * hh + 1],
+                                        o_acc[r + 3] * alpha[1],
+                                        o_acc[r + 2] * alpha[1],
+                                    )
+                                col = (2 * p + (mat >> 1)) * 8
+                                # 128B swizzle of 16-byte chunks
+                                chunk = ((col & 63) >> 3) ^ (srow & 7)
+                                txl.ptx[STMATRIX_X4](
+                                    o_s.ptr_to([(col >> 6) * BM * E + (cw * 64 + srow) * E + chunk * 8]),
+                                    words[0], words[1], words[2], words[3],
+                                )  # fmt: skip
+                            txl.ptx.fence.proxy.async_.shared__cta()
+                            txl.ptx["bar.sync"](
+                                txl.cast(epi[0].barrier_id + cw, "uint32"), txl.uint32(128)
+                            )
+                            with txl.if_(tw == 0), txl.then_():
+                                for a in range(HEAD_DIM // E):
+                                    txl.ptx[TMA3D_STORE](
+                                        txl.address_of(O_map),
+                                        txl.int32(a * E),
+                                        head,
+                                        seq0 + row0,
+                                        o_s.ptr_to([a * BM * E + cw * 64 * E]),
+                                    )
+                                txl.ptx.cp.async_.bulk.commit_group()
+                                if not persistent:
+                                    # shared memory outlives the read
+                                    txl.ptx.cp.async_.bulk.wait_group.read(0)
+                        with txl.else_():
+                            packed = txl.local_scalar("uint32")
+                            for r in range(0, PV.num_acc, 2):
+                                row, col = W.acc_coord(tw, r)
+                                q_row = row0 + row
+                                h = (r % 4) // 2
+                                with txl.if_(q_row < seq_len), txl.then_():
+                                    txl.ptx["cvt.rn.bf16x2.f32"](
+                                        packed, o_acc[r + 1] * alpha[h], o_acc[r] * alpha[h]
+                                    )
+                                    off = (
+                                        txl.cast(seq0 + q_row, "int64") * H + head
+                                    ) * HEAD_DIM + col
+                                    txl.ptx["st.global.b32"](O.ptr_to([off]), packed)
 
-                # epilogue: quad-reduce l, normalize, store the rows inside the sequence
-                for h in range(2):
-                    for d in (1, 2):
-                        txl.assign(
-                            l_run[h],
-                            l_run[h] + T.cuda.__shfl_xor_sync(T.uint32(FULL), l_run[h], d, 32),
-                        )
-                    txl.assign(alpha[h], T.float32(1.0) / l_run[h])
-                row0 = m_blk * BM + cw * 64  # this warpgroup's first Q row in the sequence
-                with txl.if_(row0 + 64 <= seq_len):
-                    # Whole 64 rows inside the sequence: stmatrix into this warpgroup's own 64-row slice
-                    # of the Q tile (only it reads those rows, and its last QK^T has retired), then one
-                    # TMA store per 64-column atom. A ragged tile's tail rows belong to the next
-                    # sequence, so partial tiles take the masked direct path below.
-                    with txl.then_():
-                        lane = tw & 31
-                        mat = lane >> 3
-                        srow = (tw >> 5) * 16 + (mat & 1) * 8 + (lane & 7)
-                        words = txl.alloc_local([4], "uint32")
-                        for p in range(PV.num_acc // 8):  # two 8-column chunks per stmatrix.x4
-                            for hh in range(2):
-                                r = (2 * p + hh) * 4
-                                txl.ptx["cvt.rn.bf16x2.f32"](
-                                    words[2 * hh], o_acc[r + 1] * alpha[0], o_acc[r] * alpha[0]
-                                )
-                                txl.ptx["cvt.rn.bf16x2.f32"](
-                                    words[2 * hh + 1],
-                                    o_acc[r + 3] * alpha[1],
-                                    o_acc[r + 2] * alpha[1],
-                                )
-                            col = (2 * p + (mat >> 1)) * 8
-                            chunk = ((col & 63) >> 3) ^ (srow & 7)  # 128B swizzle of 16-byte chunks
-                            txl.ptx[STMATRIX_X4](
-                                q_s.ptr_to([(col >> 6) * BM * E + (cw * 64 + srow) * E + chunk * 8]),
-                                words[0], words[1], words[2], words[3],
-                            )  # fmt: skip
-                        txl.ptx.fence.proxy.async_.shared__cta()
-                        txl.ptx["bar.sync"](
-                            txl.cast(epi[0].barrier_id + cw, "uint32"), txl.uint32(128)
-                        )
-                        with txl.if_(tw == 0), txl.then_():
-                            for a in range(HEAD_DIM // E):
-                                txl.ptx[TMA3D_STORE](
-                                    txl.address_of(O_map),
-                                    txl.int32(a * E),
-                                    head,
-                                    seq0 + row0,
-                                    q_s.ptr_to([a * BM * E + cw * 64 * E]),
-                                )
-                            txl.ptx.cp.async_.bulk.commit_group()
-                            txl.ptx.cp.async_.bulk.wait_group.read(
-                                0
-                            )  # shared memory outlives the read
-                    with txl.else_():
-                        packed = txl.local_scalar("uint32")
-                        for r in range(0, PV.num_acc, 2):
-                            row, col = W.acc_coord(tw, r)
-                            q_row = row0 + row
-                            h = (r % 4) // 2
-                            with txl.if_(q_row < seq_len), txl.then_():
-                                txl.ptx["cvt.rn.bf16x2.f32"](
-                                    packed, o_acc[r + 1] * alpha[h], o_acc[r] * alpha[h]
-                                )
-                                off = (txl.cast(seq0 + q_row, "int64") * H + head) * HEAD_DIM + col
-                                txl.ptx["st.global.b32"](O.ptr_to([off]), packed)
+                for_each_tile(consume)
+                if persistent:
+                    with txl.if_(tw == 0), txl.then_():
+                        # shared memory outlives the last read
+                        txl.ptx.cp.async_.bulk.wait_group.read(0)
 
     return fa3_forward_sm90
 
@@ -450,7 +560,7 @@ def _tensor_map(t, box_rows):
 
 
 def tile_table(seq_lens, num_heads, causal, device="cuda"):
-    """(sequence, head, Q block) per CTA, in launch order.
+    """(sequence, head, Q block) per CTA, in launch order, for the one-tile-per-CTA grid.
 
     The Q blocks of one (sequence, head) are consecutive, so the CTAs in flight share a few heads'
     K/V in L2. With heads innermost, about a hundred 2 MB K/V streams thrashed the 50 MB L2. Causal
@@ -464,8 +574,34 @@ def tile_table(seq_lens, num_heads, causal, device="cuda"):
     return torch.tensor(tiles, dtype=torch.int32, device=device).view(-1), len(tiles)
 
 
-def get_kernel(num_heads=None, causal=False, *, backend_config=None, pingpong=None, **kwargs):
-    return make_kernel(num_heads, causal, backend_config=backend_config, pingpong=pingpong).func
+def work_lists(seq_lens, num_heads, causal, num_ctas):
+    """Per-CTA tile lists for the persistent grid: FlashInfer's ``PrefillSM90Plan``.
+
+    Heads outer, sequences by length descending, Q blocks descending; each tile goes to the CTA with
+    the least work so far, at cost ``2 * BM + kv_len`` (kv_len is the tile's causal KV extent). Each
+    CTA runs its list in order, so the CTAs' first tiles are the longest and the tiles in flight
+    still cover a few heads at a time (L2 locality as in ``tile_table``).
+    """
+    heap = [(0, c) for c in range(num_ctas)]
+    lists = [[] for _ in range(num_ctas)]
+    for h in range(num_heads):
+        for b in sorted(range(len(seq_lens)), key=lambda b: -seq_lens[b]):
+            n = seq_lens[b]
+            nq = (n + BM - 1) // BM
+            for m in reversed(range(nq)):
+                kv_len = n if (not causal or m + 1 == nq) else (m + 1) * BM
+                cost, c = heapq.heappop(heap)
+                heapq.heappush(heap, (cost + 2 * BM + kv_len, c))
+                lists[c].append((b, h, m))
+    return lists
+
+
+def get_kernel(
+    num_heads=None, causal=False, *, backend_config=None, pingpong=None, persistent=None, **kwargs
+):
+    return make_kernel(
+        num_heads, causal, backend_config=backend_config, pingpong=pingpong, persistent=persistent
+    ).func
 
 
 class Launcher:
@@ -475,9 +611,16 @@ class Launcher:
     workload receives a GPU.
     """
 
-    def __init__(self, num_heads, causal, *, backend_config=None, pingpong=None):
+    def __init__(self, num_heads, causal, *, backend_config=None, pingpong=None, persistent=None):
+        self.persistent = causal if persistent is None else persistent
         self.ex = compile_kernel(
-            get_kernel(num_heads, causal, backend_config=backend_config, pingpong=pingpong),
+            get_kernel(
+                num_heads,
+                causal,
+                backend_config=backend_config,
+                pingpong=pingpong,
+                persistent=self.persistent,
+            ),
             backend_config=backend_config,
         )
         self.num_heads, self.causal = num_heads, causal
@@ -491,14 +634,29 @@ class Launcher:
         if sum(seq_lens) != q.shape[0] or q.shape[1] != self.num_heads:
             raise ValueError(f"seq_lens {seq_lens} / heads do not match q {tuple(q.shape)}")
         cu = cu_seqlens(seq_lens, q.device)
-        tiles, num_tiles = tile_table(seq_lens, self.num_heads, self.causal, q.device)
+        if self.persistent:
+            num_tiles = sum((n + BM - 1) // BM for n in seq_lens) * self.num_heads
+            num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+            lists = work_lists(seq_lens, self.num_heads, self.causal, min(num_sms, num_tiles))
+            ptr = [0]
+            for lst in lists:
+                ptr.append(ptr[-1] + len(lst))
+            tiles = torch.tensor(
+                [t for lst in lists for t in lst], dtype=torch.int32, device=q.device
+            ).view(-1)
+            work_ptr = torch.tensor(ptr, dtype=torch.int32, device=q.device)
+            num_ctas = len(lists)
+        else:
+            tiles, num_ctas = tile_table(seq_lens, self.num_heads, self.causal, q.device)
+            work_ptr = torch.zeros(1, dtype=torch.int32, device=q.device)  # unused
         maps = (_tensor_map(q, BM), _tensor_map(k, BN), _tensor_map(v, BN), _tensor_map(o, 64))
-        args = (*[mp.ptr for mp in maps], o.view(-1), cu, tiles, num_tiles)
+        args = (*[mp.ptr for mp in maps], o.view(-1), cu, tiles, work_ptr, num_ctas)
 
         def run():
             self.ex(*args)
 
-        run.keepalive = (maps, cu, tiles)  # the host tensor maps and metadata outlive the closure
+        # the host tensor maps and metadata outlive the closure
+        run.keepalive = (maps, cu, tiles, work_ptr)
         return run
 
 
