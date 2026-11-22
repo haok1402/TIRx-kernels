@@ -1,7 +1,7 @@
 # SM90 FlashAttention-3 backward (hd128 bf16 MHA) against flash_attn_3's three kernels: the
 # benchmark_attn.py-style 16k-token sweep (16 heads of 128), causal and non-causal.
 kernel: flash_attention3_backward_sm90
-selection_rationale: The defaults bracket the sequence range and both schedulers - a short non-causal shape (s512, many 80-row m-blocks per CTA), the mid-range causal shape (s4096, LPT scheduler), and the longest non-causal shape (s16384). The other points interpolate and stay available but off by default.
+selection_rationale: The defaults bracket the sequence range and both schedulers and both epilogues - a short MHA non-causal shape (s512, many 80-row m-blocks per CTA), the Llama-3 8B GQA causal shape at s4096 (LPT scheduler, fp32 dK/dV reduce + convert), and the longest MHA non-causal shape (s16384). The other points interpolate and stay available but off by default.
 configs:
   - {config: bench_b32_sq512_sk512_h16_d128_noncausal, default: true, selection_role: small}
   - {config: bench_b32_sq512_sk512_h16_d128_causal, default: false}
@@ -10,8 +10,15 @@ configs:
   - {config: bench_b8_sq2048_sk2048_h16_d128_noncausal, default: false}
   - {config: bench_b8_sq2048_sk2048_h16_d128_causal, default: false}
   - {config: bench_b4_sq4096_sk4096_h16_d128_noncausal, default: false}
-  - {config: bench_b4_sq4096_sk4096_h16_d128_causal, default: true, selection_role: medium}
+  - {config: bench_b4_sq4096_sk4096_h16_d128_causal, default: false}
   - {config: bench_b2_sq8192_sk8192_h16_d128_noncausal, default: false}
   - {config: bench_b2_sq8192_sk8192_h16_d128_causal, default: false}
   - {config: bench_b1_sq16384_sk16384_h16_d128_noncausal, default: true, selection_role: large}
   - {config: bench_b1_sq16384_sk16384_h16_d128_causal, default: false}
+  # GQA (upstream's CollectiveEpilogueBwdGQA path): Llama-3 8B attention, 32 query / 8 KV heads of 128.
+  - {config: bench_b16_sq1024_sk1024_h32_hk8_d128_noncausal, default: false}
+  - {config: bench_b16_sq1024_sk1024_h32_hk8_d128_causal, default: false}
+  - {config: bench_b4_sq4096_sk4096_h32_hk8_d128_noncausal, default: false}
+  - {config: bench_b4_sq4096_sk4096_h32_hk8_d128_causal, default: true, selection_role: medium}
+  - {config: bench_b2_sq8192_sk8192_h32_hk8_d128_noncausal, default: false}
+  - {config: bench_b2_sq8192_sk8192_h32_hk8_d128_causal, default: false}
