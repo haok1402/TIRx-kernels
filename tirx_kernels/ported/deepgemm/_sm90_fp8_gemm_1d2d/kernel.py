@@ -57,12 +57,9 @@ def _u32(x):
 
 
 def _wait(barrier_ptr, phase):
-    """`ClusterTransactionBarrier::wait`: try_wait.parity with the suspend hint, retried."""
-    done = txl.local_scalar("uint32", init=txl.uint32(0))
-    with txl.while_(done == txl.uint32(0)):
-        txl.ptx["mbarrier.try_wait.parity.shared::cta.b64"](
-            done, barrier_ptr, _u32(phase), txl.uint32(TRY_WAIT_TICKS)
-        )
+    """`ClusterTransactionBarrier::wait` (`cutlass/arch/barrier.h:408-421`): one asm retry loop around
+    `mbarrier.try_wait.parity.shared::cta.b64` with the 0x989680 suspend hint."""
+    txl.cuda.mbarrier_wait_parity(barrier_ptr, _u32(phase), TRY_WAIT_TICKS)
 
 
 class _Scheduler:
@@ -103,13 +100,10 @@ class _Scheduler:
             )
 
     def _layout_at(self, index):
-        # A signed destination (the source's `int` load emits `ld.global.u32`, the same 32-bit
-        # load): reading into a uint32 and casting lets TIRx's arithmetic analysis assume the
-        # value is non-negative and delete the `>= 0` skip test and the `max(., 0)` clamp
-        # (sm90-probe ISSUE-011).
-        value = txl.local_scalar("int32")
-        txl.ptx["ld.global.s32"](value, self.gl.ptr_to([index]))
-        return value
+        # The source's `int` load emits `ld.global.u32`; the bits are reinterpreted as int32.
+        raw = txl.local_scalar("uint32")
+        txl.ptx["ld.global.u32"](raw, self.gl.ptr_to([index]))
+        return txl.local_scalar("int32", init=txl.cast(raw, "int32"))
 
     def _swizzle(self, block_idx):
         """`get_swizzled_block_idx`, SM90 branch (with the unaligned-multicast fix)."""
@@ -269,6 +263,14 @@ class _Scheduler:
         return m_offset + m_block_idx * bm < self.current_psum_m
 
 
+def _with_source_fp_mode(backend_config):
+    """DeepGEMM's JIT builds without fast math: `fp_mode="precise"` (no FTZ, IEEE div/sqrt, FMA
+    contraction on), on the kernel so it composes with a caller's other CUDA settings."""
+    config = {key: dict(value) for key, value in (backend_config or {}).items()}
+    config.setdefault("cuda", {})["fp_mode"] = "precise"
+    return config
+
+
 def build_kernel(spec: KernelSpec, *, backend_config=None):
     """The TIRx `PrimFunc` for one `sm90_fp8_gemm_1d2d_impl` template instantiation."""
     BM, BN, BK = spec.block_m, spec.block_n, spec.block_k
@@ -294,8 +296,8 @@ def build_kernel(spec: KernelSpec, *, backend_config=None):
     gcd = math.gcd(BK, BN)
     should_optimize = BK // gcd <= 4 and not uniform_sfb
     k_gap, k_end = gcd // 8, (BK // 8 if should_optimize else 0)
-    # Non-uniform B scales without the dispatch use the runtime predicate (`.cuh:342`); its emitted
-    # form (one select shared by i = 0 and 1) relies on `num_former_iters` being even.
+    # Non-uniform B scales without the dispatch use the runtime predicate (`.cuh:342`), checked
+    # against the source at BLOCK_N 48 and 112.
     runtime_predicate = not uniform_sfb and not should_optimize
     if runtime_predicate and BN not in (48, 112):
         raise NotImplementedError(f"runtime-predicate promotion at BLOCK_N = {BN} is not ported")
@@ -331,7 +333,7 @@ def build_kernel(spec: KernelSpec, *, backend_config=None):
                 grid=spec.num_sms, block=num_threads, cluster=(mc,) if mc > 1 else None
             ),
             kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1),
-            backend_config=backend_config,
+            backend_config=_with_source_fp_mode(backend_config),
         )
         del shape_n_arg, shape_k_arg  # SHAPE_N / SHAPE_K are compiled in (`.cuh:72-74`)
 
@@ -585,32 +587,28 @@ def _producer(spec, *, sched_args, smem, maps, full, empty, stage_idx, phase, ad
 
 def _promote_runtime_predicate(final_accum, accum, scale, base, num_accum, num_former_iters):
     """Promotion with the runtime predicate `i < num_former_iters` (`.cuh:333-346`), in the form nvcc
-    emits for the source: the select is factored out of the products,
+    emits for the source: the B-scale select is factored out of the products,
     `(p ? sa*sb0 : sa*sb1) == sa*(p ? sb0 : sb1)` bit for bit, and since `num_former_iters` is even for
     BLOCK_N 48/112, i = 0 and i = 1 share one select and product pair under `num_former_iters != 0`.
-    The products are explicit non-FTZ PTX, so the sharing is written out here."""
-    groups = num_accum // 4
+    Written out here because this compile path does not factor the source's form on its own."""
 
-    def products(pred):
-        sb = txl.local_scalar("float32", init=txl.select(pred, scale[2], scale[3]))
-        lo = txl.local_scalar("float32")
-        hi = txl.local_scalar("float32")
-        txl.ptx["mul.f32"](lo, scale[0], sb)
-        txl.ptx["mul.f32"](hi, scale[1], sb)
+    def products(predicate):
+        sb = txl.local_scalar("float32", init=txl.select(predicate, scale[2], scale[3]))
+        lo = txl.local_scalar("float32", init=scale[0] * sb)
+        hi = txl.local_scalar("float32", init=scale[1] * sb)
         return lo, hi
 
-    def fma4(i, lo, hi):
+    def promote(i, lo, hi):
         for j, s in ((0, lo), (1, lo), (2, hi), (3, hi)):
-            txl.ptx["fma.rn.f32"](
-                final_accum[base + 4 * i + j], s, accum[4 * i + j], final_accum[base + 4 * i + j]
-            )
+            idx = base + 4 * i + j
+            txl.assign(final_accum[idx], final_accum[idx] + s * accum[4 * i + j])
 
     lo, hi = products(num_former_iters != txl.uint32(0))
-    fma4(0, lo, hi)
-    fma4(1, lo, hi)
-    for i in range(2, groups):
+    promote(0, lo, hi)
+    promote(1, lo, hi)
+    for i in range(2, num_accum // 4):
         lo, hi = products(txl.uint32(i) < num_former_iters)
-        fma4(i, lo, hi)
+        promote(i, lo, hi)
 
 
 def _math(
@@ -725,25 +723,19 @@ def _math(
                 txl.ptx.wgmma.wait_group.sync.aligned(0)
                 if local_idx == num_waves - 1:
                     empty_barrier_arrive()
-                # Plain (non-FTZ) `mul.f32` / `fma.rn.f32`, as the source compiles them: written as
-                # PTX so the result does not depend on the backend's fast-math setting.
-                # Only the products this copy's (constant) predicate selects: the source compiler
-                # drops the others, e.g. scale_x_0 in the `num_former_iters == 0` copy.
+                # `scale_0_0 = scale_a_0 * scale_b_0` ... (`.cuh:333-336`); the backend's precise FP
+                # mode keeps them non-FTZ `mul.f32` / `fma.rn.f32`, as the source compiles them.
+                txl.assign(scale[4], scale[0] * scale[2])
+                txl.assign(scale[5], scale[1] * scale[2])
+                if not uniform_sfb:
+                    txl.assign(scale[6], scale[0] * scale[3])
+                    txl.assign(scale[7], scale[1] * scale[3])
                 base = num_accum * local_idx
                 if runtime_former_iters is not None:
                     _promote_runtime_predicate(
                         final_accum, accum, scale, base, num_accum, runtime_former_iters
                     )
                 else:
-                    groups = num_accum // 4
-                    uses_former = uniform_sfb or former_iters > 0
-                    uses_latter = not uniform_sfb and former_iters < groups
-                    if uses_former:
-                        txl.ptx["mul.f32"](scale[4], scale[0], scale[2])
-                        txl.ptx["mul.f32"](scale[5], scale[1], scale[2])
-                    if uses_latter:
-                        txl.ptx["mul.f32"](scale[6], scale[0], scale[3])
-                        txl.ptx["mul.f32"](scale[7], scale[1], scale[3])
                     for i in range(num_accum // 4):
                         # `predicate ? scale_x_0 : scale_x_1` with `i < num_former_iters` pinned to a
                         # constant by the dispatch branch this copy sits in (`.cuh:342`).
@@ -751,12 +743,8 @@ def _math(
                         lo = scale[4] if former else scale[6]
                         hi = scale[5] if former else scale[7]
                         for j, s in ((0, lo), (1, lo), (2, hi), (3, hi)):
-                            txl.ptx["fma.rn.f32"](
-                                final_accum[base + 4 * i + j],
-                                s,
-                                accum[4 * i + j],
-                                final_accum[base + 4 * i + j],
-                            )
+                            idx = base + 4 * i + j
+                            txl.assign(final_accum[idx], final_accum[idx] + s * accum[4 * i + j])
             advance()
 
     sched.next()
