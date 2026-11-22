@@ -49,19 +49,34 @@ def _case(num_groups, expected_m_per_group, n, k, *, max_m=4096, seed=0) -> dict
     }
 
 
+def _edge(label, num_groups, expected_m_per_group, n, k, group_ms, *, seed=0) -> dict:
+    case = _case(num_groups, expected_m_per_group, n, k, seed=seed)
+    case.update(label=f"edge_{label}", group_ms=tuple(group_ms))
+    return case
+
+
 CONFIGS = [
-    _case(g, m, n, k, seed=i)
-    for i, ((g, m), (n, k)) in enumerate([(gm, nk) for gm in _GROUPS for nk in _NK], start=1)
+    *[
+        _case(g, m, n, k, seed=i)
+        for i, ((g, m), (n, k)) in enumerate([(gm, nk) for gm in _GROUPS for nk in _NK], start=1)
+    ],
+    # Edge shapes: empty groups (the scheduler skips them), a full `max_m` group, one row, and
+    # row counts that are not BLOCK_M multiples (partial and fully invalid WGMMA row bands).
+    _edge("empty_one_full", 4, 300, 4096, 4096, (0, 1, 4096, 777), seed=51),
+    _edge("mostly_empty", 8, 20, 4096, 4096, (0, 0, 0, 5, 0, 0, 0, 0), seed=52),
+    _edge("odd_m_blocks", 6, 1024, 4096, 7168, (64, 100, 129, 1000, 1200, 900), seed=53),
 ]
 
 
-def make_desc(*, num_groups, expected_m_per_group, N, K, max_m=4096, seed=0, num_sms=None):
+def make_desc(
+    *, num_groups, expected_m_per_group, N, K, max_m=4096, seed=0, group_ms=None, num_sms=None
+):
     """The descriptor `sm90_m_grouped_fp8_gemm_masked_1d2d` builds."""
     from tirx_kernels.runner import hardware_num_sms
 
     from ._sm90_fp8_gemm_1d2d.spec import GemmDesc, GemmType
 
-    del seed
+    del seed, group_ms
     if num_sms is None:
         num_sms = hardware_num_sms()
     return GemmDesc(

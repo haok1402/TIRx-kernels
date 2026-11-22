@@ -57,6 +57,27 @@ def _case(num_groups, expected_m_per_group, n, k, *, use_psum=False, seed=0) -> 
 _MASKED_GROUPS = [(32, 192), (6, 1024), (32, 20), (6, 20)]
 
 
+def _edge(
+    label,
+    num_groups,
+    expected_m_per_group,
+    n,
+    k,
+    group_ms,
+    *,
+    psum=False,
+    from_masked=False,
+    seed=0,
+):
+    case = (_from_masked_case if from_masked else _case)(
+        num_groups, expected_m_per_group, n, k, seed=seed
+    )
+    if psum:
+        case["use_psum_layout"] = True
+    case.update(label=f"edge_{label}", group_ms=tuple(group_ms))
+    return case
+
+
 def _from_masked_case(num_groups, expected_m_per_group, n, k, *, seed=0) -> dict:
     return {
         "label": f"g{num_groups}_m{expected_m_per_group}_n{n}_k{k}_psum_from_masked",
@@ -82,6 +103,25 @@ CONFIGS = [
         _from_masked_case(g, m, n, k, seed=100 + i)
         for i, ((g, m), (n, k)) in enumerate([(gm, nk) for gm in _MASKED_GROUPS for nk in _NK])
     ],
+    # Edge shapes: an empty expert, one-row and near-full experts (partial and fully padded
+    # 64-row bands, skipped by `is_computation_valid`), odd M/N block counts (the multicast
+    # tail fix and `is_peer_cta_alive`), and empty PSUM groups.
+    _edge("zero_one_full", 6, 2500, 4096, 4096, (0, 1, 127, 300, 6000, 9000), seed=61),
+    _edge(
+        "zero_one_full_psum", 6, 2500, 4096, 4096, (0, 1, 127, 300, 6000, 9000), psum=True, seed=62
+    ),
+    _edge("odd_blocks", 4, 1300, 4032, 7168, (64, 100, 128, 5000), seed=63),
+    _edge("odd_m_blocks_psum", 4, 1300, 4096, 7168, (64, 100, 128, 5000), psum=True, seed=64),
+    _edge(
+        "empty_groups_psum_from_masked",
+        4,
+        300,
+        4096,
+        4096,
+        (0, 1, 300, 0),
+        from_masked=True,
+        seed=65,
+    ),
 ]
 
 
@@ -95,6 +135,7 @@ def make_desc(
     from_masked=False,
     max_m=4096,
     seed=0,
+    group_ms=None,
     num_sms=None,
 ):
     """The descriptor `sm90_m_grouped_fp8_gemm_contiguous_1d2d` builds.
@@ -124,7 +165,8 @@ def make_desc(
             expected_num_groups=num_groups,
         )
     m = sum(
-        align_up(x, MK_ALIGNMENT) for x in make_actual_ms(num_groups, expected_m_per_group, seed)
+        align_up(x, MK_ALIGNMENT)
+        for x in (group_ms or make_actual_ms(num_groups, expected_m_per_group, seed))
     )
     return GemmDesc(
         GemmType.M_GROUPED_CONTIGUOUS_WITH_PSUM_LAYOUT

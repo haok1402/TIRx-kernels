@@ -95,13 +95,16 @@ def prepare_m_grouped_contiguous(
     K: int,
     use_psum_layout: bool = False,
     seed: int = 0,
+    group_ms: tuple | None = None,
 ) -> dict:
     """Mirror `generators.generate_m_grouped_contiguous` (K-major A and B, FP8 x FP8)."""
     import torch
 
     require_sm90()
     torch.manual_seed(seed)
-    actual_ms = make_actual_ms(num_groups, expected_m_per_group, seed)
+    actual_ms = (
+        list(group_ms) if group_ms else make_actual_ms(num_groups, expected_m_per_group, seed)
+    )
     aligned_ms = [align_up(m, MK_ALIGNMENT) for m in actual_ms]
     M = sum(aligned_ms)
 
@@ -142,7 +145,14 @@ def prepare_m_grouped_contiguous(
 
 
 def prepare_m_grouped_contiguous_psum_from_masked(
-    *, num_groups: int, expected_m_per_group: int, N: int, K: int, max_m: int = 4096, seed: int = 0
+    *,
+    num_groups: int,
+    expected_m_per_group: int,
+    N: int,
+    K: int,
+    max_m: int = 4096,
+    seed: int = 0,
+    group_ms: tuple | None = None,
 ) -> dict:
     """The PSUM half of `test_m_grouped_gemm_masked`: masked operands packed by
     `generators.layout_masked_to_psum` into one `[num_groups * max_m, K]` PSUM-layout A.
@@ -157,7 +167,7 @@ def prepare_m_grouped_contiguous_psum_from_masked(
     torch.manual_seed(seed)
     a_bf16 = torch.randn((num_groups, max_m, K), device="cuda", dtype=torch.bfloat16)
     b_bf16 = torch.randn((num_groups, N, K), device="cuda", dtype=torch.bfloat16)
-    counts = make_actual_ms(num_groups, expected_m_per_group, seed)
+    counts = list(group_ms) if group_ms else make_actual_ms(num_groups, expected_m_per_group, seed)
     if max(counts) > max_m:
         raise ValueError(f"masked_m {max(counts)} exceeds max_m {max_m}")
     psum = []
@@ -195,7 +205,14 @@ def prepare_m_grouped_contiguous_psum_from_masked(
 
 
 def prepare_m_grouped_masked(
-    *, num_groups: int, expected_m_per_group: int, N: int, K: int, max_m: int = 4096, seed: int = 0
+    *,
+    num_groups: int,
+    expected_m_per_group: int,
+    N: int,
+    K: int,
+    max_m: int = 4096,
+    seed: int = 0,
+    group_ms: tuple | None = None,
 ) -> dict:
     """Mirror `generators.generate_m_grouped_masked` (no psum layout)."""
     import torch
@@ -204,7 +221,7 @@ def prepare_m_grouped_masked(
     torch.manual_seed(seed)
     a_bf16 = torch.randn((num_groups, max_m, K), device="cuda", dtype=torch.bfloat16)
     b_bf16 = torch.randn((num_groups, N, K), device="cuda", dtype=torch.bfloat16)
-    counts = make_actual_ms(num_groups, expected_m_per_group, seed)
+    counts = list(group_ms) if group_ms else make_actual_ms(num_groups, expected_m_per_group, seed)
     if max(counts) > max_m:
         raise ValueError(f"masked_m {max(counts)} exceeds max_m {max_m}")
     masked_m = torch.tensor(counts, device="cuda", dtype=torch.int32)
