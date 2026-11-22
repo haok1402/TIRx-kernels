@@ -552,19 +552,22 @@ def _reduce_and_store(
     for v, vo in ((v_0, v_offsets[0]), (v_1, v_offsets[1])):
         col = kv_offset + vo
         index = q_offset + txl.cast(kv_offset, "uint64") + txl.cast(vo, "uint64")
-
-        def store(idx, v=v):
-            ptr = logits.ptr_to([txl.cast(idx, "int64")])
-            if is_bf16:
-                bits = txl.local_scalar("uint16")
+        if is_compressed:
+            index = index - txl.cast(ks, "uint64")
+        # The compressed store is predicated (`@p st.global`) rather than branched around: nvrtc
+        # sinks the address chain into a guarded region, and ptxas then keeps the branch instead
+        # of the predicated store the source's SASS has.
+        pred = txl.And(ks <= col, col < ke) if is_compressed else None
+        ptr = logits.ptr_to([txl.cast(index, "int64")])
+        if is_bf16:
+            bits = txl.local_scalar("uint16", init=txl.uint16(0))
+            if pred is None:
                 txl.ptx.cvt.rn.bf16.f32(bits, v)
                 txl.ptx["st.global.u16"](ptr, bits)
             else:
-                txl.ptx["st.global.f32"](ptr, v)
-
-        if is_compressed:
-            with txl.if_(txl.And(ks <= col, col < ke)):
-                with txl.then_():
-                    store(index - txl.cast(ks, "uint64"))
+                txl.ptx.cvt.rn.bf16.f32(bits, v, pred=pred, preserve_dst=True)
+                txl.ptx["st.global.u16"](ptr, bits, pred=pred)
+        elif pred is None:
+            txl.ptx["st.global.f32"](ptr, v)
         else:
-            store(index)
+            txl.ptx["st.global.f32"](ptr, v, pred=pred)
