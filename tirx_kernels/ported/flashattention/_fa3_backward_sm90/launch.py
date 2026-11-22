@@ -179,6 +179,7 @@ def _args(p, ours):
         ours["dq_accum"].reshape(-1),
         ours["dq_semaphore"].reshape(-1),
         s_q,
+        d,
         h,
         b,
     )
@@ -201,14 +202,16 @@ def _args(p, ours):
         ours["dv"].reshape(-1),
         s_q,
         s_k,
+        d,
         h,
         b,
+        0 if p["is_causal"] else -1,  # window_size_right as mha_bwd sets it
         f32(p["softmax_scale"]),
         scale_log2(p["softmax_scale"]),
         *sched,
         *(m.ptr for m in maps),
     )
-    post_args = (ours["dq_accum"].reshape(-1), ours["dq"].reshape(-1), s_q, h, b, f32(p["softmax_scale"]))
+    post_args = (ours["dq_accum"].reshape(-1), ours["dq"].reshape(-1), s_q, d, h, b, f32(p["softmax_scale"]))
     cache[key] = (maps, pre_args, main_args, post_args)
     return cache[key]
 
@@ -223,4 +226,4 @@ def launch_backward(ex: Executables, p, ours) -> None:
 
 def launch_postprocess(ex: Executables, p, dq_accum, dq) -> None:
     """The dQ convert alone, on a given accumulator."""
-    ex.post.mod(dq_accum.reshape(-1), dq.reshape(-1), p["s_q"], p["h"], p["b"], f32(p["softmax_scale"]))
+    ex.post.mod(dq_accum.reshape(-1), dq.reshape(-1), p["s_q"], p["d"], p["h"], p["b"], f32(p["softmax_scale"]))

@@ -72,9 +72,8 @@ def prepare(
     dout = torch.randn(b, seqlen_q, h, d, device=dev, dtype=torch.bfloat16, generator=gen)
     scale = 1.0 / math.sqrt(d)
     out, lse, *_ = fa3.fwd(
-        q, k, v, None, None, None, None, None, None, None, None, None, None, None, None, None,
-        None, None, None, None, None, None, scale, is_causal, -1, 0 if is_causal else -1, 0,
-        0.0, True, None, 1, None, 0,
+        q, k, v, softmax_scale=scale, is_causal=is_causal, window_size_left=-1,
+        window_size_right=0 if is_causal else -1, num_splits=1,
     )
     bm, bn = block_m(d, is_causal), block_n(d)
     return {
@@ -96,8 +95,8 @@ def run_fa3(p, dq=None, dk=None, dv=None):
     dv = torch.empty_like(p["v"]) if dv is None else dv
     softmax_d, lse_log2, dq_accum, _, _ = fa3.bwd(
         p["dout"], p["q"], p["k"], p["v"], p["out"], p["lse"], dq, dk, dv,
-        None, None, None, None, None, None, p["softmax_scale"], p["is_causal"],
-        -1, 0 if p["is_causal"] else -1, 0.0, False, 0,
+        softmax_scale=p["softmax_scale"], is_causal=p["is_causal"], window_size_left=-1,
+        window_size_right=0 if p["is_causal"] else -1, softcap=0.0, deterministic=False, sm_margin=0,
     )
     return dq, dk, dv, softmax_d, lse_log2, dq_accum
 
