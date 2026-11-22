@@ -97,6 +97,8 @@ CONFIGS = [
         ("s4096", (4096,), 4),
         ("varlen", (1, 127, 129, 640, 1777), 3),
         ("b2_s2048", (2048, 2048), 4),
+        ("zero_len", (0, 0), 2),  # nothing to compute: no launch
+        ("zero_mixed", (0, 300, 0, 129, 0), 2),  # empty sequences own no tiles and no rows
     ]
     for causal in (False, True)
 ] + [
@@ -634,6 +636,13 @@ class Launcher:
         if sum(seq_lens) != q.shape[0] or q.shape[1] != self.num_heads:
             raise ValueError(f"seq_lens {seq_lens} / heads do not match q {tuple(q.shape)}")
         cu = cu_seqlens(seq_lens, q.device)
+        if not any(seq_lens):
+            # No rows, so no tiles: a 0-CTA grid is a launch error (and a 0-row tensor map is
+            # invalid). As FlashInfer, whose plan then holds no work, nothing is computed or written.
+            def run():
+                pass
+
+            return run
         if self.persistent:
             num_tiles = sum((n + BM - 1) // BM for n in seq_lens) * self.num_heads
             num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
@@ -681,6 +690,8 @@ def reference(q, k, v, seq_lens, causal):
     out = torch.empty(q.shape, dtype=torch.float32, device=q.device)
     start = 0
     for n in seq_lens:
+        if n == 0:
+            continue
         qs, ks, vs = (x[start : start + n].transpose(0, 1).float() for x in (q, k, v))
         out[start : start + n] = torch.nn.functional.scaled_dot_product_attention(
             qs, ks, vs, is_causal=causal
