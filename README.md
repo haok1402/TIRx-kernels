@@ -152,6 +152,8 @@ Grouped by the FlashInfer Python entry point each port backs.
   [`sparse_flashmla_decode_head64`](tirx_kernels/ported/flashmla/sparse_decode_head64.py)
 - **Sparse forward:**
   [`flash_mla_sparse_fwd`](tirx_kernels/ported/flashmla/flash_mla_sparse_fwd.py)
+- **Dense decode (SM90):**
+  [`flashmla_sm90_dense_decode`](tirx_kernels/ported/flashmla/dense_decode_sm90.py) ⟨sm_90a⟩
 
 ### DeepGEMM ports
 
@@ -233,7 +235,7 @@ externally managed GPU runtime dependency.
 | `flashinfer`     | all `flashinfer.*` ports, `nvfp4_gemm` and `rmsnorm` baselines | Correctness reference and optimized baseline. |
 | `flash-attn` + CUTLASS DSL | `flash_attention_backward_sm100` baseline | Current SM100 forward/backward reference. |
 | SGLang CuTeDSL kernels (vendored, + CUTLASS DSL) | `deepgemm_sm100_fp8_paged_mqa_logits` reference | `sglang_cutedsl` benchmark reference; copied into `tirx_kernels/ported/deepgemm/_sglang_cutedsl/`, no SGLang install needed. |
-| `flash_mla`      | `sparse_flashmla_*` / `flash_mla_sparse_fwd` baselines | Reference impls. |
+| `flash_mla`      | `sparse_flashmla_*` / `flash_mla_sparse_fwd` / `flashmla_sm90_dense_decode` baselines | Reference impls. |
 | `deep_ep`        | `deepep_*` correctness and baselines | Reference implementation. |
 | `flash-linear-attention` | `kda_forward_portfolio_multishape` and `kda_backward_packed` correctness | Independent FLA BF16/Triton chunk reference. |
 | `flash_kda`      | `flashkda_*` and `kda_forward_portfolio_multishape` optional baselines | Raw FlashKDA benchmark peer. |
