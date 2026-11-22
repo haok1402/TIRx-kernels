@@ -13,9 +13,11 @@ kernel modules to use.
 
 from __future__ import annotations
 
+import functools
 import importlib
 import os
 import signal
+import subprocess
 import sys
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -322,8 +324,56 @@ def cuda_is_initialized() -> bool:
     return torch_initialized or bool(_current_process_cuda_uuids())
 
 
-def hardware_num_sms(default: int = 148) -> int:
-    """Return the compile-profile SM count without touching CUDA during prepare."""
+# Run in a child process so this one never initializes the CUDA driver (CPU prepare must not, and a
+# driver initialized before a fork is unusable in the child). Prints the SM count of visible device 0.
+_SM_COUNT_PROBE = """
+import ctypes, sys
+try:
+    cuda = ctypes.CDLL("libcuda.so.1")
+except OSError:
+    sys.exit(3)
+device, value = ctypes.c_int(), ctypes.c_int()
+if cuda.cuInit(0) != 0 or cuda.cuDeviceGet(ctypes.byref(device), 0) != 0:
+    sys.exit(4)
+# CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16
+if cuda.cuDeviceGetAttribute(ctypes.byref(value), 16, device) != 0:
+    sys.exit(5)
+print(value.value)
+"""
+
+
+@functools.cache
+def _probed_num_sms(visible_devices: str | None) -> int | None:
+    """SM count of the first visible CUDA device, queried in a child process; None if none."""
+    del visible_devices  # the cache key: the child inherits this process's device visibility
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _SM_COUNT_PROBE],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        value = int(result.stdout.strip())
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def hardware_num_sms(default: int | None = None) -> int:
+    """Return the SM count kernels are specialized for, without initializing CUDA here.
+
+    In order: ``$TIRX_PREPARE_NUM_SMS``; the current device, when this process already
+    initialized CUDA; the first visible CUDA device, queried in a child process (so prepare stays
+    CUDA-free); ``default``, when a caller passes one for hardware that is not present. Otherwise
+    it raises: guessing an SM count silently mis-sizes persistent grids (a B200's 148 on a 132-SM
+    H100/H200 leaves 16 CTAs waiting for a second wave).
+    """
     configured = os.environ.get(PREPARE_NUM_SMS_ENV)
     if configured is not None:
         value = int(configured)
@@ -336,7 +386,16 @@ def hardware_num_sms(default: int = 148) -> int:
         return int(
             torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         )
-    return default
+    probed = _probed_num_sms(os.environ.get("CUDA_VISIBLE_DEVICES"))
+    if probed is not None:
+        return probed
+    if default is not None:
+        return int(default)
+    raise RuntimeError(
+        "cannot determine the SM count: no CUDA device is visible. Set "
+        f"{PREPARE_NUM_SMS_ENV} to the target GPU's SM count (e.g. 132 for H100/H200 SXM, "
+        "148 for B200)."
+    )
 
 
 def resolve_backend_config(backend_config=None, *, defaults=None, target=None):
