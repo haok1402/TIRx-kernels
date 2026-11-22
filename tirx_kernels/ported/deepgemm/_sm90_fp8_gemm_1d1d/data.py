@@ -241,13 +241,20 @@ def deepgemm_launch_k_grouped(data, *, out=None):
     return launch, (buffer, d)
 
 
-def deepgemm_launch_normal(data, *, out=None):
+def deepgemm_launch_normal(data, *, out=None, raw_scales=False):
     """`deep_gemm.fp8_fp4_gemm_nt(..., c=d, recipe=(1, 1, 128))`: the SM90 1D1D dispatch
-    (`gemm.hpp:111`, `gran_n == 1`)."""
+    (`gemm.hpp:111`, `gran_n == 1`).
+
+    By default the scales are passed already in the layout the kernel reads (`data["sfa"/"sfb"]`),
+    which `transform_sf_pair_into_required_layout` returns unchanged, so each call launches only the
+    GEMM kernel, as the TIRx launch does.  `raw_scales=True` passes the per-token K-major scales, for
+    which the entry runs a `transpose_fp32` layout kernel per call (`gemm.hpp:106`): the same result,
+    but not a like-for-like timing."""
     deep_gemm = require_deep_gemm()
     buffer, d = guarded_like(data["c"]) if out is None else out
-    a = (data["a"], data["sfa_raw"])
-    b = (data["b"], data["sfb_raw"])
+    which = "_raw" if raw_scales else ""
+    a = (data["a"], data["sfa" + which])
+    b = (data["b"], data["sfb" + which])
 
     def launch():
         deep_gemm.fp8_fp4_gemm_nt(a, b, d, c=d, recipe=RECIPE)

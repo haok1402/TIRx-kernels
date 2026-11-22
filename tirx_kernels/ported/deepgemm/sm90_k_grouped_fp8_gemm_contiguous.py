@@ -93,6 +93,9 @@ CONFIGS = [
     *_OTHER_REACHED,
     # Multicast on A with an odd N-block count (7 at BLOCK_N 104): the unaligned-multicast fix-up.
     _case(2, 2048, 728, 2048, seed=53, label="edge_onA_odd_n_blocks", group_ks=(2048, 1920)),
+    # Multicast on A over several block groups with an odd tail (29 N blocks at BLOCK_N 104: groups
+    # of 16 and 13), the runtime group-size path.
+    _case(1, 1024, 2920, 2048, seed=55, label="edge_onA_odd_multigroup", group_ks=(2048,)),
     # Edge shapes.  Leading, trailing and interior empty groups (the scheduler's group walk and
     # the first tensor-map rewrite), a single non-empty group, group K that are not multiples of
     # 128 (zero-padded up), and M / N that leave partial and odd block counts (TMA-clipped tiles,

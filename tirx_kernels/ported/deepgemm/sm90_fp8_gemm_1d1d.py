@@ -122,7 +122,8 @@ def run_test(*, backend_config=None, **config):
     if launch is not None:
         launch()
     torch.cuda.synchronize()
-    ref_launch, (ref_buffer, ref_d) = deepgemm_launch_normal(data)
+    # The public entry on the raw per-token scales, as callers use it (it also transforms them).
+    ref_launch, (ref_buffer, ref_d) = deepgemm_launch_normal(data, raw_scales=True)
     ref_launch()
     torch.cuda.synchronize()
     detail = f"M={data['M']} N={data['N']} K={data['K']}"

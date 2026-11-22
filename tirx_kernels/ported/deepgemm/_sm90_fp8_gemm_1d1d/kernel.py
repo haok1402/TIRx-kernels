@@ -28,6 +28,8 @@ EVICT_NORMAL = 0x1000000000000000
 TRY_WAIT_TICKS = 0x989680
 #: `cutlass::arch::NamedBarrier` reserves ids 0..7; the source's id `math_wg_idx` becomes 8 + it.
 NAMED_BARRIER_BASE = 8
+#: (BLOCK_M, BLOCK_N) of the multicast-on-A classes with a reviewed export (k-grouped only).
+REVIEWED_MULTICAST_ON_A = frozenset({(128, 104), (128, 120)})
 #: `CUtensorMap` bytes.
 TENSOR_MAP_BYTES = 128
 
@@ -179,7 +181,14 @@ class _Scheduler:
             first = txl.local_scalar("uint32", init=txl.uint32(0))
             in_group = txl.local_scalar("uint32", init=block_idx)
         else:
-            blocks_per_group = txl.local_scalar("uint32", init=secondary * txl.uint32(per))
+            secondary_const = spec.shape_m if on_a else spec.shape_n
+            if secondary_const:
+                # `secondary * per` is a compile-time constant: divide by the literal (nvcc's form).
+                blocks_per_group = txl.uint32(
+                    _ceil_div(secondary_const, spec.block_m if on_a else spec.block_n) * per
+                )
+            else:
+                blocks_per_group = txl.local_scalar("uint32", init=secondary * txl.uint32(per))
             first = txl.local_scalar("uint32", init=block_idx // blocks_per_group * txl.uint32(per))
             in_group = txl.local_scalar("uint32", init=block_idx % blocks_per_group)
         if self.const_group_size is not None:
@@ -302,10 +311,15 @@ def build_kernel(spec: KernelSpec, *, backend_config=None):
         raise NotImplementedError(f"gemm type {spec.gemm_type!r} is not a 1D1D type")
     if BK != 128 or BM not in (64, 128) or spec.num_tma_threads != 128:
         raise NotImplementedError(f"unported specialization {spec}")
-    if mc > 1 and spec.is_tma_multicast_on_a and not is_k_grouped:
-        # Multicast on A is exported and checked for KGroupedContiguous only (no realistic dense wgrad
-        # shape selects it for Normal); refuse rather than build an unverified variant.
-        raise NotImplementedError("TMA multicast on A is ported for KGroupedContiguous only")
+    if mc > 1 and spec.is_tma_multicast_on_a and (
+        not is_k_grouped or (BM, BN) not in REVIEWED_MULTICAST_ON_A
+    ):
+        # Multicast on A is exported and reviewed for the KGroupedContiguous classes the realistic
+        # MoE shapes select (`sm90_fp8_gemm_1d1d_multicast_on_a.md`); refuse the rest (other BLOCK_N,
+        # BLOCK_M 64, Normal) rather than build an unverified variant.
+        raise NotImplementedError(
+            f"TMA multicast on A is ported for KGroupedContiguous {sorted(REVIEWED_MULTICAST_ON_A)} only"
+        )
 
     # ---- template constants (`.cuh:56-75, 150-155`) ----
     num_accum = BN // 2  # WGMMA m64nBNk32 f32 accumulators per thread
@@ -589,141 +603,149 @@ def _producer(
 
     sched = _Scheduler(spec, grouped_layout, shape_m, shape_n, shape_k)
     last_group_idx = txl.local_scalar("uint32", init=txl.uint32(spec.num_groups))
-    sched.next()
-    with txl.while_(sched.valid == txl.uint32(1)):
-        m_block, n_block = sched.m_block_idx, sched.n_block_idx
-        # `num_tma_multicast_a/b` (`.cuh:179-181`): the multicast side gets `kNumTMAMulticast`.
-        valid = sched.is_tma_multicast_valid() if mc > 1 else False
-        if isinstance(valid, bool):
-            # Compile-time: one TMA path per operand.
-            mc_a = mc if (on_a and valid) else 1
-            mc_b = mc if (not on_a and valid) else 1
-        else:
-            mc_a = txl.local_scalar("uint32", init=txl.uint32(1))
-            mc_b = txl.local_scalar("uint32", init=txl.uint32(1))
-            with txl.if_(valid):
-                with txl.then_():
-                    txl.assign(mc_a if on_a else mc_b, txl.uint32(mc))
-        num_k_blocks = txl.local_scalar(
-            "uint32", init=(sched.current_shape_k + txl.uint32(BK - 1)) // txl.uint32(BK)
-        )
-        m_idx = txl.local_scalar("uint32", init=m_block * txl.uint32(BM))
-        n_idx = txl.local_scalar("uint32", init=n_block * txl.uint32(BN))
-
-        if is_k_grouped:
-            with txl.if_(last_group_idx != sched.current_group_idx):
-                with txl.then_():
-                    txl.assign(last_group_idx, sched.current_group_idx)
-                    # "Directly update current tensor map" (`.cuh:194-199`).
-                    k_offset = txl.cast(sched.current_k_cumsum, "int64")
-                    for which, base, dim in ((0, gmem_a, shape_m), (1, gmem_b, shape_n)):
-                        txl.ptx.tensormap_replace.tile.global_address.shared__cta.b1024.b64(
-                            smem_tmap.ptr_to([which * 32]),
-                            txl.reinterpret(
-                                base.ptr_to([k_offset * txl.cast(dim, "int64")]), ty="uint64"
-                            ),
-                        )
-                    for which in (0, 1):
-                        txl.ptx.tensormap_replace.tile.global_dim.shared__cta.b1024.b32(
-                            smem_tmap.ptr_to([which * 32]), txl.uint32(0), sched.current_shape_k
-                        )
-                        txl.ptx.tensormap_replace.tile.global_stride.shared__cta.b1024.b64(
-                            smem_tmap.ptr_to([which * 32]),
-                            txl.uint32(0),
-                            txl.cast(sched.current_shape_k, "uint64"),
-                        )
-                    # "Make sure the tensor maps are not used by in-flight TMA loads before
-                    # updating GMEM" (`.cuh:202-206`).
-                    txl.ptx.cp.async_.bulk.commit_group()
-                    txl.ptx.cp.async_.bulk.wait_group.read(0)
-                    txl.ptx.bar.warp.sync(txl.uint32(1) << lane_idx)
-                    _copy_smem_tensor_map_to_gmem(smem_tmap, 0, gmem_tmap_a)
-                    _copy_smem_tensor_map_to_gmem(smem_tmap, 32, gmem_tmap_b)
-                    txl.ptx.fence.proxy.tensormap__generic.release.gpu()
-                    # "Immediately acquire current tensor map" (`.cuh:213-214`).
-                    txl.ptx.fence.proxy.tensormap__generic.acquire.gpu(gmem_tmap_a)
-                    txl.ptx.fence.proxy.tensormap__generic.acquire.gpu(gmem_tmap_b)
-
-        unroll = c["unrolls"] if c["unrolls"] > 0 else None
-        if unroll is None and sched.odd_single_group:
-            # `#pragma unroll 0` leaves the factor to the compiler.  With both A/SFA paths live (the
-            # odd single block group under multicast) nvcc unrolls this loop x2 (+1 remainder copy; the
-            # 128x120 export), where NVRTC picks x4 and spills the 40-register producer: pin nvcc's x2.
-            unroll = 2
-        with txl.serial(0, num_k_blocks, unroll=unroll, dtype="uint32") as k_block_idx:
-            # Wait consumer release (`.cuh:220-221`).
-            stage_idx, phase = _pipeline(iter_idx, stages)
-            _wait(empty(stage_idx), phase ^ txl.uint32(1))
-            k_idx = k_block_idx * txl.uint32(BK)
-            sf_k_idx = sched.current_sf_k_cumsum + k_block_idx
-
-            def tma_copy(dst, tmap, inner, outer, num_multicast, may_multicast):
-                """`tma::copy` (`tma_copy.cuh:20-55`): plain when `num_tma_multicast == 1`, else
-                the cluster-rank-0 multicast into both CTAs."""
-
-                def plain():
-                    txl.ptx[_TMA_LOAD_HINT](
-                        dst,
-                        tmap,
-                        txl.cast(inner, "int32"),
-                        txl.cast(outer, "int32"),
-                        full(stage_idx),
-                        txl.uint64(EVICT_NORMAL),
-                    )
-
-                if not may_multicast or (isinstance(num_multicast, int) and num_multicast == 1):
-                    plain()  # `num_tma_multicast == 1` is a compile-time fact here
-                    return
-                if isinstance(num_multicast, int):  # compile-time multicast
-                    with txl.if_(_u32(txl.cuda.cluster_cta_id("x")) == txl.uint32(0)):
+    # `while (scheduler.get_next_block(...))`: one copy of the scheduler, at the loop top.
+    running = txl.local_scalar("uint32", init=txl.uint32(1))
+    with txl.while_(running == txl.uint32(1)):
+        sched.next()
+        with txl.if_(sched.valid == txl.uint32(1)):
+            with txl.then_():
+                m_block, n_block = sched.m_block_idx, sched.n_block_idx
+                # `num_tma_multicast_a/b` (`.cuh:179-181`): the multicast side gets `kNumTMAMulticast`.
+                valid = sched.is_tma_multicast_valid() if mc > 1 else False
+                if isinstance(valid, bool):
+                    # Compile-time: one TMA path per operand.
+                    mc_a = mc if (on_a and valid) else 1
+                    mc_b = mc if (not on_a and valid) else 1
+                else:
+                    mc_a = txl.local_scalar("uint32", init=txl.uint32(1))
+                    mc_b = txl.local_scalar("uint32", init=txl.uint32(1))
+                    with txl.if_(valid):
                         with txl.then_():
-                            txl.ptx[_TMA_LOAD_MULTICAST](
+                            txl.assign(mc_a if on_a else mc_b, txl.uint32(mc))
+                num_k_blocks = txl.local_scalar(
+                    "uint32", init=(sched.current_shape_k + txl.uint32(BK - 1)) // txl.uint32(BK)
+                )
+                m_idx = txl.local_scalar("uint32", init=m_block * txl.uint32(BM))
+                n_idx = txl.local_scalar("uint32", init=n_block * txl.uint32(BN))
+
+                if is_k_grouped:
+                    with txl.if_(last_group_idx != sched.current_group_idx):
+                        with txl.then_():
+                            txl.assign(last_group_idx, sched.current_group_idx)
+                            # "Directly update current tensor map" (`.cuh:194-199`).
+                            k_offset = txl.cast(sched.current_k_cumsum, "int64")
+                            for which, base, dim in ((0, gmem_a, shape_m), (1, gmem_b, shape_n)):
+                                txl.ptx.tensormap_replace.tile.global_address.shared__cta.b1024.b64(
+                                    smem_tmap.ptr_to([which * 32]),
+                                    txl.reinterpret(
+                                        base.ptr_to([k_offset * txl.cast(dim, "int64")]), ty="uint64"
+                                    ),
+                                )
+                            for which in (0, 1):
+                                txl.ptx.tensormap_replace.tile.global_dim.shared__cta.b1024.b32(
+                                    smem_tmap.ptr_to([which * 32]), txl.uint32(0), sched.current_shape_k
+                                )
+                                txl.ptx.tensormap_replace.tile.global_stride.shared__cta.b1024.b64(
+                                    smem_tmap.ptr_to([which * 32]),
+                                    txl.uint32(0),
+                                    txl.cast(sched.current_shape_k, "uint64"),
+                                )
+                            # "Make sure the tensor maps are not used by in-flight TMA loads before
+                            # updating GMEM" (`.cuh:202-206`).
+                            txl.ptx.cp.async_.bulk.commit_group()
+                            txl.ptx.cp.async_.bulk.wait_group.read(0)
+                            txl.ptx.bar.warp.sync(txl.uint32(1) << lane_idx)
+                            _copy_smem_tensor_map_to_gmem(smem_tmap, 0, gmem_tmap_a)
+                            _copy_smem_tensor_map_to_gmem(smem_tmap, 32, gmem_tmap_b)
+                            txl.ptx.fence.proxy.tensormap__generic.release.gpu()
+                            # "Immediately acquire current tensor map" (`.cuh:213-214`).
+                            txl.ptx.fence.proxy.tensormap__generic.acquire.gpu(gmem_tmap_a)
+                            txl.ptx.fence.proxy.tensormap__generic.acquire.gpu(gmem_tmap_b)
+
+                unroll = c["unrolls"] if c["unrolls"] > 0 else None
+                if unroll is None and mc > 1 and not isinstance(valid, bool):
+                    # `#pragma unroll 0` leaves the factor to the compiler.  With both multicast-side load
+                    # paths live (multicast validity is a runtime value: an odd block group, or a group size
+                    # not fixed by the compiled shape) nvcc unrolls this loop x2 (+1 remainder copy; the
+                    # 128x120, 4160x7232 and 1024x2920 exports), where NVRTC picks x4 and spills the
+                    # 40-register producer: pin nvcc's x2.
+                    unroll = 2
+                with txl.serial(0, num_k_blocks, unroll=unroll, dtype="uint32") as k_block_idx:
+                    # Wait consumer release (`.cuh:220-221`).
+                    stage_idx, phase = _pipeline(iter_idx, stages)
+                    _wait(empty(stage_idx), phase ^ txl.uint32(1))
+                    k_idx = k_block_idx * txl.uint32(BK)
+                    sf_k_idx = sched.current_sf_k_cumsum + k_block_idx
+
+                    def tma_copy(dst, tmap, inner, outer, num_multicast, may_multicast):
+                        """`tma::copy` (`tma_copy.cuh:20-55`): plain when `num_tma_multicast == 1`, else
+                        the cluster-rank-0 multicast into both CTAs."""
+
+                        def plain():
+                            txl.ptx[_TMA_LOAD_HINT](
                                 dst,
                                 tmap,
                                 txl.cast(inner, "int32"),
                                 txl.cast(outer, "int32"),
                                 full(stage_idx),
-                                txl.uint16((1 << mc) - 1),
                                 txl.uint64(EVICT_NORMAL),
                             )
-                    return
-                with txl.if_(num_multicast == txl.uint32(1)):
-                    with txl.then_():
-                        plain()
-                    with txl.else_():
-                        with txl.if_(_u32(txl.cuda.cluster_cta_id("x")) == txl.uint32(0)):
-                            with txl.then_():
-                                txl.ptx[_TMA_LOAD_MULTICAST](
-                                    dst,
-                                    tmap,
-                                    txl.cast(inner, "int32"),
-                                    txl.cast(outer, "int32"),
-                                    full(stage_idx),
-                                    txl.uint16((1 << mc) - 1),
-                                    txl.uint64(EVICT_NORMAL),
-                                )
 
-            mc_on_a, mc_on_b = mc > 1 and on_a, mc > 1 and not on_a
-            tma_copy(
-                smem_sfa.ptr_to([stage_idx * txl.uint32(c["sfa_stage"] // 4)]),
-                txl.address_of(tensor_map_sfa), m_idx, sf_k_idx, mc_a, mc_on_a,
-            )  # fmt: skip
-            tma_copy(
-                smem_sfb.ptr_to([stage_idx * txl.uint32(c["sfb_stage"] // 4)]),
-                txl.address_of(tensor_map_sfb), n_idx, sf_k_idx, mc_b, mc_on_b,
-            )  # fmt: skip
-            tma_copy(
-                smem_a.ptr_to([stage_idx * txl.uint32(c["a_stage"])]),
-                tmap_a, k_idx, m_idx, mc_a, mc_on_a,
-            )  # fmt: skip
-            tma_copy(
-                smem_b.ptr_to([stage_idx * txl.uint32(c["b_stage"])]),
-                tmap_b, k_idx, n_idx, mc_b, mc_on_b,
-            )  # fmt: skip
-            txl.ptx["mbarrier.arrive.expect_tx.shared::cta.b64"](
-                full(stage_idx), txl.uint32(c["expect_tx"])
-            )
-        sched.next()
+                        if not may_multicast or (isinstance(num_multicast, int) and num_multicast == 1):
+                            plain()  # `num_tma_multicast == 1` is a compile-time fact here
+                            return
+                        if isinstance(num_multicast, int):  # compile-time multicast
+                            with txl.if_(_u32(txl.cuda.cluster_cta_id("x")) == txl.uint32(0)):
+                                with txl.then_():
+                                    txl.ptx[_TMA_LOAD_MULTICAST](
+                                        dst,
+                                        tmap,
+                                        txl.cast(inner, "int32"),
+                                        txl.cast(outer, "int32"),
+                                        full(stage_idx),
+                                        txl.uint16((1 << mc) - 1),
+                                        txl.uint64(EVICT_NORMAL),
+                                    )
+                            return
+                        with txl.if_(num_multicast == txl.uint32(1)):
+                            with txl.then_():
+                                plain()
+                            with txl.else_():
+                                with txl.if_(_u32(txl.cuda.cluster_cta_id("x")) == txl.uint32(0)):
+                                    with txl.then_():
+                                        txl.ptx[_TMA_LOAD_MULTICAST](
+                                            dst,
+                                            tmap,
+                                            txl.cast(inner, "int32"),
+                                            txl.cast(outer, "int32"),
+                                            full(stage_idx),
+                                            txl.uint16((1 << mc) - 1),
+                                            txl.uint64(EVICT_NORMAL),
+                                        )
+
+                    mc_on_a, mc_on_b = mc > 1 and on_a, mc > 1 and not on_a
+                    tma_copy(
+                        smem_sfa.ptr_to([stage_idx * txl.uint32(c["sfa_stage"] // 4)]),
+                        txl.address_of(tensor_map_sfa), m_idx, sf_k_idx, mc_a, mc_on_a,
+                    )  # fmt: skip
+                    tma_copy(
+                        smem_sfb.ptr_to([stage_idx * txl.uint32(c["sfb_stage"] // 4)]),
+                        txl.address_of(tensor_map_sfb), n_idx, sf_k_idx, mc_b, mc_on_b,
+                    )  # fmt: skip
+                    tma_copy(
+                        smem_a.ptr_to([stage_idx * txl.uint32(c["a_stage"])]),
+                        tmap_a, k_idx, m_idx, mc_a, mc_on_a,
+                    )  # fmt: skip
+                    tma_copy(
+                        smem_b.ptr_to([stage_idx * txl.uint32(c["b_stage"])]),
+                        tmap_b, k_idx, n_idx, mc_b, mc_on_b,
+                    )  # fmt: skip
+                    txl.ptx["mbarrier.arrive.expect_tx.shared::cta.b64"](
+                        full(stage_idx), txl.uint32(c["expect_tx"])
+                    )
+            with txl.else_():
+                txl.assign(running, txl.uint32(0))
+
     if mc > 1:
         # "To safely deconstruct distributed shared barriers, we need another round of empty
         # waits" (`.cuh:237-244`).
@@ -794,105 +816,111 @@ def _math(
         lo = (_u32(txl.cuda.cvta_generic_to_shared(ptr)) >> txl.uint32(4)) & txl.uint32(0x3FFF)
         return txl.uint64(c["desc_hi64"]) | txl.cast(lo, "uint64")
 
-    sched.next()
-    with txl.while_(sched.valid == txl.uint32(1)):
-        m_block, n_block = sched.m_block_idx, sched.n_block_idx
-        current_shape_k = sched.current_shape_k if is_k_grouped else shape_k
-        current_group_idx = sched.current_group_idx if is_k_grouped else txl.uint32(0)
-        num_k_blocks = txl.local_scalar(
-            "uint32", init=(current_shape_k + txl.uint32(127)) // txl.uint32(128)
-        )
-        for i in range(num_accum):
-            txl.assign(final_accum[i], txl.float32(0))
-
-        unroll = c["unrolls"] if c["unrolls"] > 0 else None
-        with txl.serial(0, num_k_blocks, unroll=unroll, dtype="uint32"):
-            # Wait TMA arrivals (`.cuh:277-279`).
-            stage_idx, phase = _pipeline(iter_idx, stages)
-            _wait(full(stage_idx), phase)
-
-            # Read A / B scales: "all shared memory read must be prior to `warpgroup_arrive`"
-            # (`.cuh:281-289`).
-            sfa_base = stage_idx * txl.uint32(c["sfa_stage"] // 4)
-            txl.ptx["ld.shared.f32"](scale_a[0], smem_sfa.ptr_to([sfa_base + r_0]))
-            txl.ptx["ld.shared.f32"](scale_a[1], smem_sfa.ptr_to([sfa_base + r_1]))
-            sfb_base = stage_idx * txl.uint32(c["sfb_stage"] // 4) + col_idx * txl.uint32(2)
-            for i in range(num_accum // 4):
-                txl.ptx["ld.shared.v2.f32"](
-                    scales_b[2 * i], scales_b[2 * i + 1],
-                    smem_sfb.ptr_to([sfb_base + txl.uint32(8 * i)]),
-                )  # fmt: skip
-
-            # Commit WGMMA instructions (`.cuh:291-306`).
-            for i in range(num_accum):
-                txl.cuda.wgmma.noop_barrier(accum[i])
-            txl.ptx.wgmma.fence.sync.aligned()
-            a_stage_base = stage_idx * txl.uint32(c["a_stage"]) + math_wg_idx * txl.uint32(64 * 128)
-            b_stage_base = stage_idx * txl.uint32(c["b_stage"])
-            for k in range(128 // 32):
-                desc_a = smem_desc(smem_a.ptr_to([a_stage_base + txl.uint32(k * 32)]))
-                desc_b = smem_desc(smem_b.ptr_to([b_stage_base + txl.uint32(k * 32)]))
-                txl.ptx[c["wgmma"]](*[accum[j] for j in range(num_accum)], desc_a, desc_b, k != 0, 1, 1)
-            txl.ptx.wgmma.commit_group.sync.aligned()
-            for i in range(num_accum):
-                txl.cuda.wgmma.noop_barrier(accum[i])
-            txl.ptx.wgmma.wait_group.sync.aligned(0)
-
-            # Notify barrier arrival (`.cuh:309`).
-            empty_barrier_arrive(stage_idx)
-
-            # Promote with scales (`.cuh:312-320`): `final += scale_a * scale_b * accum`, which the
-            # source compiles (no fast math) to one non-FTZ `mul.f32` and one `fma.rn.f32`.
-            for i in range(num_accum // 4):
-                for j, sa, sb in (
-                    (0, scale_a[0], scales_b[2 * i]),
-                    (1, scale_a[0], scales_b[2 * i + 1]),
-                    (2, scale_a[1], scales_b[2 * i]),
-                    (3, scale_a[1], scales_b[2 * i + 1]),
-                ):
-                    idx = 4 * i + j
-                    txl.assign(final_accum[idx], final_accum[idx] + sa * sb * accum[idx])
-
-        # ---- epilogue (`.cuh:322-346`) ----
-        # Flush previous stores.
-        with txl.if_(warp_idx % txl.uint32(4) == txl.uint32(0)):
-            with txl.then_():
-                with txl.if_(_elect() == txl.uint32(1)):
-                    with txl.then_():
-                        txl.ptx.cp.async_.bulk.wait_group.read(0)
-        named_barrier = math_wg_idx + txl.uint32(NAMED_BARRIER_BASE)
-        txl.ptx["bar.sync"](named_barrier, txl.uint32(128))
-
-        # Store to D shared memory: `smem_d_0 + i * 4` on a float2 pointer is 8 columns per i.
-        d_0 = r_0 * txl.uint32(BN) + col_idx * txl.uint32(2)
-        d_1 = r_1 * txl.uint32(BN) + col_idx * txl.uint32(2)
-        for i in range(num_accum // 4):
-            txl.ptx["st.shared.v2.f32"](
-                smem_d.ptr_to([d_0 + txl.uint32(8 * i)]), final_accum[4 * i], final_accum[4 * i + 1]
-            )
-            txl.ptx["st.shared.v2.f32"](
-                smem_d.ptr_to([d_1 + txl.uint32(8 * i)]),
-                final_accum[4 * i + 2],
-                final_accum[4 * i + 3],
-            )
-        txl.ptx.fence.proxy.async_.shared__cta()
-        txl.ptx["bar.sync"](named_barrier, txl.uint32(128))
-
-        # Use TMA store to write back to global memory (`.cuh:339-345`); the elected lane's own
-        # r_0 / col_idx address its warpgroup's 64 rows.
-        with txl.if_(warp_idx % txl.uint32(4) == txl.uint32(0)):
-            with txl.then_():
-                with txl.if_(_elect() == txl.uint32(1)):
-                    with txl.then_():
-                        txl.ptx[_TMA_REDUCE_ADD](
-                            txl.address_of(tensor_map_cd),
-                            txl.cast(n_block * txl.uint32(BN), "int32"),
-                            txl.cast(
-                                current_group_idx * shape_m + m_block * txl.uint32(BM) + r_0,
-                                "int32",
-                            ),
-                            smem_d.ptr_to([d_0]),
-                        )
-                        txl.ptx.cp.async_.bulk.commit_group()
-        txl.ptx.bar.warp.sync(txl.uint32(0xFFFFFFFF))
+    # `while (scheduler.get_next_block(...))`: one copy of the scheduler, at the loop top.
+    running = txl.local_scalar("uint32", init=txl.uint32(1))
+    with txl.while_(running == txl.uint32(1)):
         sched.next()
+        with txl.if_(sched.valid == txl.uint32(1)):
+            with txl.then_():
+                m_block, n_block = sched.m_block_idx, sched.n_block_idx
+                current_shape_k = sched.current_shape_k if is_k_grouped else shape_k
+                current_group_idx = sched.current_group_idx if is_k_grouped else txl.uint32(0)
+                num_k_blocks = txl.local_scalar(
+                    "uint32", init=(current_shape_k + txl.uint32(127)) // txl.uint32(128)
+                )
+                for i in range(num_accum):
+                    txl.assign(final_accum[i], txl.float32(0))
+
+                unroll = c["unrolls"] if c["unrolls"] > 0 else None
+                with txl.serial(0, num_k_blocks, unroll=unroll, dtype="uint32"):
+                    # Wait TMA arrivals (`.cuh:277-279`).
+                    stage_idx, phase = _pipeline(iter_idx, stages)
+                    _wait(full(stage_idx), phase)
+
+                    # Read A / B scales: "all shared memory read must be prior to `warpgroup_arrive`"
+                    # (`.cuh:281-289`).
+                    sfa_base = stage_idx * txl.uint32(c["sfa_stage"] // 4)
+                    txl.ptx["ld.shared.f32"](scale_a[0], smem_sfa.ptr_to([sfa_base + r_0]))
+                    txl.ptx["ld.shared.f32"](scale_a[1], smem_sfa.ptr_to([sfa_base + r_1]))
+                    sfb_base = stage_idx * txl.uint32(c["sfb_stage"] // 4) + col_idx * txl.uint32(2)
+                    for i in range(num_accum // 4):
+                        txl.ptx["ld.shared.v2.f32"](
+                            scales_b[2 * i], scales_b[2 * i + 1],
+                            smem_sfb.ptr_to([sfb_base + txl.uint32(8 * i)]),
+                        )  # fmt: skip
+
+                    # Commit WGMMA instructions (`.cuh:291-306`).
+                    for i in range(num_accum):
+                        txl.cuda.wgmma.noop_barrier(accum[i])
+                    txl.ptx.wgmma.fence.sync.aligned()
+                    a_stage_base = stage_idx * txl.uint32(c["a_stage"]) + math_wg_idx * txl.uint32(64 * 128)
+                    b_stage_base = stage_idx * txl.uint32(c["b_stage"])
+                    for k in range(128 // 32):
+                        desc_a = smem_desc(smem_a.ptr_to([a_stage_base + txl.uint32(k * 32)]))
+                        desc_b = smem_desc(smem_b.ptr_to([b_stage_base + txl.uint32(k * 32)]))
+                        txl.ptx[c["wgmma"]](*[accum[j] for j in range(num_accum)], desc_a, desc_b, k != 0, 1, 1)
+                    txl.ptx.wgmma.commit_group.sync.aligned()
+                    for i in range(num_accum):
+                        txl.cuda.wgmma.noop_barrier(accum[i])
+                    txl.ptx.wgmma.wait_group.sync.aligned(0)
+
+                    # Notify barrier arrival (`.cuh:309`).
+                    empty_barrier_arrive(stage_idx)
+
+                    # Promote with scales (`.cuh:312-320`): `final += scale_a * scale_b * accum`, which the
+                    # source compiles (no fast math) to one non-FTZ `mul.f32` and one `fma.rn.f32`.
+                    for i in range(num_accum // 4):
+                        for j, sa, sb in (
+                            (0, scale_a[0], scales_b[2 * i]),
+                            (1, scale_a[0], scales_b[2 * i + 1]),
+                            (2, scale_a[1], scales_b[2 * i]),
+                            (3, scale_a[1], scales_b[2 * i + 1]),
+                        ):
+                            idx = 4 * i + j
+                            txl.assign(final_accum[idx], final_accum[idx] + sa * sb * accum[idx])
+
+                # ---- epilogue (`.cuh:322-346`) ----
+                # Flush previous stores.
+                with txl.if_(warp_idx % txl.uint32(4) == txl.uint32(0)):
+                    with txl.then_():
+                        with txl.if_(_elect() == txl.uint32(1)):
+                            with txl.then_():
+                                txl.ptx.cp.async_.bulk.wait_group.read(0)
+                named_barrier = math_wg_idx + txl.uint32(NAMED_BARRIER_BASE)
+                txl.ptx["bar.sync"](named_barrier, txl.uint32(128))
+
+                # Store to D shared memory: `smem_d_0 + i * 4` on a float2 pointer is 8 columns per i.
+                d_0 = r_0 * txl.uint32(BN) + col_idx * txl.uint32(2)
+                d_1 = r_1 * txl.uint32(BN) + col_idx * txl.uint32(2)
+                for i in range(num_accum // 4):
+                    txl.ptx["st.shared.v2.f32"](
+                        smem_d.ptr_to([d_0 + txl.uint32(8 * i)]), final_accum[4 * i], final_accum[4 * i + 1]
+                    )
+                    txl.ptx["st.shared.v2.f32"](
+                        smem_d.ptr_to([d_1 + txl.uint32(8 * i)]),
+                        final_accum[4 * i + 2],
+                        final_accum[4 * i + 3],
+                    )
+                txl.ptx.fence.proxy.async_.shared__cta()
+                txl.ptx["bar.sync"](named_barrier, txl.uint32(128))
+
+                # Use TMA store to write back to global memory (`.cuh:339-345`); the elected lane's own
+                # r_0 / col_idx address its warpgroup's 64 rows.
+                with txl.if_(warp_idx % txl.uint32(4) == txl.uint32(0)):
+                    with txl.then_():
+                        with txl.if_(_elect() == txl.uint32(1)):
+                            with txl.then_():
+                                txl.ptx[_TMA_REDUCE_ADD](
+                                    txl.address_of(tensor_map_cd),
+                                    txl.cast(n_block * txl.uint32(BN), "int32"),
+                                    txl.cast(
+                                        current_group_idx * shape_m + m_block * txl.uint32(BM) + r_0,
+                                        "int32",
+                                    ),
+                                    smem_d.ptr_to([d_0]),
+                                )
+                                txl.ptx.cp.async_.bulk.commit_group()
+                txl.ptx.bar.warp.sync(txl.uint32(0xFFFFFFFF))
+            with txl.else_():
+                txl.assign(running, txl.uint32(0))
+
