@@ -5,8 +5,11 @@
 
 
 """TIRx port of `smxx::decode::get_mla_metadata_kernel`
-(`csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu`), dense (`topk == -1`)
-path: one warp, dynamic shared memory of `4 * (5 * b + 1)` bytes, `__launch_bounds__(32, 1, 1)`.
+(`csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu`): one warp, dynamic shared
+memory of `4 * (5 * b + 1)` bytes, `__launch_bounds__(32, 1, 1)`. The per-request token count
+follows the runtime `topk` branch, as upstream: dense decode passes `topk = -1` and `seqlens_k`;
+sparse decode passes `topk` (and `extra_topk`, 0 without an extra KV cache) with optional
+`topk_length` / `extra_topk_length` (null tensors when absent) and no `seqlens_k`.
 """
 
 import tirx_kernels.tirx_lite as txl
@@ -21,11 +24,15 @@ def build_sched_meta_kernel(*, backend_config=None):
     @txl.kernel()
     def get_mla_metadata(
         seqlens_k: txl.Tensor((txl.int64(),), "int32"),
+        topk_length: txl.Tensor((txl.int64(),), "int32"),
+        extra_topk_length: txl.Tensor((txl.int64(),), "int32"),
         tile_scheduler_metadata: txl.Tensor((txl.int64(),), "int32"),
         num_splits: txl.Tensor((txl.int64(),), "int32"),
         b: "int32",
         block_size_n: "int32",
         fixed_overhead_num_blocks: "int32",
+        topk: "int32",
+        extra_topk: "int32",
         num_sm_parts: "int32",
     ):
         txl.device_entry(
@@ -42,12 +49,30 @@ def build_sched_meta_kernel(*, backend_config=None):
         last_block_s = b * 4 + 1  # [b]
         lane = txl.thread_id()
 
-        # :29-55 (dense, topk == -1): per-request block ranges.
+        # :29-55: per-request block ranges.
         total = txl.local_scalar("int32", init=0)
         i = txl.local_scalar("int32", init=lane)
         with txl.while_(i < b):
             cur_s_k = txl.local_scalar("int32")
-            txl.ptx.ld.global_.nc.s32(cur_s_k, seqlens_k.ptr_to([i]))
+            with txl.if_(topk == -1):
+                with txl.then_():
+                    # Dense model: cur_s_k = the actual s_k.
+                    txl.ptx.ld.global_.nc.s32(cur_s_k, seqlens_k.ptr_to([i]))
+                with txl.else_():
+                    # Sparse model: cur_s_k = topk (+ extra topk).
+                    txl.assign(cur_s_k, topk)
+                    with txl.if_(txl.Not(txl.isnullptr(topk_length.data))), txl.then_():
+                        txl.ptx.ld.global_.nc.s32(cur_s_k, topk_length.ptr_to([i]))
+                    with txl.if_(cur_s_k == 0), txl.then_():
+                        txl.assign(cur_s_k, 1)  # the main loop is never empty
+                    with txl.if_(extra_topk != 0), txl.then_():
+                        # ku::ceil(cur_s_k, block_size_n) rounds up to a multiple.
+                        up = txl.local_scalar("int32", init=cur_s_k + block_size_n - 1)
+                        txl.assign(cur_s_k, up - up % block_size_n)
+                        xs = txl.local_scalar("int32", init=extra_topk)
+                        with txl.if_(txl.Not(txl.isnullptr(extra_topk_length.data))), txl.then_():
+                            txl.ptx.ld.global_.nc.s32(xs, extra_topk_length.ptr_to([i]))
+                        txl.assign(cur_s_k, cur_s_k + xs)
             txl.ptx.st.shared.s32(smem.ptr_to([seqlens_s + i]), cur_s_k)
             first_token = txl.local_scalar("int32", init=0)
             last_token = txl.local_scalar("int32", init=txl.max(cur_s_k - 1, 0))

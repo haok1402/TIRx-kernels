@@ -5,8 +5,9 @@
 
 
 """TIRx port of `smxx::decode::flash_fwd_mla_combine_kernel<ElementT, 512, 8, MAX_SPLITS, 256>`
-(`csrc/smxx/decode/combine/combine.cu`), without an attention sink (dense decode passes none).
-Launched with programmatic stream serialization after the main kernel.
+(`csrc/smxx/decode/combine/combine.cu`). Launched with programmatic stream serialization after
+the main kernel. `attn_sink` is a null tensor when absent (dense decode always; sparse decode
+without a sink), selecting the source's runtime `params.attn_sink != nullptr` branch.
 """
 
 import tirx_kernels.tirx_lite as txl
@@ -26,6 +27,7 @@ def max_splits_for(num_sm_parts: int) -> int:
 
 
 _LOG2E = 1.4426950408889634  # (float)M_LOG2E
+_L2E = 1.4426950408889634  # CUDART_L2E_F
 
 
 def _fmax(dst, a, b):
@@ -45,6 +47,7 @@ def build_combine_kernel(dtype: str, max_splits: int, *, backend_config=None):
         lse_accum: txl.Tensor((txl.int64(),), "float32"),
         o_accum: txl.Tensor((txl.int64(),), "float32"),
         num_splits: txl.Tensor((txl.int64(),), "int32"),
+        attn_sink: txl.Tensor((txl.int64(),), "float32"),
         stride_lse_b: "int32",
         stride_lse_s_q: "int32",
         stride_o_b: "int32",
@@ -166,6 +169,28 @@ def build_combine_kernel(dtype: str, max_splits: int, *, backend_config=None):
             lse_out = txl.local_scalar("float32")
             txl.ptx["div.approx.ftz.f32"](lse_out, global_lse, txl.float32(_LOG2E))
             txl.ptx.st.global_.f32(lse.ptr_to([lse_base + warp_idx]), lse_out)
+        # combine.cu:102-113: fold the attention sink into the global LSE.
+        with txl.if_(txl.Not(txl.isnullptr(attn_sink.data))), txl.then_():
+            sink = txl.local_scalar("float32")
+            txl.ptx.ld.global_.nc.f32(sink, attn_sink.ptr_to([h_block_idx * BLOCK_SIZE_M + warp_idx]))
+            with txl.if_(global_lse != txl.float32(float("inf"))):
+                with txl.then_():
+                    v = txl.local_scalar("float32")
+                    txl.ptx["mul.ftz.f32"](v, sink, txl.float32(_L2E))
+                    txl.ptx["sub.ftz.f32"](v, v, global_lse)
+                    txl.ptx["ex2.approx.ftz.f32"](v, v)
+                    txl.ptx["add.ftz.f32"](v, v, txl.float32(1.0))
+                    txl.ptx["lg2.approx.ftz.f32"](v, v)
+                    txl.ptx["add.ftz.f32"](global_lse, global_lse, v)
+                with txl.else_():
+                    v = txl.local_scalar("float32")
+                    txl.ptx["mul.ftz.f32"](v, sink, txl.float32(_L2E))
+                    txl.assign(
+                        global_lse,
+                        txl.if_then_else(
+                            sink == txl.float32(-float("inf")), txl.float32(float("inf")), v
+                        ),
+                    )
         for i in range(lse_frags):
             txl.ptx["sub.ftz.f32"](tmp, local_lse[i], global_lse)
             txl.ptx["ex2.approx.ftz.f32"](tmp, tmp)

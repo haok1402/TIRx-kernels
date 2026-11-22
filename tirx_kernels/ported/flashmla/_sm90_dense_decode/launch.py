@@ -164,15 +164,32 @@ def compile_kernels(dtype: str, *, backend_config=None) -> Executables:
     return ex
 
 
+def _null_i32():
+    """A zero-size tensor, i.e. a null data pointer: the kernels' `nullptr` operand."""
+    import torch
+
+    return torch.empty(0, dtype=torch.int32, device="cuda")
+
+
+def _null_f32():
+    import torch
+
+    return torch.empty(0, dtype=torch.float32, device="cuda")
+
+
 def launch_sched_meta(ex: Executables, p) -> None:
     """`run_get_decoding_sched_meta_kernel` for the dense path."""
     ex.sched_meta.mod(
         p["seqlens_k"],
+        _null_i32(),  # topk_length (sparse only): null
+        _null_i32(),  # extra_topk_length (sparse only): null
         p["tile_scheduler_metadata"].reshape(-1),
         p["num_splits"],
         p["b"],
         64,  # block_size_n
         5,  # fixed_overhead_num_blocks
+        -1,  # topk: dense
+        -1,  # extra_topk: dense_attn_decode_interface passes -1
         p["num_sm_parts"],
     )
 
@@ -222,6 +239,7 @@ def _decode_args(p):
         p["lse_accum"].reshape(-1),
         p["out_accum"].reshape(-1),
         p["num_splits"],
+        _null_f32(),  # attn_sink: dense decode passes nullptr
         h_kv * q_seq_per_hk,
         h_q,
         h_q * s_q * dv,
