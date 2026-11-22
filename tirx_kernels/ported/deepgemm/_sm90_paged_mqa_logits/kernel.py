@@ -52,13 +52,11 @@ class _Scheduler:
         self.end_kv = txl.local_scalar("uint32")
         self.cur_num_kv = txl.local_scalar("uint32")
         sm = _u32(txl.cta_id())
-        # Constructor (sched:194-210): two uint2 reads of the metadata.
-        txl.ptx["ld.global.v2.u32"](
-            self.cur_q, self.cur_kv, schedule_meta.ptr_to([sm * txl.uint32(2)])
-        )
-        txl.ptx["ld.global.v2.u32"](
-            self.end_q, self.end_kv, schedule_meta.ptr_to([(sm + txl.uint32(1)) * txl.uint32(2)])
-        )
+        # Constructor (sched:194-210): two uint2 reads of the metadata, `uint2` pointer + sm_idx and + 1,
+        # i.e. one unsigned 64-bit base and an 8-byte immediate for the second, as nvcc forms it.
+        meta_ptr = schedule_meta.ptr_to([txl.cast(sm, "uint64") * txl.uint64(2)])
+        txl.ptx["ld.global.v2.u32"](self.cur_q, self.cur_kv, meta_ptr)
+        txl.ptx["ld.global.v2.u32"](self.end_q, self.end_kv, txl.ptx.addr(meta_ptr, 8))
         txl.assign(self.cur_kv, self.cur_kv * txl.uint32(NUM_BLOCKS_PER_SPLIT))
         txl.assign(self.end_kv, self.end_kv * txl.uint32(NUM_BLOCKS_PER_SPLIT))
         self.refresh(self.cur_q)

@@ -276,7 +276,8 @@ def build_kernel(spec, *, backend_config=None):
                 v_1_offset = txl.local_scalar(
                     "uint32", init=lane_idx // txl.uint32(4) + txl.uint32(8)
                 )
-                v_0_offset_u64 = txl.local_scalar("uint64", init=txl.cast(v_0_offset, "uint64"))
+                if not is_compressed:
+                    v_0_offset_u64 = txl.local_scalar("uint64", init=txl.cast(v_0_offset, "uint64"))
                 q_lo = txl.local_scalar(
                     "uint32", init=_u32(txl.cuda.cvta_generic_to_shared(smem_q.ptr_to([0])))
                 )
@@ -306,6 +307,18 @@ def build_kernel(spec, *, backend_config=None):
                                         + lane_idx % txl.uint32(4) * txl.uint32(2)
                                     ]
                                 ),
+                            )
+
+                    # `q_offset` of each row is invariant over the KV blocks; nvcc keeps it out of
+                    # the KV loop for the compressed path of the source, so it is formed once per Q
+                    # block there. The dense path forms it per row inside the uniform store base.
+                    if is_compressed:
+                        q_offsets = txl.alloc_local((BQ,), "uint64")
+                        for i in range(BQ):
+                            txl.assign(
+                                q_offsets[i],
+                                txl.cast(block_q_idx * txl.uint32(BQ) + txl.uint32(i), "uint64")
+                                * txl.cast(stride_logits, "uint64"),
                             )
 
                     with txl.serial(0, num_kv_blocks, unroll=True, dtype="uint32") as kv_block_idx:
@@ -356,12 +369,13 @@ def build_kernel(spec, *, backend_config=None):
                                 scale_kv_0,
                                 scale_kv_1,
                                 zero,
-                                q_offset=txl.cast(block_q_idx * txl.uint32(BQ) + txl.uint32(i), "uint64")
+                                q_offset=q_offsets[i]
+                                if is_compressed
+                                else txl.cast(block_q_idx * txl.uint32(BQ) + txl.uint32(i), "uint64")
                                 * txl.cast(stride_logits, "uint64"),
                                 kv_offset=kv_offset,
                                 v_offsets=(v_0_offset, v_1_offset),
-                                v_0_u64=v_0_offset_u64,
-                                chain_outer=not is_compressed,
+                                v_0_u64=None if is_compressed else v_0_offset_u64,
                                 ks=seq_k_start[i],
                                 ke=seq_k_end[i],
                                 logits=logits,
@@ -482,7 +496,6 @@ def _reduce_and_store(
     kv_offset,
     v_offsets,
     v_0_u64,
-    chain_outer,
     ks,
     ke,
     logits,
@@ -506,29 +519,16 @@ def _reduce_and_store(
 
     # Plain FP32 arithmetic under `fp_mode="precise"`; NVRTC contracts `a * b + c` to `fma.rn.f32` as nvcc
     # does for the source: `s_k = fma(max(a[k]), w, max(a[4+k]) * w')`, then one `fma` per head group.
-    # The four k-chains are independent, so their issue order does not change a bit; it only steers
-    # ptxas's schedule. Measured best (CUPTI vs DeepGEMM, h64 d128): chain by chain for the dense store
-    # path, head group by head group (the order of nvcc's PTX for the source) for the compressed one.
-    sums = [txl.local_scalar("float32") for _ in range(4)]
-    if chain_outer:
-        for k in range(4):
-            r0 = relu(k)
-            r1 = relu(4 + k)
-            txl.assign(sums[k], r1 * w(4 + k))
-            txl.assign(sums[k], r0 * w(k) + sums[k])
-            for j in range(2, H // 8):
-                r = relu(4 * j + k)
-                txl.assign(sums[k], r * w(4 * j + k) + sums[k])
-    else:
-        r0 = [relu(k) for k in range(4)]
-        for k in range(4):
-            r1 = relu(4 + k)
-            txl.assign(sums[k], r1 * w(4 + k))
-            txl.assign(sums[k], r0[k] * w(k) + sums[k])
+    sums = []
+    for k in range(4):
+        r0 = relu(k)
+        r1 = relu(4 + k)
+        s = txl.local_scalar("float32", init=r1 * w(4 + k))
+        txl.assign(s, r0 * w(k) + s)
         for j in range(2, H // 8):
-            for k in range(4):
-                r = relu(4 * j + k)
-                txl.assign(sums[k], r * w(4 * j + k) + sums[k])
+            r = relu(4 * j + k)
+            txl.assign(s, r * w(4 * j + k) + s)
+        sums.append(s)
 
     v_0 = txl.local_scalar("float32", init=scale_kv_0 * (sums[0] + sums[1]))
     v_1 = txl.local_scalar("float32", init=scale_kv_1 * (sums[2] + sums[3]))
@@ -549,16 +549,20 @@ def _reduce_and_store(
     # Store into the global memory
     # `v_1_offset == v_0_offset + 8`: like nvcc for the source, address both values of a row from one
     # 64-bit base (`[base]` and `[base + 8 elements]`).
-    # `logits[q_offset + kv_offset + v_0_offset]` as nvcc forms it for the source:
-    # (row * stride + u64(kv_offset)) + u64(v0), with u64(v0) loop-invariant, so ptxas keeps the warp-uniform
-    # row * stride + kv_offset on the uniform datapath (UIMAD.WIDE). NVRTC's reassociation would group the
-    # loop-invariant row * stride with the per-thread v0 instead (vector IMAD.WIDE + an LDC per iteration,
-    # 3-5 % on the dense path), so the last add is one PTX add.u64 -- a workaround for sm90-probe ISSUE-016.
-    uniform_base = txl.local_scalar("uint64", init=q_offset + txl.cast(kv_offset, "uint64"))
-    index = txl.local_scalar("uint64")
-    txl.ptx["add.u64"](index, uniform_base, v_0_u64)
     if is_compressed:
+        # The compressed path already matches the source's address instructions as written.
+        index = q_offset + txl.cast(kv_offset, "uint64") + txl.cast(v_offsets[0], "uint64")
         index = index - txl.cast(ks, "uint64")
+    else:
+        # Dense: `logits[q_offset + kv_offset + v_0_offset]` as nvcc forms it for the source,
+        # (row * stride + u64(kv_offset)) + u64(v0) with u64(v0) loop-invariant, so ptxas keeps the
+        # warp-uniform row * stride + kv_offset on the uniform datapath (UIMAD.WIDE). NVRTC's reassociation
+        # groups the loop-invariant row * stride with the per-thread v0 instead (vector IMAD.WIDE + an LDC
+        # per iteration, 3-5 % on this path), so the last add is one PTX add.u64.
+        # TODO(ISSUE-016): temporary workaround; on v4 use `txl.cuda.arithmetic_fence(uniform_base) + v_0_u64`.
+        uniform_base = txl.local_scalar("uint64", init=q_offset + txl.cast(kv_offset, "uint64"))
+        index = txl.local_scalar("uint64")
+        txl.ptx["add.u64"](index, uniform_base, v_0_u64)
     ptr_0 = logits.ptr_to([txl.cast(index, "int64")])
     ptr_1 = txl.ptx.addr(ptr_0, 8 * (2 if is_bf16 else 4))
     for v, vo, ptr in ((v_0, v_offsets[0], ptr_0), (v_1, v_offsets[1], ptr_1)):
