@@ -67,8 +67,10 @@ FP32 C/D with accumulation through TMA reduce-add; FP32 per-128-K scales on both
 (16, 24, 40, ..., 152 -- the code path is BLOCK_N-generic; the exported values are 136 and 152);
 `kNumTMAMulticast` 1, or 2 on B; compiled dims "mn" (k-grouped) and "nk" (normal).
 
-**Out of scope.** Multicast on A (`kIsTMAMulticastOnA`): no upstream shape selects it; the
-branches are kept below where the source shares code, marked `[on-A]`. `BLOCK_M` 16/32
+**Out of scope here.** Multicast on A (`kIsTMAMulticastOnA`): no upstream shape selects it; it is
+covered by the delta sketch [`sm90_fp8_gemm_1d1d_multicast_on_a.md`](sm90_fp8_gemm_1d1d_multicast_on_a.md)
+(k-grouped 128x104 and 128x120, from realistic MoE shapes); the branches are kept below where the source
+shares code, marked `[on-A]`. `BLOCK_M` 16/32
 (the heuristic offers them for M <= 32 but the source's static assert rejects them). PSUM
 k-grouped layouts and MN-major operands (SM100 only); BF16 output; tile (`Tx`) primitives.
 

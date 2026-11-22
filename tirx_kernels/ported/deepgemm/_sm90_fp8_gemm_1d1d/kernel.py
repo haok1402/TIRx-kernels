@@ -126,7 +126,21 @@ class _Scheduler:
         on_a = spec.is_tma_multicast_on_a
         primary_const = spec.shape_n if on_a else spec.shape_m
         primary_blocks = _ceil_div(primary_const, bn if on_a else bm)
-        self.const_group_size = per if primary_const and primary_blocks % per == 0 else None
+        # Compile-time facts about the block groups (see `_swizzle`), with the primary extent compiled in:
+        # - `primary % per == 0`: every group has exactly `per` blocks;
+        # - `primary <= per`: one group (`first` is always 0) of `primary` blocks, split by the
+        #   unaligned-multicast fix-up when `primary` is odd under multicast.
+        self.primary_blocks = primary_blocks if primary_const else None
+        self.single_group = bool(primary_const) and primary_blocks <= per
+        self.odd_single_group = (
+            self.single_group and spec.num_tma_multicast > 1 and primary_blocks % 2 == 1
+        )
+        if primary_const and primary_blocks % per == 0:
+            self.const_group_size = per
+        elif self.single_group and not self.odd_single_group:
+            self.const_group_size = primary_blocks
+        else:
+            self.const_group_size = None
         if self.is_k_grouped:
             self._get_next_k_group(self.current_group_idx, self.current_shape_k)
             txl.assign(self.next_group_idx, self.current_group_idx + txl.uint32(1))
@@ -157,32 +171,46 @@ class _Scheduler:
         on_a = spec.is_tma_multicast_on_a
         primary = self.num_n_blocks if on_a else self.num_m_blocks
         secondary = self.num_m_blocks if on_a else self.num_n_blocks
-        blocks_per_group = txl.local_scalar("uint32", init=secondary * txl.uint32(per))
-        first = txl.local_scalar("uint32", init=block_idx // blocks_per_group * txl.uint32(per))
-        in_group = txl.local_scalar("uint32", init=block_idx % blocks_per_group)
-        # With the primary extent compiled in (SHAPE_M for multicast on B, SHAPE_N on A) and a
-        # multiple of `kNum1DBlocksPerGroup`, `primary - first` is a positive multiple of it for every
-        # in-range block, so `min` is the constant `per` (even, as `per % kNumTMAMulticast == 0`) and the
-        # odd-size fix-up is dead.  nvcc proves this from the compiled shape; it is written as the
-        # constant here because NVRTC keeps the runtime `min` (and with it `is_tma_multicast_valid` and
-        # the plain-B/SFB load path) alive.
+        # The compiled primary extent lets nvcc fold the group arithmetic below (constant group size,
+        # `first == 0` when there is only one group); NVRTC keeps it, and with it
+        # `is_tma_multicast_valid` and the plain multicast-side load path, so the folds are written out.
+        if self.single_group:
+            # `block_idx < num_blocks = primary * secondary <= per * secondary`: group 0.
+            first = txl.local_scalar("uint32", init=txl.uint32(0))
+            in_group = txl.local_scalar("uint32", init=block_idx)
+        else:
+            blocks_per_group = txl.local_scalar("uint32", init=secondary * txl.uint32(per))
+            first = txl.local_scalar("uint32", init=block_idx // blocks_per_group * txl.uint32(per))
+            in_group = txl.local_scalar("uint32", init=block_idx % blocks_per_group)
         if self.const_group_size is not None:
-            txl.assign(self.num_blocks_in_group, txl.uint32(per))
+            txl.assign(self.num_blocks_in_group, txl.uint32(self.const_group_size))
+        elif self.odd_single_group:
+            # "Fix unaligned TMA multicast" with the (odd) group size a constant.
+            even = self.primary_blocks ^ 1
+            with txl.if_(in_group < txl.uint32(even) * secondary):
+                with txl.then_():
+                    txl.assign(self.num_blocks_in_group, txl.uint32(even))
+                with txl.else_():
+                    txl.assign(in_group, in_group - txl.uint32(even) * secondary)
+                    txl.assign(first, txl.uint32(even))
+                    txl.assign(self.num_blocks_in_group, txl.uint32(1))
         else:
             txl.assign(self.num_blocks_in_group, txl.min(txl.uint32(per), primary - first))
-        if spec.num_tma_multicast > 1 and self.const_group_size is None:
-            with txl.if_(self.num_blocks_in_group % txl.uint32(2) != txl.uint32(0)):
-                with txl.then_():
-                    even = txl.local_scalar("uint32", init=self.num_blocks_in_group ^ txl.uint32(1))
-                    with txl.if_(in_group < even * secondary):
-                        with txl.then_():
-                            txl.assign(self.num_blocks_in_group, even)
-                        with txl.else_():
-                            txl.assign(in_group, in_group - even * secondary)
-                            txl.assign(first, first + even)
-                            txl.assign(self.num_blocks_in_group, txl.uint32(1))
+            if spec.num_tma_multicast > 1:
+                with txl.if_(self.num_blocks_in_group % txl.uint32(2) != txl.uint32(0)):
+                    with txl.then_():
+                        even = txl.local_scalar(
+                            "uint32", init=self.num_blocks_in_group ^ txl.uint32(1)
+                        )
+                        with txl.if_(in_group < even * secondary):
+                            with txl.then_():
+                                txl.assign(self.num_blocks_in_group, even)
+                            with txl.else_():
+                                txl.assign(in_group, in_group - even * secondary)
+                                txl.assign(first, first + even)
+                                txl.assign(self.num_blocks_in_group, txl.uint32(1))
         if self.const_group_size is not None:
-            group_size = txl.uint32(per)
+            group_size = txl.uint32(self.const_group_size)
         else:
             group_size = self.num_blocks_in_group
         if on_a:
@@ -274,10 +302,6 @@ def build_kernel(spec: KernelSpec, *, backend_config=None):
         raise NotImplementedError(f"gemm type {spec.gemm_type!r} is not a 1D1D type")
     if BK != 128 or BM not in (64, 128) or spec.num_tma_threads != 128:
         raise NotImplementedError(f"unported specialization {spec}")
-    if mc > 1 and spec.is_tma_multicast_on_a:
-        # Multicast on A is not reached by any upstream SM90 1D1D shape; its branches below are
-        # written but unverified, so refuse the build rather than run them unchecked.
-        raise NotImplementedError("TMA multicast on A is not ported")
 
     # ---- template constants (`.cuh:56-75, 150-155`) ----
     num_accum = BN // 2  # WGMMA m64nBNk32 f32 accumulators per thread
@@ -617,6 +641,11 @@ def _producer(
                     txl.ptx.fence.proxy.tensormap__generic.acquire.gpu(gmem_tmap_b)
 
         unroll = c["unrolls"] if c["unrolls"] > 0 else None
+        if unroll is None and sched.odd_single_group:
+            # `#pragma unroll 0` leaves the factor to the compiler.  With both A/SFA paths live (the
+            # odd single block group under multicast) nvcc unrolls this loop x2 (+1 remainder copy; the
+            # 128x120 export), where NVRTC picks x4 and spills the 40-register producer: pin nvcc's x2.
+            unroll = 2
         with txl.serial(0, num_k_blocks, unroll=unroll, dtype="uint32") as k_block_idx:
             # Wait consumer release (`.cuh:220-221`).
             stage_idx, phase = _pipeline(iter_idx, stages)

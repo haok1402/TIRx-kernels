@@ -75,10 +75,24 @@ def _with_empty_group(case: dict) -> dict:
 
 
 _UPSTREAM = [_case(g, m, n, k, seed=i) for i, (g, m, n, k) in enumerate(_SHAPES, start=1)]
+#: Realistic MoE `down`-projection wgrad shapes outside the upstream tests that the heuristic gives
+#: TMA multicast on A (`cluster_n = 2`): Qwen3-30B-A3B at EP 64 (128x104) and Qwen3-235B-A22B at EP 32
+#: (128x120).
+_MULTICAST_ON_A = [
+    _case(2, 2048, 768, 2048, seed=51, label="cov_onA_g2_m2048_n768_k2048"),
+    _case(4, 4096, 1536, 512, seed=52, label="cov_onA_g4_m4096_n1536_k512"),
+]
+#: The other realistic class outside the upstream tests: Qwen3-235B-A22B `down` at EP 8/16 with 512
+#: tokens per expert picks 128x120 without a cluster (more than 4 groups disable multicast).
+_OTHER_REACHED = [_case(8, 4096, 1536, 512, seed=54, label="cov_g8_m4096_n1536_k512")]
 
 CONFIGS = [
     *_UPSTREAM,
     *[_with_empty_group(c) for c in _UPSTREAM],
+    *_MULTICAST_ON_A,
+    *_OTHER_REACHED,
+    # Multicast on A with an odd N-block count (7 at BLOCK_N 104): the unaligned-multicast fix-up.
+    _case(2, 2048, 728, 2048, seed=53, label="edge_onA_odd_n_blocks", group_ks=(2048, 1920)),
     # Edge shapes.  Leading, trailing and interior empty groups (the scheduler's group walk and
     # the first tensor-map rewrite), a single non-empty group, group K that are not multiples of
     # 128 (zero-padded up), and M / N that leave partial and odd block counts (TMA-clipped tiles,
@@ -92,7 +106,7 @@ CONFIGS = [
 ]
 
 #: Benchmarks run the upstream shapes; the edge shapes are correctness-only.
-BENCH_CONFIGS = list(_UPSTREAM)
+BENCH_CONFIGS = [*_UPSTREAM, *_MULTICAST_ON_A, *_OTHER_REACHED]
 
 
 def make_desc(
