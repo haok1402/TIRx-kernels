@@ -611,7 +611,8 @@ def _producer_load(locals_):
         # gLSE / gdPsum row base of this (bidb, bidh), int64 as upstream's strides (local_tile of mLSE /
         # mdPsum). The 24-register producer is sensitive to how it is held: causal binds it once per
         # tile (re-deriving it spilled 32 B), non-causal re-derives it per use (binding it spilled 4 B
-        # and made ptxas rematerialize threadIdx in the MMA loop). Both forms are spill-free.
+        # and made ptxas rematerialize threadIdx in the MMA loop). Both forms are spill-free. The
+        # sensitivity is a codegen issue: sm90-probe ISSUE-022 (A).
         if L["is_causal"]:
             stat_row = txl.local_scalar("int64", init=L["stat_base"](bidb, bidh))
         else:
@@ -762,7 +763,9 @@ def _consumer_wait(bar_ptr, phase):
 
 
 def _desc(pool_base, byte, lbo_field):
-    """64-bit GMMA descriptor of the operand at pool byte offset ``byte`` (an expression)."""
+    """64-bit GMMA descriptor of the operand at pool byte offset ``byte`` (an expression), rebuilt per
+    k-step. Advancing a base descriptor as cute does (``desc.lo += offset >> 4``) is shorter in SASS but
+    measured up to 1.4 % slower on this stack (sm90-probe ISSUE-022 (B)), so the rebuild stays."""
     lo = ((pool_base + _u32(byte)) >> txl.uint32(4)) & txl.uint32(0x3FFF) | txl.uint32(lbo_field << 16)
     return (txl.uint64(DESC_HI) << txl.uint64(32)) | txl.cast(lo, "uint64")
 

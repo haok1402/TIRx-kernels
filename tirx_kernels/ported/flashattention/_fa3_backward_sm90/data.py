@@ -135,20 +135,17 @@ def _bitwise_mismatch(actual, expected) -> int:
 
 
 def max_kv_contributors(p) -> int:
-    """The most KV blocks whose dQ partials reach one Q row block (bulk reduce-add order matters
-    only from three on: 0 + a + b == 0 + b + a in fp32)."""
-    n_blocks = _cdiv(p["s_k"], p["block_n"])
-    if not p["is_causal"]:
-        return n_blocks
-    # Causal (bottom-right aligned): the last Q row block sees every KV block up to its diagonal.
-    return min(n_blocks, _cdiv(p["s_k"] - p["s_q"] + p["s_q"], p["block_n"]))
+    """An upper bound on the KV blocks whose dQ partials reach one Q row block: all of them (the
+    causal diagonal can only lower it, which keeps this conservative). The cross-CTA bulk reduce-add
+    order matters only from three on (0 + a + b == 0 + b + a in fp32)."""
+    return _cdiv(p["s_k"], p["block_n"])
 
 
 def check_case(config, *, backend_config=None) -> dict[str, Any]:
-    """Bitwise: dK, dV, dPsum, LSE*log2e over the whole tensors (sentinel-initialised), dQ when at
-    most two KV blocks feed a row, and the dQ convert alone (upstream's dq_accum through our
-    postprocess vs upstream's dq). Tolerance (upstream's test bound, against an fp32 PyTorch
-    reference): dQ always."""
+    """Bitwise against flash_attn_3, whole tensors from a NaN sentinel: dK, dV, dPsum, LSE*log2e; the dQ
+    convert alone (upstream's dq_accum through our postprocess vs upstream's dq); dq and dq_accum under
+    K-isolation (every shape; see ``_check_k_isolation``); dq itself when at most two KV blocks feed
+    a row. Tolerance (upstream's test bound, against PyTorch references): dQ always."""
     import torch
 
     from .launch import compile_kernels, launch_backward, launch_postprocess
@@ -180,7 +177,8 @@ def check_case(config, *, backend_config=None) -> dict[str, Any]:
     torch.cuda.synchronize()
     report["dq_convert"] = _bitwise_mismatch(dq_conv, ref_dq)
 
-    bad = [k for k in ("dk", "dv", "softmax_d", "lse_log2", "dq_convert") if report[k]]
+    report.update(_check_k_isolation(ex, p))
+    bad = [k for k in ("dk", "dv", "softmax_d", "lse_log2", "dq_convert", "dq_iso", "dq_accum_iso") if report[k]]
     if report["kv_contributors"] <= 2 and report["dq_bitwise"]:
         bad.append("dq_bitwise")
     if bad:
@@ -190,6 +188,38 @@ def check_case(config, *, backend_config=None) -> dict[str, Any]:
         report.update(_check_dq_tolerance(p, ours["dq"], ref_dq))
     del s_q
     return report
+
+
+def isolated_kv_blocks(p) -> list[int]:
+    """The KV blocks K-isolation keeps: the first and the last (one block if there is only one)."""
+    n_blocks = _cdiv(p["s_k"], p["block_n"])
+    return sorted({0, n_blocks - 1})
+
+
+def _check_k_isolation(ex, p) -> dict:
+    """dQ bitwise on every shape (sm90-port-review's K-isolation check). The backward takes O and LSE
+    as inputs, so with K zeroed outside at most two KV blocks (O, LSE, Q, V, dO unchanged) every other
+    block's dQ partial is dS * 0 = +-0 exactly, and the at-most-two remaining partials commute in fp32:
+    the cross-CTA reduce order cannot matter, and dq_accum and dq must be bitwise identical to
+    flash_attn_3's on the same inputs."""
+    import torch
+
+    from .launch import launch_backward
+
+    keep = torch.zeros(p["s_k"], dtype=torch.bool, device="cuda")
+    for j in isolated_kv_blocks(p):
+        keep[j * p["block_n"] : (j + 1) * p["block_n"]] = True
+    p_iso = {key: val for key, val in p.items() if key != "_launch_args"}
+    p_iso["k"] = (p["k"] * keep[None, :, None, None].to(p["k"].dtype)).contiguous()
+    ours = alloc_outputs(p_iso)
+    launch_backward(ex, p_iso, ours)
+    ref = run_fa3(p_iso)
+    torch.cuda.synchronize()
+    return {
+        "dq_iso": _bitwise_mismatch(ours["dq"], ref[0]),
+        "dq_accum_iso": _bitwise_mismatch(ours["dq_accum"], ref[5]),
+        "iso_blocks": isolated_kv_blocks(p),
+    }
 
 
 def attention_ref(q, k, v, causal=False, upcast=True, reorder_ops=False):
