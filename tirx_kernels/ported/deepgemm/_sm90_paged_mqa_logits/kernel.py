@@ -547,12 +547,11 @@ def _reduce_and_store(
         return weights[w0 + (j // 4) * 2 + (j & 1)]
 
     def relu(j):
-        r = txl.local_scalar("float32")
-        txl.ptx["max.f32"](r, accum[a0 + j], zero)
-        return r
+        # `fmaxf(x, 0)`: IEEE maxNum, one `max.f32` (FMNMX).
+        return txl.local_scalar("float32", init=txl.fmax(accum[a0 + j], zero))
 
     # Plain FP32 arithmetic under `fp_mode="precise"` (NVRTC contracts `a * b + c` to `fma.rn.f32` as
-    # nvcc does); `max` stays explicit `max.f32` (ISSUE-009).
+    # nvcc does).
     r0 = [relu(k) for k in range(4)]
     sums = []
     for k in range(4):
