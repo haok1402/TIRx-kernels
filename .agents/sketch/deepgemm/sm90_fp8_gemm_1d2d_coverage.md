@@ -100,7 +100,7 @@ for i in static_range(kNumAccum // 4):
     p = i < num_former_iters                       # runtime, per element group
     fma(dst[4i+0], select(p, s00, s01), accum[4i+0])   # ... x4
 # instruction_selection (export, 128x112 and 128x48): nvcc factors the select out of the products:
-#   per i (i = 0 folds, num_former_iters >= 2): setp on min.u32(...) -> selp.f32 sb = p ? scale_b_0 : scale_b_1,
+#   per i (i = 0 folds to the first scale; 13 selp per unrolled copy at BN 112): setp on min.u32(...) -> selp.f32 sb = p ? scale_b_0 : scale_b_1,
 #   then mul.f32 sa0*sb and mul.f32 sa1*sb, then 4 fma.rn.f32 (.cuh:342-346, "(predicate ? s00 : s01) * acc").
 #   That is bitwise the source expression (sa*(p ? b0 : b1) == p ? sa*b0 : sa*b1). Totals for 128x112:
 #   104 selp.f32, 208 mul.f32, 448 fma.rn.f32. The port emits exactly this form: txl.select on the B
