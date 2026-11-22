@@ -222,6 +222,8 @@ def _gen_kv_scope(c, s_k, block_size, topk, have_topk_length, device):
     topk_length = (
         torch.randint(0, topk + 1, (b,), dtype=torch.int32, device=device) if have_topk_length else None
     )
+    if have_topk_length and c.get("topk_length_value") is not None:
+        topk_length.fill_(c["topk_length_value"])  # edge shapes: e.g. every length 0
     if have_topk_length:
         masked = indices.clone()
         ar = torch.arange(0, topk, device=device).view(1, 1, topk).broadcast_to(b, s_q, topk)
@@ -235,6 +237,13 @@ def _gen_kv_scope(c, s_k, block_size, topk, have_topk_length, device):
     flat[unused, :, :] = float("nan")
     blocked_k = flat.view(-1, block_size, 1, d_qk)
     kq = quantize_k_cache(blocked_k, d_qk)
+    fill = c.get("index_fill_beyond_topk_length")
+    if have_topk_length and fill is not None:
+        # Edge shapes: garbage (e.g. INT_MAX) indices past topk_length, which the kernel must not
+        # dereference (splitkv_mla.cuh:531-536); the reference masks them by topk_length.
+        ar = torch.arange(0, topk, device=device).view(1, 1, topk).broadcast_to(b, s_q, topk)
+        indices = indices.clone()
+        indices[ar >= topk_length.view(b, 1, 1)] = fill
     return {
         "seqlens": seqlens,
         "block_table": _non_contiguousify(block_table),
@@ -259,6 +268,8 @@ def generate(config: dict, device="cuda") -> dict:
         inf_mask = torch.randn((h_q,), dtype=torch.float32, device=device)
         attn_sink[inf_mask > 0.5] = float("inf")
         attn_sink[inf_mask < -0.5] = float("-inf")
+        if c.get("attn_sink_value") is not None:
+            attn_sink.fill_(c["attn_sink_value"])
     scope0 = _gen_kv_scope(c, c["s_k"], c["block_size"], c["topk"], c["have_topk_length"], device)
     scope1 = None
     if c.get("extra_topk") is not None:
@@ -287,14 +298,16 @@ def torch_reference(g):
     def scope(sc):
         idx = sc["indices"]
         topk = idx.size(-1)
-        gathered = (
-            sc["k_dequant"].view(-1, d_qk).index_select(0, torch.clamp_min(idx, 0).reshape(-1))
-            .view(b, s_q, topk, d_qk)
-        )
         invalid = idx == -1
         if sc["topk_length"] is not None:
             ar = torch.arange(0, topk, device=idx.device).view(1, 1, topk).broadcast_to(b, s_q, topk)
             invalid |= ar >= sc["topk_length"].view(b, 1, 1)
+        # Upstream clamps at 0 only; the edge shapes also put INT_MAX past topk_length, so gather
+        # through the mask (the masked rows are -inf-weighted either way).
+        safe = torch.where(invalid, torch.zeros_like(idx), idx)
+        gathered = (
+            sc["k_dequant"].view(-1, d_qk).index_select(0, safe.reshape(-1)).view(b, s_q, topk, d_qk)
+        )
         return gathered, invalid
 
     kv, invalid = scope(g["kv"])
@@ -439,5 +452,83 @@ def check_is_allclose(name, ans, ref, abs_tol=1e-5, rel_tol=1e-2, cos_diff_tol=1
         raise AssertionError(f"`{name}` cosine diff too large: {cos_diff} vs {cos_diff_tol}")
 
 
-def check_case(config, *, backend_config=None, kernel="flashmla_sm90_sparse_fp8_decode"):
-    raise NotImplementedError("filled in with the kernel")
+def check_case(config, *, backend_config=None, kernel="flashmla_sm90_sparse_fp8_decode", reference=True):
+    """Run one case; raise AssertionError on any mismatch. Returns a small result dict."""
+    import torch
+
+    from .launch import compile_kernels, launch_decode, launch_sched_meta, model_type_of
+
+    g = prepare(**config)
+    c = g["config"]
+    ex = compile_kernels(model_type_of(c["d_qk"]), c["h_q"], backend_config=backend_config)
+    detail = f"{c} parts={g['num_sm_parts']}"
+
+    # Upstream first: its sched_meta is built by its own scheduler kernel on the first call.
+    ref_out, ref_lse, sched_meta = run_flashmla(g)
+    torch.cuda.synchronize()
+
+    # Scheduler metadata: the 7 fields of every part, and num_splits, exact.
+    fill_sentinel(g["tile_scheduler_metadata"])
+    fill_sentinel(g["num_splits"])
+    launch_sched_meta(ex, g)
+    torch.cuda.synchronize()
+    ref_meta, ref_splits = sched_meta.tile_scheduler_metadata, sched_meta.num_splits
+    if not torch.equal(g["num_splits"], ref_splits):
+        raise AssertionError(f"{kernel} {detail}: num_splits differs from FlashMLA's")
+    if not torch.equal(g["tile_scheduler_metadata"][:, :7], ref_meta[:, :7]):
+        bad = (g["tile_scheduler_metadata"][:, :7] != ref_meta[:, :7]).any(1).nonzero()
+        raise AssertionError(f"{kernel} {detail}: scheduler metadata differs at parts {bad[:4]}")
+
+    # Main + combine, NaN sentinel on every output and workspace.
+    for name in ("out", "lse", "out_accum", "lse_accum"):
+        fill_sentinel(g[name])
+    launch_decode(ex, g)
+    torch.cuda.synchronize()
+    out, lse = g["out"], g["lse"].transpose(1, 2)
+    n_out, first_out = bitwise_diff(out, ref_out)
+    n_lse, first_lse = bitwise_diff(lse, ref_lse)
+    if n_out or n_lse:
+        raise AssertionError(
+            f"{kernel} {detail}: not bitwise identical to FlashMLA: out {n_out}/{out.numel()} "
+            f"(first {first_out}), lse {n_lse}/{lse.numel()} (first {first_lse})"
+        )
+    if reference:
+        # FlashMLA's own acceptance test against the upstream PyTorch reference.
+        out_ref, lse_ref = torch_reference(g)
+        check_is_allclose("out", out, out_ref, abs_tol=1e-3, rel_tol=2.01 / 128, cos_diff_tol=5e-6)
+        check_is_allclose("lse", lse, lse_ref, abs_tol=1e-6, rel_tol=8.01 / 65536)
+    return {"bitwise": True, "num_sm_parts": g["num_sm_parts"]}
+
+
+def bench_against_flashmla(
+    executables, config, *, warmup=None, repeat=None, timer=None, rounds=1, cooldown_s=1.0
+):
+    """Kernel-only: our main + combine against FlashMLA's (scheduler metadata precomputed by both,
+    as `flash_mla_with_kvcache` does after its first call)."""
+    import torch
+
+    from tirx_kernels.runner import bench
+
+    from .launch import launch_decode, launch_sched_meta
+
+    g = prepare(**config)
+    launch_sched_meta(executables, g)
+    torch.cuda.synchronize()
+
+    def tirx():
+        launch_decode(executables, g)
+
+    def build_reference():
+        _, _, sched_meta = run_flashmla(g)
+        torch.cuda.synchronize()
+        return lambda: run_flashmla(g, sched_meta)
+
+    return bench(
+        {"tirx": tirx},
+        references={"flashmla": build_reference},
+        warmup=warmup,
+        repeat=repeat,
+        timer=timer,
+        rounds=rounds,
+        cooldown_s=cooldown_s,
+    )

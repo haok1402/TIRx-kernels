@@ -66,6 +66,7 @@ def _case(
     have_zero_seqlen_k=False,
     seed=0,
     prefix="",
+    **extra_opts,
 ) -> dict:
     """One `RawTestParamForDecode` of `tests/test_flash_mla_sparse_decoding.py` as a config dict."""
     if extra_topk is not None:
@@ -84,6 +85,7 @@ def _case(
         )
         + f"{'_allinvalid' if is_all_indices_invalid else ''}{'_zeroseq' if have_zero_seqlen_k else ''}"
         + (f"_s{seed}" if seed else "")
+        + "".join(f"_{k}{v}" for k, v in sorted(extra_opts.items()))
     )
     return {
         "label": label,
@@ -104,6 +106,7 @@ def _case(
         "is_all_indices_invalid": is_all_indices_invalid,
         "have_zero_seqlen_k": have_zero_seqlen_k,
         "seed": seed,
+        **extra_opts,
     }
 
 
@@ -207,7 +210,65 @@ def upstream_performance_cases() -> list[dict]:
     return out
 
 
-CONFIGS: list[dict] = []  # filled at the correctness stage
+def _official_subset() -> list[dict]:
+    """A cover of the upstream grid for the official runner: per feature group (model, h_q,
+    topk_length, extra KV, extra_topk_length) every (s_k, topk, page) triple once (paired with
+    the same extra triple), at b = 74 / s_q = 3 varlen, plus b = 4 and b = 321 at s_q = 1; and the
+    corner cases with all indices invalid and with zero-length sequences. The full grids run
+    through `upstream_correctness_cases` / `upstream_corner_cases` (scripted sweep)."""
+    picked = []
+    for d_qk, have_x, have_xtl, have_tl, h_q in _feature_axes():
+        for n, (s_k, topk, bs) in enumerate(_SK_TOPK_BS):
+            ex = _SK_TOPK_BS[n] if have_x else (None, None, None)
+            for b, s_q in ((74, 3), (4, 1), (321, 1)) if n == 0 else ((74, 3),):
+                picked.append(
+                    _case(b, h_q, s_q, s_k, True, topk, d_qk=d_qk, block_size=bs,
+                          have_topk_length=have_tl, enable_attn_sink=True, extra_s_k=ex[0],
+                          extra_topk=ex[1], extra_block_size=ex[2], have_extra_topk_length=have_xtl)
+                )
+        s_k, topk, bs = _CORNER_SK_TOPK_BS[1]
+        ex = _CORNER_SK_TOPK_BS[1] if have_x else (None, None, None)
+        for all_invalid, zero_seq, sink in ((True, False, True), (False, True, False)):
+            picked.append(
+                _case(74, h_q, 3, s_k, True, topk, d_qk=d_qk, block_size=bs, have_topk_length=have_tl,
+                      enable_attn_sink=sink, extra_s_k=ex[0], extra_topk=ex[1],
+                      extra_block_size=ex[2], have_extra_topk_length=have_xtl,
+                      is_all_indices_invalid=all_invalid, have_zero_seqlen_k=zero_seq)
+            )
+    return picked
+
+
+INT_MAX = 2147483647
+
+#: Edge shapes beyond the upstream grid.
+EDGE_CASES = [
+    # one request split over every partition (b = 1, topk 16384)
+    _case(1, 128, 1, 65536, False, 16384, d_qk=576, prefix="edge_", seed=21),
+    _case(1, 64, 1, 65536, False, 16384, d_qk=512, prefix="edge_", seed=22),
+    # s_k < topk: -1 padding inside the index rows; page size 1
+    _case(3, 64, 7, 100, True, 128, d_qk=576, block_size=1, prefix="edge_", seed=23),
+    # num_sm_parts == 1 (s_q * h_q / 64 >= 132): one CTA walks every request (Q reload parity)
+    _case(24, 128, 66, 256, True, 64, d_qk=576, prefix="edge_", seed=24),
+    _case(20, 64, 140, 300, True, 128, d_qk=512, have_topk_length=True, prefix="edge_", seed=25),
+    # MODEL1: INT_MAX indices past topk_length / extra_topk_length (no IMA, masked)
+    _case(37, 64, 2, 2000, True, 512, d_qk=512, have_topk_length=True, extra_s_k=1500,
+          extra_topk=256, extra_block_size=2, have_extra_topk_length=True, prefix="edge_", seed=26,
+          index_fill_beyond_topk_length=INT_MAX),
+    _case(37, 128, 2, 2000, True, 512, d_qk=512, have_topk_length=True, extra_s_k=1500,
+          extra_topk=256, extra_block_size=2048, have_extra_topk_length=True, prefix="edge_",
+          seed=27, index_fill_beyond_topk_length=INT_MAX),
+    # MODEL1: every topk_length and extra_topk_length 0 (only padded, fully masked blocks)
+    _case(9, 128, 3, 700, True, 128, d_qk=512, have_topk_length=True, extra_s_k=700,
+          extra_topk=128, have_extra_topk_length=True, prefix="edge_", seed=28, topk_length_value=0),
+    # attention sink +inf / -inf everywhere
+    _case(16, 64, 2, 1024, True, 256, d_qk=576, prefix="edge_", seed=29, attn_sink_value=float("inf")),
+    _case(16, 128, 2, 1024, True, 256, d_qk=512, prefix="edge_", seed=30, attn_sink_value=float("-inf")),
+    # many short requests, mostly unsplit (b = 132, topk 64)
+    _case(132, 64, 1, 64, False, 64, d_qk=576, prefix="edge_", seed=31),
+    _case(132, 128, 1, 64, False, 64, d_qk=512, prefix="edge_", seed=32),
+]
+
+CONFIGS: list[dict] = [*_official_subset(), *EDGE_CASES]
 
 BENCH_CONFIGS: list[dict] = upstream_performance_cases()
 
@@ -236,19 +297,67 @@ def run_test(*, backend_config=None, **config):
     return check_case(config, backend_config=backend_config, kernel=KERNEL_META["name"])
 
 
+def prepare_bench(*, backend_config=None, **config):
+    """Compile the three kernels without touching CUDA."""
+    from tirx_kernels.runner import prepared_gpu_benchmark
+
+    from ._sm90_sparse_fp8_decode.launch import compile_kernels, model_type_of
+
+    config.pop("label", None)
+    state = {
+        "config": dict(config),
+        "executables": compile_kernels(
+            model_type_of(config["d_qk"]), config["h_q"], backend_config=backend_config
+        ),
+    }
+    return prepared_gpu_benchmark(run_gpu, state, backend_config=backend_config)
+
+
+def run_gpu(
+    prepared,
+    *,
+    warmup=None,
+    repeat=None,
+    timer=None,
+    rounds=1,
+    cooldown_s=1.0,
+    backend_config=None,
+    **config,
+):
+    from ._sm90_sparse_fp8_decode.data import bench_against_flashmla
+
+    del backend_config
+    config = {**prepared["config"], **config}
+    config.pop("label", None)
+    return bench_against_flashmla(
+        prepared["executables"],
+        config,
+        warmup=warmup,
+        repeat=repeat,
+        timer=timer,
+        rounds=rounds,
+        cooldown_s=cooldown_s,
+    )
+
+
 def run_bench(
     *, warmup=None, repeat=None, timer=None, rounds=1, cooldown_s=1.0, backend_config=None, **config
 ):
-    raise NotImplementedError
+    return prepare_bench(**config, backend_config=backend_config).run_gpu(
+        warmup=warmup, repeat=repeat, timer=timer, rounds=rounds, cooldown_s=cooldown_s
+    )
 
 
 __all__ = [
     "BENCH_CONFIGS",
     "CONFIGS",
+    "EDGE_CASES",
     "KERNEL_META",
     "get_kernel",
+    "prepare_bench",
     "prepare_data",
     "run_bench",
+    "run_gpu",
     "run_test",
     "upstream_correctness_cases",
     "upstream_corner_cases",
