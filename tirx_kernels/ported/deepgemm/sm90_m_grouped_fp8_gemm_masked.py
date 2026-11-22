@@ -68,6 +68,10 @@ CONFIGS = [
 ]
 
 
+#: Benchmarks run the upstream shapes; the edge shapes are correctness-only.
+BENCH_CONFIGS = [c for c in CONFIGS if not c["label"].startswith("edge_")]
+
+
 def make_desc(
     *, num_groups, expected_m_per_group, N, K, max_m=4096, seed=0, group_ms=None, num_sms=None
 ):
@@ -220,6 +224,7 @@ def run_bench(
 
 
 __all__ = [
+    "BENCH_CONFIGS",
     "CONFIGS",
     "KERNEL_META",
     "get_kernel",

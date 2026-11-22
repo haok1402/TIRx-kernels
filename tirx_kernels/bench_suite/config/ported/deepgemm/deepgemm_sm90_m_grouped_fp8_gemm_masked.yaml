@@ -1,0 +1,11 @@
+kernel: deepgemm_sm90_m_grouped_fp8_gemm_masked
+selection_rationale: The defaults span many-small-group and few-large-group masks and every specialization class the upstream SM90 shapes select (128x192 and 64-row tiles, with and without multicast).
+configs:
+  - {config: g32_m192_n6144_k7168, default: true, selection_role: large}
+  - {config: g32_m192_n4096_k2048, default: false}
+  - {config: g6_m1024_n6144_k7168, default: false}
+  - {config: g6_m1024_n4096_k2048, default: true, selection_role: medium}
+  - {config: g32_m20_n6144_k7168, default: false}
+  - {config: g32_m20_n4096_k4096, default: false}
+  - {config: g6_m20_n6144_k7168, default: false}
+  - {config: g6_m20_n4096_k4096, default: true, selection_role: small}

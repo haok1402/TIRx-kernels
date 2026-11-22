@@ -1,6 +1,4 @@
-# This file is a TIRx port of code from DeepGEMM
-# (https://github.com/deepseek-ai/DeepGEMM @ 559d79fb), Copyright (c) 2025 DeepSeek
-# SPDX-License-Identifier: Apache-2.0 AND MIT
+# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright TIRx authors
 
 """Shared TIRx port of DeepGEMM's SM90 `sm90_fp8_gemm_1d2d` implementation.
