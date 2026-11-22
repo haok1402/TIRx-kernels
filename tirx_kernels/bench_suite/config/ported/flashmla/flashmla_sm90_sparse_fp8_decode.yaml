@@ -2,11 +2,11 @@
 # performance_cases): DeepSeek-V3.2 (V32, d_qk 576, 128 heads) and MODEL1 (d_qk 512, 64 / 128 heads, extra
 # KV cache, extra_topk_length) production batch sizes, and the peak-perf shapes (topk 16384).
 kernel: flashmla_sm90_sparse_fp8_decode
-selection_rationale: The defaults span V3.2 (128 heads, cluster of 2) and MODEL1 with the extra KV cache and extra_topk_length (128 heads), and the MODEL1 peak top-k (16384).
+selection_rationale: The defaults bracket the cost range - MODEL1 with the extra KV cache and extra_topk_length at 128 heads (about 150 us, small), the DeepSeek-V3.2 production shape at 128 heads (about 210 us, medium), and the MODEL1 peak top-k 16384 shape (about 3 ms, large). The other production batch sizes and the 64-head shapes stay available but off by default.
 configs:
   - {config: prod_v32_v32_b2_hq128_sq2_sk32768_topk2048_bs64_varlen, default: false}
   - {config: prod_v32_v32_b64_hq128_sq2_sk32768_topk2048_bs64_varlen, default: false}
-  - {config: prod_v32_v32_b74_hq128_sq2_sk32768_topk2048_bs64_varlen, default: true}
+  - {config: prod_v32_v32_b74_hq128_sq2_sk32768_topk2048_bs64_varlen, default: true, selection_role: medium}
   - {config: prod_v32_v32_b128_hq128_sq2_sk32768_topk2048_bs64_varlen, default: false}
   - {config: prod_m1c1_model1_b2_hq64_sq2_sk16384_topk128_bs256_varlen_x16384_512_64, default: false}
   - {config: prod_m1c1_model1_b64_hq64_sq2_sk16384_topk128_bs256_varlen_x16384_512_64, default: false}
@@ -29,10 +29,10 @@ configs:
   - {config: prod_m1c4_model1_b2_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
   - {config: prod_m1c4_model1_b64_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
   - {config: prod_m1c4_model1_b74_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
-  - {config: prod_m1c4_model1_b128_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: true}
+  - {config: prod_m1c4_model1_b128_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: true, selection_role: small}
   - {config: prod_m1c4_model1_b148_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
   - {config: prod_m1c4_model1_b256_hq128_sq2_sk16384_topk128_bs256_varlen_x16384_1024_2_xtl, default: false}
   - {config: peak_model1_b148_hq64_sq2_sk32768_topk16384_bs64_varlen, default: false}
   - {config: peak_v32_b148_hq64_sq2_sk32768_topk16384_bs64_varlen, default: false}
-  - {config: peak_model1_b148_hq128_sq2_sk32768_topk16384_bs64_varlen, default: true}
+  - {config: peak_model1_b148_hq128_sq2_sk32768_topk16384_bs64_varlen, default: true, selection_role: large}
   - {config: peak_v32_b148_hq128_sq2_sk32768_topk16384_bs64_varlen, default: false}
