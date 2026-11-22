@@ -70,8 +70,10 @@ mc_b = 1                                                            # on-A: B is
 #     (tma_copy.cuh:31), per CTA. ABSENT from these exports: N is a template constant and ceil(N/BN) is even, so
 #     nvcc proves num_blocks_in_group != 1 (first is a multiple of kNum1DBlocksPerGroup, so num_n_blocks - first is
 #     even) and folds is_tma_multicast_valid to true. With ceil(N/BN) odd (legal only for MGroupedContiguous,
-#     sm90.hpp:87-91) the tail column has num_blocks_in_group == 1 and this branch is live; its selection comes
-#     from the odd-N edge export (contig g4 n6352 k2048, 57 N blocks, `export_ext.py` RAW_CASES).
+#     sm90.hpp:87-91) the tail column has num_blocks_in_group == 1 and this branch is live. Odd-N edge export
+#     (contig g4 n6352 k2048, 57 N blocks, `export_ext.py` RAW_CASES; heuristic picks 128x112 1x2 on A, 2 waves):
+#     A and SFA appear in BOTH forms (2 plain + 2 multicast each), B plain only; producer unrolled 2x
+#     (2 expect_tx); promotion/WGMMA counts as the even-N 128x112 row.
 #   B: only the plain form above, per CTA (tma_copy.cuh:31).
 #   expect_bytes: mbarrier.arrive.expect_tx.shared::cta.b64, one per K block (base :323-324).
 #   Producer K loop (.cuh:183, a runtime-form loop over the compile-time num_total_k_blocks): nvcc unrolls it by
@@ -207,3 +209,4 @@ and masked 64x32 (K = 2048, fully unrolled), but 4 for contig 128x32 at the same
 | masked 64x32_s16, none | 32 m64n32k32 | 16 | 128 | 0 | 4 | 0 / 48 | 16 | 1 | 0 |
 | masked 64x48_s15, none | 32 m64n48k32 | 80 | 192 | 40 | 6 | 0 / 12 | 4 | 1 | 0 |
 | masked 64x64_s13, none | 32 m64n64k32 | 16 | 256 | 0 | 8 | 0 / 36 | 12 | 1 | 0 |
+| contig 128x112_s6, on A, odd N (g4 n6352 k2048) | 32 m64n112k32 | 208 | 448 | 104 | 14 | 4 / 6 | 2 | 1 | 0 |
