@@ -42,13 +42,34 @@ def _u32(x):
     return txl.cast(x, "uint32")
 
 
+#: `ClusterBarrier::wait` (`cutlass/arch/barrier.h:404-426`) verbatim: the retry loop lives inside
+#: one asm block, so a loop around a wait has no inner C loop and nvcc/nvrtc can still unroll it
+#: (the source's producer KV loop is unrolled by 4 + a 3-copy remainder).
+_CLUSTER_BARRIER_WAIT = """
+__forceinline__ __device__ void deepgemm_cluster_barrier_wait(void* barrier, uint32_t phase) {
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile(
+        "{\\n"
+        ".reg .pred                P1;\\n"
+        "LAB_WAIT:\\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1, %2;\\n"
+        "@P1                       bra DONE;\\n"
+        "bra                   LAB_WAIT;\\n"
+        "DONE:\\n"
+        "}\\n"
+        :: "r"(smem_addr), "r"(phase), "r"(TICKSU));
+}
+""".replace("TICKS", hex(TRY_WAIT_TICKS))
+
+
 def _wait(barrier_ptr, phase):
-    """`ClusterTransactionBarrier::wait`: try_wait.parity with the suspend hint, retried."""
-    done = txl.local_scalar("uint32", init=txl.uint32(0))
-    with txl.while_(done == txl.uint32(0)):
-        txl.ptx["mbarrier.try_wait.parity.shared::cta.b64"](
-            done, barrier_ptr, _u32(phase), txl.uint32(TRY_WAIT_TICKS)
-        )
+    """`ClusterTransactionBarrier::wait`: try_wait.parity with the suspend hint, retried in asm."""
+    txl.cuda.func_call(
+        "deepgemm_cluster_barrier_wait",
+        barrier_ptr,
+        _u32(phase),
+        source_code=_CLUSTER_BARRIER_WAIT,
+    )
 
 
 def _elect():
@@ -83,7 +104,8 @@ def build_kernel(spec, *, backend_config=None):
     # GMMA descriptor high word: SBO = 8*D >> 4 in bits [32,46), layout type in bits [62,64).
     desc_hi = ((8 * D) >> 4) | (_GMMA_LAYOUT[D] << 30)
 
-    @txl.kernel()
+    # The only C-level helper is the local-PTX barrier wait above.
+    @txl.kernel(allowed_func_calls=("deepgemm_cluster_barrier_wait",))
     def sm90_fp8_mqa_logits(
         seq_len_arg: "int32",
         seq_len_kv_arg: "int32",
