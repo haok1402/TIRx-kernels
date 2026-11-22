@@ -222,10 +222,26 @@ def build_main_kernel(dtype: str, *, backend_config=None):
         def fence_async_shared():
             txl.ptx.fence.proxy.async_.shared__cta()
 
-        def desc(hi, byte):
-            """A 64-bit GMMA descriptor for the tile at pool byte offset `byte`."""
-            addr = (pool_base + _u32(byte)) >> txl.uint32(4)
-            return txl.uint64(hi) | txl.cast(addr & txl.uint32(0x3FFF), "uint64")
+        # GMMA descriptor start-address field (address >> 4, 14 bits) of the pool base. Every
+        # operand offset is a compile-time constant and the pool lies below 256 KiB, so a
+        # descriptor is this base plus a constant in the low word, packed with a constant high
+        # word -- as cute advances its descriptors (`desc.lo += offset >> 4`).
+        # The low word also carries the LBO field, so each layout gets its own base low word.
+        start_field = txl.local_scalar(
+            "uint32", init=(pool_base >> txl.uint32(4)) & txl.uint32(0x3FFF)
+        )
+        desc_lo_base = {}
+        for layout in (DESC_K_HI, DESC_MN_HI):
+            desc_lo_base[layout] = txl.local_scalar(
+                "uint32", init=start_field | txl.uint32(layout & 0xFFFFFFFF)
+            )
+
+        def desc(layout, byte):
+            """A 64-bit GMMA descriptor for the tile at pool byte offset `byte` (a constant):
+            {base low word + (byte >> 4), constant high word}."""
+            assert isinstance(byte, int) and byte % 16 == 0
+            lo = desc_lo_base[layout] + txl.uint32(byte >> 4)
+            return (txl.uint64(layout >> 32) << txl.uint64(32)) | txl.cast(lo, "uint64")
 
         def fence_regs(regs, n):
             for i in range(n):
