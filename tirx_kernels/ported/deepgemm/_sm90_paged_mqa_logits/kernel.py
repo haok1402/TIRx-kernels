@@ -13,7 +13,7 @@ the schedule metadata DeepGEMM's metadata kernel produced. A task is (q, kv spli
   3-stage ring, through a 32-task block-table window held in lanes. Group 0 also prefetches the
   next q's Q rows and weights into the shared 3-stage Q ring.
 - Math warpgroup g computes `m64n{next_n*H}k32` WGMMA chains against the q's Q rows, then the
-  ReLU x weight head reduction (explicit non-FTZ PTX, in nvcc's order), the KV-scale multiply,
+  ReLU x weight head reduction (non-FTZ under `fp_mode="precise"`, in nvcc's order), the KV-scale multiply,
   two butterflies, and the stores.
 
 Every shared-memory buffer is a byte offset into one linear pool (`.cuh:62-106`). The
@@ -22,7 +22,7 @@ Every shared-memory buffer is a byte offset into one linear pool (`.cuh:62-106`)
 
 import tirx_kernels.tirx_lite as txl
 
-from .._sm90_mqa_logits.kernel import _CLUSTER_BARRIER_WAIT, EVICT_NORMAL, FULL_MASK, _elect, _u32
+from .._sm90_mqa_logits.kernel import EVICT_NORMAL, FULL_MASK, _elect, _u32, _wait, _with_fp_mode
 
 BLOCK_KV = 64
 NUM_Q_STAGES = 3
@@ -38,13 +38,6 @@ _GMMA_LAYOUT = {128: 1, 64: 2, 32: 3}
 
 def _align(x, a):
     return (x + a - 1) // a * a
-
-
-def _wait(barrier_ptr, phase):
-    """`ClusterTransactionBarrier::wait`: the cutlass single-asm try_wait retry loop."""
-    txl.cuda.func_call(
-        "deepgemm_cluster_barrier_wait", barrier_ptr, _u32(phase), source_code=_CLUSTER_BARRIER_WAIT
-    )
 
 
 class _Scheduler:
@@ -138,8 +131,7 @@ def build_kernel(spec, *, backend_config=None):
         raise AssertionError("pool layout disagrees with the host smem size")
     desc_hi = ((8 * D) >> 4) | (_GMMA_LAYOUT[D] << 30)
 
-    # The only C-level helper is the local-PTX barrier wait (cutlass ClusterBarrier::wait).
-    @txl.kernel(allowed_func_calls=("deepgemm_cluster_barrier_wait",))
+    @txl.kernel()
     def sm90_fp8_paged_mqa_logits(
         batch_size_arg: "int32",
         logits_stride_arg: "int32",
@@ -156,7 +148,7 @@ def build_kernel(spec, *, backend_config=None):
         txl.device_entry(
             launch=txl.cuda.LaunchConfig(grid=spec.num_sms, block=128 + NUM_MATH_THREADS),
             kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1),
-            backend_config=backend_config,
+            backend_config=_with_fp_mode(backend_config),
         )
         batch_size = txl.local_scalar("uint32", init=_u32(batch_size_arg))
         logits_stride = txl.local_scalar("uint32", init=_u32(logits_stride_arg))
@@ -544,7 +536,7 @@ def build_kernel(spec, *, backend_config=None):
 def _reduce_and_store(
     accum, a0, weights, w0, H, scale_kv_0, scale_kv_1, zero, *, index, logits, is_bf16, elem
 ):
-    """One next_n row of `.cuh:295-328` as the non-FTZ PTX nvcc emits, in its order.
+    """One next_n row of `.cuh:295-328`, in the order nvcc emits (non-FTZ under `fp_mode="precise"`).
 
     Accumulator `a0 + J` belongs to weight `w0 + (J//4)*2 + (J&1)`. nvcc contracts
     `sum[k] = t(k); sum[k] += t(4j + k)` to `fma(max(a[k]), w, max(a[4+k]) * w')`, followed by one
@@ -559,27 +551,22 @@ def _reduce_and_store(
         txl.ptx["max.f32"](r, accum[a0 + j], zero)
         return r
 
+    # Plain FP32 arithmetic under `fp_mode="precise"` (NVRTC contracts `a * b + c` to `fma.rn.f32` as
+    # nvcc does); `max` stays explicit `max.f32` (ISSUE-009).
     r0 = [relu(k) for k in range(4)]
     sums = []
     for k in range(4):
         r1 = relu(4 + k)
-        s = txl.local_scalar("float32")
-        txl.ptx["mul.f32"](s, r1, w(4 + k))
-        txl.ptx["fma.rn.f32"](s, r0[k], w(k), s)
+        s = txl.local_scalar("float32", init=r1 * w(4 + k))
+        txl.assign(s, r0[k] * w(k) + s)
         sums.append(s)
     for j in range(2, H // 8):
         for k in range(4):
             r = relu(4 * j + k)
-            txl.ptx["fma.rn.f32"](sums[k], r, w(4 * j + k), sums[k])
+            txl.assign(sums[k], r * w(4 * j + k) + sums[k])
 
-    t_0 = txl.local_scalar("float32")
-    v_0 = txl.local_scalar("float32")
-    t_1 = txl.local_scalar("float32")
-    v_1 = txl.local_scalar("float32")
-    txl.ptx["add.f32"](t_0, sums[0], sums[1])
-    txl.ptx["mul.f32"](v_0, scale_kv_0, t_0)
-    txl.ptx["add.f32"](t_1, sums[2], sums[3])
-    txl.ptx["mul.f32"](v_1, scale_kv_1, t_1)
+    v_0 = txl.local_scalar("float32", init=scale_kv_0 * (sums[0] + sums[1]))
+    v_1 = txl.local_scalar("float32", init=scale_kv_1 * (sums[2] + sums[3]))
 
     # Inter-thread reduction
     for m in (1, 2):
@@ -592,7 +579,7 @@ def _reduce_and_store(
                 txl.uint32(31),
                 txl.uint32(FULL_MASK),
             )
-            txl.ptx["add.f32"](v, v, txl.reinterpret(o, ty="float32"))
+            txl.assign(v, v + txl.reinterpret(o, ty="float32"))
 
     # Store into the global memory: `[base]` and `[base + 8 elements]` (v_1_offset = v_0_offset + 8)
     ptr_0 = logits.ptr_to([txl.cast(index, "int64")])

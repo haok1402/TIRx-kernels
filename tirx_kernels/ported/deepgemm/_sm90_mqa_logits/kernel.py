@@ -13,8 +13,8 @@ the heads, scale by the KV row scale and store the logits.
 
 Every shared-memory buffer is a one-dimensional allocation at the byte offset the source computes
 (`.cuh:58-95`); the `kHeadDim`-byte swizzle of Q and KV lives in the TensorMaps and the WGMMA
-descriptors.  The FP32 head reduction is explicit non-FTZ PTX in the operation order nvcc emits for
-the source (DeepGEMM builds without fast math).
+descriptors.  DeepGEMM builds without fast math, so the kernel compiles with `fp_mode="precise"`
+(no FTZ); the head reduction is written in the operation order nvcc emits for the source.
 """
 
 import tirx_kernels.tirx_lite as txl
@@ -42,34 +42,23 @@ def _u32(x):
     return txl.cast(x, "uint32")
 
 
-#: `ClusterBarrier::wait` (`cutlass/arch/barrier.h:404-426`) verbatim: the retry loop lives inside
-#: one asm block, so a loop around a wait has no inner C loop and nvcc/nvrtc can still unroll it
-#: (the source's producer KV loop is unrolled by 4 + a 3-copy remainder).
-_CLUSTER_BARRIER_WAIT = """
-__forceinline__ __device__ void deepgemm_cluster_barrier_wait(void* barrier, uint32_t phase) {
-    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
-    asm volatile(
-        "{\\n"
-        ".reg .pred                P1;\\n"
-        "LAB_WAIT:\\n"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1, %2;\\n"
-        "@P1                       bra DONE;\\n"
-        "bra                   LAB_WAIT;\\n"
-        "DONE:\\n"
-        "}\\n"
-        :: "r"(smem_addr), "r"(phase), "r"(TICKSU));
-}
-""".replace("TICKS", hex(TRY_WAIT_TICKS))
-
-
 def _wait(barrier_ptr, phase):
-    """`ClusterTransactionBarrier::wait`: try_wait.parity with the suspend hint, retried in asm."""
-    txl.cuda.func_call(
-        "deepgemm_cluster_barrier_wait",
-        barrier_ptr,
-        _u32(phase),
-        source_code=_CLUSTER_BARRIER_WAIT,
-    )
+    """`ClusterTransactionBarrier::wait`: cutlass's one-asm try_wait retry loop (suspend hint 0x989680).
+
+    One asm block, not a TIRx loop around the single-shot `try_wait`, so a loop around a wait stays
+    unrollable as in the source (the producer's KV loop is unrolled by 4 + a 3-copy remainder).
+    """
+    txl.cuda.mbarrier_wait_parity(barrier_ptr, _u32(phase), TRY_WAIT_TICKS)
+
+
+#: DeepGEMM's JIT builds without fast math: IEEE FP32 (no FTZ, precise division), FMA contraction on.
+FP_MODE = {"cuda": {"fp_mode": "precise"}}
+
+
+def _with_fp_mode(backend_config):
+    from tvm_tirx.backend.config import merge_backend_configs
+
+    return merge_backend_configs(FP_MODE, backend_config)
 
 
 def _elect():
@@ -104,8 +93,7 @@ def build_kernel(spec, *, backend_config=None):
     # GMMA descriptor high word: SBO = 8*D >> 4 in bits [32,46), layout type in bits [62,64).
     desc_hi = ((8 * D) >> 4) | (_GMMA_LAYOUT[D] << 30)
 
-    # The only C-level helper is the local-PTX barrier wait above.
-    @txl.kernel(allowed_func_calls=("deepgemm_cluster_barrier_wait",))
+    @txl.kernel()
     def sm90_fp8_mqa_logits(
         seq_len_arg: "int32",
         seq_len_kv_arg: "int32",
@@ -123,7 +111,7 @@ def build_kernel(spec, *, backend_config=None):
         txl.device_entry(
             launch=txl.cuda.LaunchConfig(grid=spec.num_sms, block=num_threads),
             kernel_attrs=txl.cuda.KernelAttributes(min_blocks_per_sm=1),
-            backend_config=backend_config,
+            backend_config=_with_fp_mode(backend_config),
         )
         del max_seqlen_k  # only selects kIsCompressedLogits on the host
         seq_len = txl.local_scalar("uint32", init=_u32(seq_len_arg))
@@ -505,7 +493,7 @@ def _reduce_and_store(
     is_compressed,
     is_bf16,
 ):
-    """One Q row of `.cuh:274-317`, as the non-FTZ PTX nvcc emits for it.
+    """One Q row of `.cuh:274-317`, in the order nvcc emits for it (non-FTZ under `fp_mode="precise"`).
 
     Accumulator `a0 + J` holds head `8*(J//4) + 2*(lane%4) + (J&1)` for KV row `v_0` (J%4 < 2)
     or `v_1` (J%4 >= 2), weight `w0 + (J//4)*2 + (J&1)`.  nvcc contracts the source's
@@ -521,26 +509,22 @@ def _reduce_and_store(
     def w(j):
         return weights[w0 + (j // 4) * 2 + (j & 1)]
 
+    # Plain FP32 arithmetic under `fp_mode="precise"`; NVRTC contracts `a * b + c` to `fma.rn.f32` as nvcc
+    # does for the source: `s_k = fma(max(a[k]), w, max(a[4+k]) * w')`, then one `fma` per head group.
+    # `max` stays explicit `max.f32` (a float `T.max` lowers to a 3-instruction select, ISSUE-009).
     sums = []
     for k in range(4):
         r0 = relu(k)
         r1 = relu(4 + k)
-        s = txl.local_scalar("float32")
-        txl.ptx["mul.f32"](s, r1, w(4 + k))
-        txl.ptx["fma.rn.f32"](s, r0, w(k), s)
+        s = txl.local_scalar("float32", init=r1 * w(4 + k))
+        txl.assign(s, r0 * w(k) + s)
         for j in range(2, H // 8):
             r = relu(4 * j + k)
-            txl.ptx["fma.rn.f32"](s, r, w(4 * j + k), s)
+            txl.assign(s, r * w(4 * j + k) + s)
         sums.append(s)
 
-    t_0 = txl.local_scalar("float32")
-    v_0 = txl.local_scalar("float32")
-    t_1 = txl.local_scalar("float32")
-    v_1 = txl.local_scalar("float32")
-    txl.ptx["add.f32"](t_0, sums[0], sums[1])
-    txl.ptx["mul.f32"](v_0, scale_kv_0, t_0)
-    txl.ptx["add.f32"](t_1, sums[2], sums[3])
-    txl.ptx["mul.f32"](v_1, scale_kv_1, t_1)
+    v_0 = txl.local_scalar("float32", init=scale_kv_0 * (sums[0] + sums[1]))
+    v_1 = txl.local_scalar("float32", init=scale_kv_1 * (sums[2] + sums[3]))
 
     # Inter-thread reduction
     for m in (1, 2):
@@ -553,7 +537,7 @@ def _reduce_and_store(
                 txl.uint32(31),
                 txl.uint32(FULL_MASK),
             )
-            txl.ptx["add.f32"](v, v, txl.reinterpret(o, ty="float32"))
+            txl.assign(v, v + txl.reinterpret(o, ty="float32"))
 
     # Store into the global memory
     # `v_1_offset == v_0_offset + 8`: like nvcc for the source, address both values of a row from one
