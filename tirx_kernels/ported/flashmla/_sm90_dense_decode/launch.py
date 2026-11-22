@@ -165,6 +165,8 @@ def launch_sched_meta(ex: Executables, p) -> None:
         p["tile_scheduler_metadata"].reshape(-1),
         p["num_splits"],
         p["b"],
+        64,  # block_size_n
+        5,  # fixed_overhead_num_blocks
         p["num_sm_parts"],
     )
 
