@@ -208,7 +208,8 @@ def build_preprocess(head_dim, block_m, *, backend_config=None):
             )
 
         # params.dq_semaphore != nullptr && thread_idx == 0 (mha_bwd always passes one).
-        with txl.if_(t == 0), txl.then_():
+        sem_ptr = txl.reinterpret(dq_semaphore.data, ty="uint64")
+        with txl.if_(txl.And(sem_ptr != txl.uint64(0), t == 0)), txl.then_():
             txl.ptx.st.global_.u32(
                 dq_semaphore.view("uint32").ptr_to([bidh + bidb * h + m_block * h * b]), txl.uint32(0)
             )

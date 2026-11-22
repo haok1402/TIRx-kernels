@@ -185,43 +185,65 @@ def check_case(config, *, backend_config=None) -> dict[str, Any]:
         bad.append("dq_bitwise")
     if bad:
         raise AssertionError(f"bitwise mismatches vs flash_attn_3: {report}")
-    assert not torch.isnan(ours["dq"]).any(), "dq has unwritten (sentinel) elements"
-    _check_dq_tolerance(p, ours["dq"], ref_dq)
+    assert not torch.isnan(ours["dq"]).any(), f"dq has unwritten (sentinel) elements: {report}"
+    if p["b"] * p["h"] * p["s_q"] * p["s_k"] <= TOLERANCE_MAX_SCORES:
+        report.update(_check_dq_tolerance(p, ours["dq"], ref_dq))
     del s_q
     return report
 
 
-def _check_dq_tolerance(p, dq, ref_dq) -> None:
-    """``test_flash_attn_output``'s dQ bound: |dq - dq_ref| <= 2 |dq_pt - dq_ref| + dq_atol, with
-    dq_ref from an fp32 PyTorch attention and dq_pt from the same in bf16 (reorder_ops)."""
+def attention_ref(q, k, v, causal=False, upcast=True, reorder_ops=False):
+    """``hopper/test_util.py::attention_ref`` for the cases here (MHA, no padding, no softcap, no
+    dropout, window (-1, 0) when causal): same operations in the same order."""
     import torch
 
-    q, k, v, dout = (t.float().requires_grad_() for t in (p["q"], p["k"], p["v"], p["dout"]))
-    del dout
-    g = p["dout"].float()
+    dtype_og = q.dtype
+    if upcast:
+        q, k, v = q.float(), k.float(), v.float()
+    seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+    d = q.shape[-1]
+    softmax_scale = 1.0 / math.sqrt(d)
+    if not reorder_ops:
+        scores = torch.einsum("bthd,bshd->bhts", q * softmax_scale, k)
+    else:
+        scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
+    local_mask = None
+    if causal:  # construct_local_mask with window_size (-1, 0)
+        row_idx = torch.arange(seqlen_q, device=q.device, dtype=torch.long)[:, None]
+        col_idx = torch.arange(seqlen_k, device=q.device, dtype=torch.long)
+        local_mask = col_idx > row_idx + seqlen_k - seqlen_q + 0
+        scores.masked_fill_(local_mask, float("-inf"))
+    attention = torch.softmax(scores, dim=-1).to(v.dtype)
+    if local_mask is not None:
+        attention = attention.masked_fill(torch.all(local_mask, dim=-1, keepdim=True), 0.0)
+    output = torch.einsum("bhts,bshd->bthd", attention, v)
+    return output.to(dtype=dtype_og)
 
-    def attn(qq, kk, vv, upcast):
-        dt = torch.float32 if upcast else torch.bfloat16
-        qq, kk, vv = qq.to(dt), kk.to(dt), vv.to(dt)
-        s = torch.einsum("bthd,bshd->bhts", qq * p["softmax_scale"], kk)
-        if p["is_causal"]:
-            sq, sk = s.shape[-2], s.shape[-1]
-            row = torch.arange(sq, device=s.device)[:, None]
-            col = torch.arange(sk, device=s.device)[None, :]
-            s = s.masked_fill(col > row + sk - sq, float("-inf"))
-        a = torch.softmax(s.float(), dim=-1).to(dt)
-        return torch.einsum("bhts,bshd->bthd", a, vv)
 
-    out_ref = attn(q, k, v, True)
-    (dq_ref,) = torch.autograd.grad(out_ref, (q,), g)
-    out_pt = attn(q, k, v, False)
-    (dq_pt,) = torch.autograd.grad(out_pt, (q,), g.to(torch.bfloat16))
+#: Above this many score elements the fp32 PyTorch reference does not fit next to the inputs on
+#: one H200; such (benchmark) shapes are checked bitwise only.
+TOLERANCE_MAX_SCORES = 1 << 31
+
+
+def _check_dq_tolerance(p, dq, ref_dq) -> dict:
+    """``test_flash_attn_output``'s dQ assertion, verbatim: with bf16 leaf tensors,
+    |dq - dq_ref| <= 2 |dq_pt - dq_ref| + 2 |dq_ref + 0.3 - 0.3 - dq_ref| (rtol 2, no softcap), where
+    dq_ref is the grad of the upcast reference and dq_pt that of the bf16 reorder_ops reference."""
+    import torch
+
+    q_ref, k_ref, v_ref = (t.detach().clone().requires_grad_() for t in (p["q"], p["k"], p["v"]))
+    g = p["dout"]
+    out_ref = attention_ref(q_ref, k_ref, v_ref, causal=p["is_causal"])
+    out_pt = attention_ref(q_ref, k_ref, v_ref, causal=p["is_causal"], upcast=False, reorder_ops=True)
+    (dq_ref,) = torch.autograd.grad(out_ref, (q_ref,), g)
+    (dq_pt,) = torch.autograd.grad(out_pt, (q_ref,), g)
     dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item()
-    err = (dq.float() - dq_ref).abs().max().item()
-    ref_err = (ref_dq.float() - dq_ref).abs().max().item()
-    bound = 2 * (dq_pt.float() - dq_ref).abs().max().item() + dq_atol
+    err = (dq - dq_ref).abs().max().item()
+    ref_err = (ref_dq - dq_ref).abs().max().item()
+    bound = 2 * (dq_pt - dq_ref).abs().max().item() + dq_atol
     if not err <= bound:
         raise AssertionError(f"dq error {err} > upstream bound {bound} (flash_attn_3: {ref_err})")
+    return {"dq_err": err, "dq_bound": bound, "fa3_dq_err": ref_err}
 
 
 def bench_against_fa3(
