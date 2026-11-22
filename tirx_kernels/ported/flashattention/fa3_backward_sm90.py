@@ -71,9 +71,14 @@ UPSTREAM_SEQLENS = [
 ]
 
 
-def _case(b, s_q, s_k, h, d, causal, *, seed=0, prefix="") -> dict:
-    label = f"{prefix}b{b}_sq{s_q}_sk{s_k}_h{h}_d{d}_{'causal' if causal else 'noncausal'}"
-    return {
+def _case(b, s_q, s_k, h, d, causal, *, h_k=None, seed=0, prefix="") -> dict:
+    """One config; ``h_k`` (KV heads) set only for GQA / MQA, which selects upstream's GQA path."""
+    gqa = h_k is not None and h_k != h
+    label = (
+        f"{prefix}b{b}_sq{s_q}_sk{s_k}_h{h}{f'_hk{h_k}' if gqa else ''}_d{d}_"
+        f"{'causal' if causal else 'noncausal'}"
+    )
+    config = {
         "label": label,
         "batch_size": b,
         "seqlen_q": s_q,
@@ -83,13 +88,17 @@ def _case(b, s_q, s_k, h, d, causal, *, seed=0, prefix="") -> dict:
         "is_causal": causal,
         "seed": seed,
     }
+    if gqa:
+        config["num_heads_k"] = h_k
+    return config
 
 
-def upstream_test_cases(head_dim=128) -> list[dict]:
-    """The MHA bf16 backward cases of ``test_flash_attn_output`` (batch 9, or 2 when seqlen_k > 2048;
-    6 heads; d = dv; no softcap, no local window)."""
+def upstream_test_cases(head_dim=128, mha_type="mha") -> list[dict]:
+    """The bf16 backward cases of ``test_flash_attn_output`` for one ``mha_type`` (batch 9, or 2 when
+    seqlen_k > 2048; 6 heads, KV heads 6 / 2 / 1 for mha / gqa / mqa; d = dv; no softcap, no local)."""
+    h_k = {"mha": None, "gqa": 2, "mqa": 1}[mha_type]
     return [
-        _case(9 if s_k <= 2048 else 2, s_q, s_k, 6, head_dim, causal)
+        _case(9 if s_k <= 2048 else 2, s_q, s_k, 6, head_dim, causal, h_k=h_k)
         for s_q, s_k in UPSTREAM_SEQLENS
         for causal in (False, True)
     ]
@@ -110,12 +119,33 @@ _EDGE = [
     _case(5, 3000, 3000, 13, 128, False, seed=8, prefix="edge_"),
 ]
 
-CONFIGS = [*upstream_test_cases(128), *_EDGE]
+#: GQA edge shapes: two query heads per KV head (dK / dV reduce order cannot matter: bitwise), the
+#: Llama-3 8B / 70B per-device head ratios (32 / 8, 64 / 8), and MQA with many query heads.
+_EDGE_GQA = [
+    _case(3, 300, 300, 4, 128, False, h_k=2, seed=11, prefix="edge_"),
+    _case(3, 300, 300, 4, 128, True, h_k=2, seed=12, prefix="edge_"),
+    _case(2, 1024, 1024, 32, 128, True, h_k=8, seed=13, prefix="edge_"),
+    _case(1, 2048, 2048, 64, 128, False, h_k=8, seed=14, prefix="edge_"),
+    _case(2, 500, 700, 16, 128, True, h_k=1, seed=15, prefix="edge_"),
+]
+
+CONFIGS = [
+    *upstream_test_cases(128),
+    *_EDGE,
+    *upstream_test_cases(128, "gqa"),
+    *upstream_test_cases(128, "mqa"),
+    *_EDGE_GQA,
+]
 
 #: ``hopper/benchmark_attn.py``-style shapes: 16k tokens per batch, hidden 2048 (16 heads of 128).
 BENCH_CONFIGS = [
     _case(16384 // s, s, s, 16, 128, causal, prefix="bench_")
     for s in (512, 1024, 2048, 4096, 8192, 16384)
+    for causal in (False, True)
+] + [
+    # Llama-3 8B attention (32 query heads, 8 KV heads of 128), 16k tokens per batch.
+    _case(16384 // s, s, s, 32, 128, causal, h_k=8, prefix="bench_")
+    for s in (1024, 4096, 8192)
     for causal in (False, True)
 ]
 
@@ -125,8 +155,9 @@ def get_kernel(*, backend_config=None, **config):
     from ._fa3_backward_sm90.launch import build_kernels
 
     config.pop("label", None)
+    gqa = config.get("num_heads_k", config["num_heads"]) != config["num_heads"]
     return list(
-        build_kernels(config["head_dim"], config["is_causal"], backend_config=backend_config)
+        build_kernels(config["head_dim"], config["is_causal"], gqa=gqa, backend_config=backend_config)
     )
 
 

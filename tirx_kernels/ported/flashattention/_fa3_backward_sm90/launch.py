@@ -119,24 +119,29 @@ def scale_log2(softmax_scale: float) -> float:
     return f32(f32(softmax_scale) * 1.44269504088896340736)
 
 
-def build_kernels(head_dim: int, is_causal: bool, *, backend_config=None):
-    from .kernel import build_main_kernel, build_postprocess, build_preprocess
+def build_kernels(head_dim: int, is_causal: bool, *, gqa: bool = False, backend_config=None):
+    """preprocess, main, dQ convert (+ the dK / dV convert for GQA: ``run_flash_bwd``'s
+    ``PostprocessKerneldKV``, launched twice)."""
+    from .kernel import build_main_kernel, build_postprocess, build_postprocess_dkv, build_preprocess
 
     bm = block_m(head_dim, is_causal)
-    return (
+    kernels = (
         build_preprocess(head_dim, bm, backend_config=backend_config),
-        build_main_kernel(head_dim, is_causal, backend_config=backend_config),
+        build_main_kernel(head_dim, is_causal, gqa=gqa, backend_config=backend_config),
         build_postprocess(head_dim, is_causal, backend_config=backend_config),
     )
+    if gqa:
+        kernels += (build_postprocess_dkv(head_dim, backend_config=backend_config),)
+    return kernels
 
 
 @cache_backend_config
-def _compile(head_dim: int, is_causal: bool, *, backend_config=None):
+def _compile(head_dim: int, is_causal: bool, gqa: bool, *, backend_config=None):
     from tirx_kernels.runner import compile_kernel
 
     return tuple(
         compile_kernel(k, backend_config=backend_config)
-        for k in build_kernels(head_dim, is_causal, backend_config=backend_config)
+        for k in build_kernels(head_dim, is_causal, gqa=gqa, backend_config=backend_config)
     )
 
 
@@ -147,11 +152,13 @@ class Executables:
     pre: Any
     main: Any
     post: Any
+    gqa: bool = False
+    post_dkv: Any = None
 
 
-def compile_kernels(head_dim: int, is_causal: bool, *, backend_config=None) -> Executables:
-    pre, main, post = _compile(head_dim, is_causal, backend_config=backend_config)
-    return Executables(head_dim, is_causal, pre, main, post)
+def compile_kernels(head_dim: int, is_causal: bool, *, gqa: bool = False, backend_config=None) -> Executables:
+    built = _compile(head_dim, is_causal, gqa, backend_config=backend_config)
+    return Executables(head_dim, is_causal, *built[:3], gqa=gqa, post_dkv=built[3] if gqa else None)
 
 
 def _args(p, ours):
@@ -160,8 +167,12 @@ def _args(p, ours):
     cache = p.setdefault("_launch_args", {})
     if key in cache:
         return cache[key]
-    b, s_q, s_k, h, d = p["b"], p["s_q"], p["s_k"], p["h"], p["d"]
+    b, s_q, s_k, h, h_k, d = p["b"], p["s_q"], p["s_k"], p["h"], p["h_k"], p["d"]
     bm, bn = p["block_m"], p["block_n"]
+    gqa = p["gqa"]
+    # The GQA epilogue reduces into fp32 dK / dV accumulators instead of storing bf16 dK / dV.
+    dk_acc = ours.get("dk_accum")
+    dv_acc = ours.get("dv_accum")
     maps = (
         _encode_bshd(p["q"], bm),
         _encode_bshd(p["dout"], bm),
@@ -194,36 +205,55 @@ def _args(p, ours):
         *lpt["l2_minor_residual"],
         lpt["num_hb_quotient"],
     )
-    main_args = (
-        ours["lse_log2"].reshape(-1),
-        ours["softmax_d"].reshape(-1),
-        ours["dq_accum"].reshape(-1),
-        ours["dk"].reshape(-1),
-        ours["dv"].reshape(-1),
-        s_q,
-        s_k,
-        d,
-        h,
-        b,
+    head = (s_q, s_k, d, h) + ((h_k,) if gqa else ()) + (b,)
+    tail = (
         0 if p["is_causal"] else -1,  # window_size_right as mha_bwd sets it
         f32(p["softmax_scale"]),
         scale_log2(p["softmax_scale"]),
         *sched,
-        *(m.ptr for m in maps),
+        *fast_divmod((h + h_k - 1) // h_k),  # qhead_per_khead_divmod (divisor 1 for MHA)
     )
+    if gqa:  # dK / dV fp32 accumulators instead of the bf16 outputs; only the Q, dO, K, V TensorMaps
+        main_args = (
+            ours["lse_log2"].reshape(-1), ours["softmax_d"].reshape(-1), ours["dq_accum"].reshape(-1),
+            dk_acc.reshape(-1), dv_acc.reshape(-1), *head, *tail, *(m.ptr for m in maps[:4]),
+        )
+    else:
+        main_args = (
+            ours["lse_log2"].reshape(-1), ours["softmax_d"].reshape(-1), ours["dq_accum"].reshape(-1),
+            ours["dk"].reshape(-1), ours["dv"].reshape(-1), *head, *tail, *(m.ptr for m in maps),
+        )
     post_args = (ours["dq_accum"].reshape(-1), ours["dq"].reshape(-1), s_q, d, h, b, f32(p["softmax_scale"]))
-    cache[key] = (maps, pre_args, main_args, post_args)
+    dkv_args = ()
+    if gqa:
+        # PostprocessKerneldKV: TileShape (kBlockN, d), softmax_scale 1.f, (seqlen_k, h_k) heads.
+        dkv_args = (
+            (ours["dk_accum"].reshape(-1), ours["dk"].reshape(-1), s_k, d, h_k, b, 1.0),
+            (ours["dv_accum"].reshape(-1), ours["dv"].reshape(-1), s_k, d, h_k, b, 1.0),
+        )
+    cache[key] = (maps, pre_args, main_args, post_args, dkv_args)
     return cache[key]
 
 
 def launch_backward(ex: Executables, p, ours) -> None:
     """preprocess, main, postprocess (no PDL: ``launch_with_pdl`` is false upstream)."""
-    _, pre_args, main_args, post_args = _args(p, ours)
+    _, pre_args, main_args, post_args, dkv_args = _args(p, ours)
+    if ex.gqa:  # mha_bwd zero-fills dk_accum / dv_accum (torch fill_) before run_mha_bwd
+        ours["dk_accum"].zero_()
+        ours["dv_accum"].zero_()
     ex.pre.mod(*pre_args)
     ex.main.mod(*main_args)
     ex.post.mod(*post_args)
+    for args in dkv_args:  # dK convert, then dV convert
+        ex.post_dkv.mod(*args)
 
 
 def launch_postprocess(ex: Executables, p, dq_accum, dq) -> None:
     """The dQ convert alone, on a given accumulator."""
     ex.post.mod(dq_accum.reshape(-1), dq.reshape(-1), p["s_q"], p["d"], p["h"], p["b"], f32(p["softmax_scale"]))
+
+
+def launch_postprocess_dkv(ex: Executables, p, dk_accum, dk, dv_accum, dv) -> None:
+    """The dK and dV converts alone, on given fp32 accumulators (GQA)."""
+    for acc, out in ((dk_accum, dk), (dv_accum, dv)):
+        ex.post_dkv.mod(acc.reshape(-1), out.reshape(-1), p["s_k"], p["d"], p["h_k"], p["b"], 1.0)

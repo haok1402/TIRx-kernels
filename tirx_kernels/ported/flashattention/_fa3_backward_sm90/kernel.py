@@ -222,14 +222,19 @@ def build_preprocess(head_dim, block_m, *, backend_config=None):
 # =====================================================================================
 
 
-def build_postprocess(head_dim, is_causal, *, backend_config=None):
+def build_postprocess(head_dim, is_causal, *, dkv=False, backend_config=None):
+    """The dQ convert (TileShape (kBlockM, d), TiledMmadQ), or with ``dkv`` the dK / dV convert of the
+    GQA build (TileShape (kBlockN, d) = (128, 128), TiledMmadKV, dKV_swapAB false: run_flash_bwd's
+    PostprocessKerneldKV, softmax_scale 1)."""
     assert head_dim == HEAD_DIM
-    BM = _block_m(is_causal)
-    NREG = 32 if is_causal else 40  # dQ (m64n64) / dQ^T (m64n80) C fragment per thread
+    BM = BLOCK_N if dkv else _block_m(is_causal)
+    # dQ (m64n64) / dQ^T (m64n80) / dK, dV (m64n128) C fragment registers per thread
+    NREG = 64 if dkv else (32 if is_causal else 40)
+    swz333 = dkv or is_causal  # Swizzle<3,3,3> 8 x 64 atoms (MmaShapeN 64 or 128), else <1,3,3> 8 x 16
     SMEM_ACC = BM * HEAD_DIM * 4
     SMEM_DQ = BM * HEAD_DIM * 2
     OFF_BAR = SMEM_ACC + SMEM_DQ
-    SMEM_BYTES = OFF_BAR + 128  # sizeof(SharedStorage): 49280 / 61568
+    SMEM_BYTES = OFF_BAR + 128  # sizeof(SharedStorage): 49280 / 61568 / 98432 (dK, dV)
 
     @txl.kernel()
     def flash_bwd_convert_dq(
@@ -291,7 +296,7 @@ def build_postprocess(head_dim, is_causal, *, backend_config=None):
 
         def sdq_byte(m, col):
             """Byte of element (row m, column col) of sdQ (col a multiple of 8)."""
-            if is_causal:  # Swizzle<3,3,3> o ((8,8),(64,2)):((64,512),(1,4096))
+            if swz333:  # Swizzle<3,3,3> o ((8,8),(64,2)):((64,512),(1,4096)) (dQ; dK, dV: (8,16) rows)
                 return SMEM_ACC + (col // 64) * (BM * 128) + m * 128 + ((((col % 64) // 8) ^ (m % 8)) * 16)
             # Swizzle<1,3,3> o ((8,10),(16,8)):((16,128),(1,1280))
             return (
@@ -301,7 +306,12 @@ def build_postprocess(head_dim, is_causal, *, backend_config=None):
 
         for p in range(NREG // 8):
             c_j = 2 * p + jm // 2
-            if is_causal:
+            if dkv:
+                # dK / dV fragment (KV rows 64w + 16*warp + 8i + .., d cols 8c + ..): STSM_N.
+                m = w * 64 + warp * 16 + i_j * 8 + k_
+                col = c_j * 8
+                txl.ptx[_STSM](pool.ptr_to([sdq_byte(m, col) // 2]), *[r16[4 * p + j] for j in range(4)])
+            elif is_causal:
                 # dQ fragment (q rows 16*warp + 8i + .., d cols 64w + 8c + ..): STSM_N.
                 m = warp * 16 + i_j * 8 + k_
                 col = w * 64 + c_j * 8
@@ -335,12 +345,16 @@ def build_postprocess(head_dim, is_causal, *, backend_config=None):
     return flash_bwd_convert_dq.func
 
 
+def build_postprocess_dkv(head_dim, *, backend_config=None):
+    return build_postprocess(head_dim, True, dkv=True, backend_config=backend_config)
+
+
 # =====================================================================================
 # Kernel 2: FlashAttnBwdSm90 (flash_bwd_kernel_sm90.h:155-278)
 # =====================================================================================
 
 
-def build_main_kernel(head_dim, is_causal, *, backend_config=None):
+def build_main_kernel(head_dim, is_causal, *, gqa=False, backend_config=None):
     assert head_dim == HEAD_DIM
     BM = _block_m(is_causal)
     NC = BM // 8  # 8-column groups of the S^T / dP^T fragment
@@ -370,45 +384,9 @@ def build_main_kernel(head_dim, is_causal, *, backend_config=None):
     def b_empty_do(s):
         return OFF["bars"] + 64 + 8 * s
 
-    @txl.kernel()
-    def flash_bwd_sm90(
-        lse_log2: txl.Tensor((txl.int64(),), "float32"),
-        dpsum: txl.Tensor((txl.int64(),), "float32"),
-        dq_accum: txl.Tensor((txl.int64(),), "float32"),
-        dk: txl.Tensor((txl.int64(),), "bfloat16"),
-        dv: txl.Tensor((txl.int64(),), "bfloat16"),
-        s_q: "int32",
-        s_k: "int32",
-        d: "int32",
-        h: "int32",
-        b: "int32",
-        window_size_right: "int32",
-        softmax_scale: "float32",
-        scale_log2: "float32",
-        lpt_total: "int32",
-        blk_div: "int32",
-        blk_mul: "uint32",
-        blk_shr: "uint32",
-        head_div: "int32",
-        head_mul: "uint32",
-        head_shr: "uint32",
-        l2min_div: "int32",
-        l2min_mul: "uint32",
-        l2min_shr: "uint32",
-        l2maj_div: "int32",
-        l2maj_mul: "uint32",
-        l2maj_shr: "uint32",
-        l2res_div: "int32",
-        l2res_mul: "uint32",
-        l2res_shr: "uint32",
-        num_hb_quotient: "int32",
-        tma_q: txl.Ptr(txl.TensorMap),
-        tma_do: txl.Ptr(txl.TensorMap),
-        tma_k: txl.Ptr(txl.TensorMap),
-        tma_v: txl.Ptr(txl.TensorMap),
-        tma_dk: txl.Ptr(txl.TensorMap),
-        tma_dv: txl.Ptr(txl.TensorMap),
-    ):
+    def _body(lse_log2, dpsum, dq_accum, dk, dv, dk_accum, dv_accum, s_q, s_k, d, h, h_k, b, window_size_right, softmax_scale, scale_log2, lpt_total, blk_div, blk_mul, blk_shr, head_div, head_mul, head_shr, l2min_div, l2min_mul, l2min_shr, l2maj_div, l2maj_mul, l2maj_shr, l2res_div, l2res_mul, l2res_shr, num_hb_quotient, qhkh_div, qhkh_mul, qhkh_shr, tma_q, tma_do, tma_k, tma_v, tma_dk, tma_dv):
+        """FlashAttnBwdSm90::operator(); the GQA build passes dk / dv / tma_dk / tma_dv = None and the MHA
+        build dk_accum / dv_accum / h_k = None."""
         n_blocks = (s_k + BLOCK_N - 1) // BLOCK_N
         grid = (lpt_total,) if is_causal else (n_blocks, h, b)
         txl.device_entry(
@@ -449,7 +427,8 @@ def build_main_kernel(head_dim, is_causal, *, backend_config=None):
             warp, _u32(thread_idx) // txl.uint32(32), txl.uint32(0), txl.uint32(31), txl.uint32(0xFFFFFFFF)
         )
         with txl.if_(txl.And(warp == txl.uint32(0), lane_pred == txl.uint32(1))), txl.then_():
-            for m in (tma_q, tma_do, tma_k, tma_v, tma_dk, tma_dv):
+            # The GQA epilogue prefetches nothing (CollectiveEpilogueBwdGQA::prefetch_tma_descriptors).
+            for m in (tma_q, tma_do, tma_k, tma_v) + (() if gqa else (tma_dk, tma_dv)):
                 txl.ptx.prefetch.tensormap(txl.address_of(m))
         wg = txl.local_scalar("uint32")
         txl.ptx.shfl_sync.idx.b32(
@@ -471,10 +450,17 @@ def build_main_kernel(head_dim, is_causal, *, backend_config=None):
 
         # ---------------- scheduler (tile_scheduler.hpp) and m-block range (block.h:83) -------------
         def fdiv(x, div, mul, shr):
-            """cutlass::FastDivmod::divide (x >= 0)."""
-            hi = txl.local_scalar("uint32")
-            txl.ptx["mul.hi.u32"](hi, _u32(x), mul)
-            return txl.if_then_else(div != 1, _i32(hi >> shr), x)
+            """cutlass::FastDivmod::divide (x >= 0): ``divisor != 1 ? umulhi(x, m) >> s : x``, a branch
+            around the multiply-high as nvcc emits it."""
+            q = txl.local_scalar("int32")
+            with txl.if_(div != 1):
+                with txl.then_():
+                    hi = txl.local_scalar("uint32")
+                    txl.ptx["mul.hi.u32"](hi, _u32(x), mul)
+                    txl.assign(q, _i32(hi >> shr))
+                with txl.else_():
+                    txl.assign(q, x)
+            return q
 
         def tile():
             if is_causal:
@@ -537,7 +523,7 @@ def build_main_kernel(head_dim, is_causal, *, backend_config=None):
                             OFF=OFF, Q_TILE=Q_TILE, HALF=HALF, TX_Q=TX_Q, LSE_STRIDE=LSE_STRIDE, BM=BM,
                             tma_q=tma_q, tma_do=tma_do, tma_k=tma_k, tma_v=tma_v, lse_log2=lse_log2,
                             dpsum=dpsum, stat_base=stat_base, thread_idx=thread_idx, is_causal=is_causal,
-                            h=h, s_q_rounded=s_q_rounded,
+                            h=h, s_q_rounded=s_q_rounded, fdiv=fdiv, qhkh=(qhkh_div, qhkh_mul, qhkh_shr),
                         ))
                     with txl.else_():
                         with txl.if_(wiw == txl.uint32(1)), txl.then_():
@@ -556,8 +542,105 @@ def build_main_kernel(head_dim, is_causal, *, backend_config=None):
                     Q_TILE=Q_TILE, HALF=HALF, LSE_STRIDE=LSE_STRIDE, BM=BM, NC=NC, KM=KM, NQ=NQ,
                     wg_s=wg_s, wg_q=wg_q, wg_kv=wg_kv, thread_idx=thread_idx, wg=wg, s_q=s_q, s_k=s_k,
                     d=d, h=h, softmax_scale=softmax_scale, scale_log2=scale_log2, tma_dk=tma_dk,
-                    tma_dv=tma_dv, is_causal=is_causal, dk_out=dk, dv_out=dv, b=b,
+                    tma_dv=tma_dv, is_causal=is_causal, dk_out=dk, dv_out=dv, b=b, gqa=gqa, fdiv=fdiv,
+                    qhkh=(qhkh_div, qhkh_mul, qhkh_shr), dk_accum=dk_accum, dv_accum=dv_accum, h_k=h_k,
                 ))
+
+
+    if not gqa:
+
+        @txl.kernel()
+        def flash_bwd_sm90(
+            lse_log2: txl.Tensor((txl.int64(),), "float32"),
+            dpsum: txl.Tensor((txl.int64(),), "float32"),
+            dq_accum: txl.Tensor((txl.int64(),), "float32"),
+            dk: txl.Tensor((txl.int64(),), "bfloat16"),
+            dv: txl.Tensor((txl.int64(),), "bfloat16"),
+            s_q: "int32",
+            s_k: "int32",
+            d: "int32",
+            h: "int32",
+            b: "int32",
+            window_size_right: "int32",
+            softmax_scale: "float32",
+            scale_log2: "float32",
+            lpt_total: "int32",
+            blk_div: "int32",
+            blk_mul: "uint32",
+            blk_shr: "uint32",
+            head_div: "int32",
+            head_mul: "uint32",
+            head_shr: "uint32",
+            l2min_div: "int32",
+            l2min_mul: "uint32",
+            l2min_shr: "uint32",
+            l2maj_div: "int32",
+            l2maj_mul: "uint32",
+            l2maj_shr: "uint32",
+            l2res_div: "int32",
+            l2res_mul: "uint32",
+            l2res_shr: "uint32",
+            num_hb_quotient: "int32",
+            qhkh_div: "int32",
+            qhkh_mul: "uint32",
+            qhkh_shr: "uint32",
+            tma_q: txl.Ptr(txl.TensorMap),
+            tma_do: txl.Ptr(txl.TensorMap),
+            tma_k: txl.Ptr(txl.TensorMap),
+            tma_v: txl.Ptr(txl.TensorMap),
+            tma_dk: txl.Ptr(txl.TensorMap),
+            tma_dv: txl.Ptr(txl.TensorMap),
+        ):
+            _body(lse_log2, dpsum, dq_accum, dk, dv, None, None, s_q, s_k, d, h, None, b, window_size_right,
+                  softmax_scale, scale_log2, lpt_total, blk_div, blk_mul, blk_shr, head_div, head_mul, head_shr, l2min_div, l2min_mul, l2min_shr, l2maj_div, l2maj_mul, l2maj_shr, l2res_div, l2res_mul, l2res_shr, num_hb_quotient,
+                  qhkh_div, qhkh_mul, qhkh_shr, tma_q, tma_do, tma_k, tma_v, tma_dk, tma_dv)
+
+    else:
+
+        @txl.kernel()
+        def flash_bwd_sm90(
+            lse_log2: txl.Tensor((txl.int64(),), "float32"),
+            dpsum: txl.Tensor((txl.int64(),), "float32"),
+            dq_accum: txl.Tensor((txl.int64(),), "float32"),
+            dk_accum: txl.Tensor((txl.int64(),), "float32"),
+            dv_accum: txl.Tensor((txl.int64(),), "float32"),
+            s_q: "int32",
+            s_k: "int32",
+            d: "int32",
+            h: "int32",
+            h_k: "int32",
+            b: "int32",
+            window_size_right: "int32",
+            softmax_scale: "float32",
+            scale_log2: "float32",
+            lpt_total: "int32",
+            blk_div: "int32",
+            blk_mul: "uint32",
+            blk_shr: "uint32",
+            head_div: "int32",
+            head_mul: "uint32",
+            head_shr: "uint32",
+            l2min_div: "int32",
+            l2min_mul: "uint32",
+            l2min_shr: "uint32",
+            l2maj_div: "int32",
+            l2maj_mul: "uint32",
+            l2maj_shr: "uint32",
+            l2res_div: "int32",
+            l2res_mul: "uint32",
+            l2res_shr: "uint32",
+            num_hb_quotient: "int32",
+            qhkh_div: "int32",
+            qhkh_mul: "uint32",
+            qhkh_shr: "uint32",
+            tma_q: txl.Ptr(txl.TensorMap),
+            tma_do: txl.Ptr(txl.TensorMap),
+            tma_k: txl.Ptr(txl.TensorMap),
+            tma_v: txl.Ptr(txl.TensorMap),
+        ):
+            _body(lse_log2, dpsum, dq_accum, None, None, dk_accum, dv_accum, s_q, s_k, d, h, h_k, b,
+                  window_size_right, softmax_scale, scale_log2, lpt_total, blk_div, blk_mul, blk_shr, head_div, head_mul, head_shr, l2min_div, l2min_mul, l2min_shr, l2maj_div, l2maj_mul, l2maj_shr, l2res_div, l2res_mul, l2res_shr, num_hb_quotient,
+                  qhkh_div, qhkh_mul, qhkh_shr, tma_q, tma_do, tma_k, tma_v, None, None)
 
     return flash_bwd_sm90.func
 
@@ -608,6 +691,9 @@ def _producer_load(locals_):
             txl.ptx["mbarrier.arrive.expect_tx.shared::cta.b64"](bar_s(full_fn, stage), txl.uint32(L["TX_Q"]))
 
     def body():
+        # qhead_per_khead_divmod.divide(bidh) (mainloop :456, after load()'s causal early return): the KV
+        # head of the K / V loads (divisor 1 for MHA, as the source runs it).
+        bidh_kv = txl.local_scalar("int32", init=L["fdiv"](bidh, *L["qhkh"]))
         # gLSE / gdPsum row base of this (bidb, bidh), int64 as upstream's strides (local_tile of mLSE /
         # mdPsum). The 24-register producer is sensitive to how it is held: causal binds it once per
         # tile (re-deriving it spilled 32 B), non-causal re-derives it per use (binding it spilled 4 B
@@ -627,10 +713,10 @@ def _producer_load(locals_):
             txl.ptx["mbarrier.arrive.expect_tx.shared::cta.b64"](bar(L["B_KV"]), txl.uint32(65536))
             for half in range(2):
                 _tma_load(L["b16"](OFF["k"] + half * 16384), L["tma_k"], 64 * half, n_block * BLOCK_N,
-                          bidh, bidb, bar(L["B_KV"]), EVICT_NORMAL)
+                          bidh_kv, bidb, bar(L["B_KV"]), EVICT_NORMAL)
             for half in range(2):
                 _tma_load(L["b16"](OFF["v"] + half * 16384), L["tma_v"], 64 * half, n_block * BLOCK_N,
-                          bidh, bidb, bar(L["B_KV"]), EVICT_NORMAL)
+                          bidh_kv, bidb, bar(L["B_KV"]), EVICT_NORMAL)
             with txl.serial(m_min, m_max - 1, unroll=2) as m:
                 acquire(L["b_empty_do"], L["b_full_do"])
                 load_do(m, stat_row)
@@ -742,14 +828,21 @@ def _mma(locals_):
             _bwd_step(L, m, stage, phase, rdK, rdV, n_block, w, tid, r0, q0, warp4, lane)
         for i in range(64):
             txl.ptx["mul.ftz.f32"](rdK[i], rdK[i], L["softmax_scale"])
-        _epilogue_store(L, rdK, rdV, n_block, bidh, bidb, w, tid, r0, warp4, lane)
+        if L["gqa"]:
+            _epilogue_store_gqa(L, rdK, rdV, n_block, bidh, bidb, w, tid)
+        else:
+            _epilogue_store(L, rdK, rdV, n_block, bidh, bidb, w, tid, r0, warp4, lane)
 
     if is_causal:
-        with txl.if_(m_max <= m_min):
-            with txl.then_():
-                _store_zero(L, n_block, bidh, bidb, tid)
-            with txl.else_():
+        if L["gqa"]:  # CollectiveEpilogueBwdGQA::store_zero is empty (the accumulators are zero-filled)
+            with txl.if_(m_max > m_min), txl.then_():
                 mainloop_and_epilogue()
+        else:
+            with txl.if_(m_max <= m_min):
+                with txl.then_():
+                    _store_zero(L, n_block, bidh, bidb, tid)
+                with txl.else_():
+                    mainloop_and_epilogue()
     else:
         mainloop_and_epilogue()
 
@@ -1017,6 +1110,35 @@ def _epilogue_store(L, rdK, rdV, n_block, bidh, bidb, w, tid, r0, warp4, lane):
                     )
             txl.ptx.cp.async_.bulk.commit_group()
     txl.ptx.cp.async_.bulk.wait_group.read(0)
+
+
+def _epilogue_store_gqa(L, rdK, rdV, n_block, bidh, bidb, w, tid):
+    """CollectiveEpilogueBwdGQA::store, Use_TMA, not Deterministic (epilogue_bwd.hpp:414-518): the fp32
+    dV, then dK, fragment of each MMA warpgroup into sdKV (R2STiledCopydKVaccum: 128 threads x float4 per
+    warpgroup half), and one 64 KiB bulk reduce-add of the whole tile into the (b, h_kv) accumulator."""
+    OFF, f32p = L["OFF"], L["f32p"]
+    w_i = _i32(w)
+    t = tid % 128
+    bidh_kv = txl.local_scalar("int32", init=L["fdiv"](bidh, *L["qhkh"]))
+    s_k_rounded = (L["s_k"] + BLOCK_N - 1) // BLOCK_N * BLOCK_N
+    tile = (_i64(bidb * L["h_k"] + bidh_kv) * _i64(s_k_rounded) + _i64(n_block * BLOCK_N)) * _i64(HEAD_DIM)
+    txl.ptx["bar.sync"](txl.uint32(BAR_EPILOGUE), txl.uint32(NUM_MMA_THREADS))  # K and V reads done
+    for regs, accum in ((rdV, L["dv_accum"]), (rdK, L["dk_accum"])):
+        if regs is rdK:
+            txl.ptx["bar.sync"](txl.uint32(BAR_EPILOGUE), txl.uint32(NUM_MMA_THREADS))  # sdKV free again
+        for i in range(16):
+            txl.ptx.st.shared.v4.f32(
+                f32p(OFF["k"] + w_i * 32768 + (i * 128 + t) * 16),
+                regs[4 * i], regs[4 * i + 1], regs[4 * i + 2], regs[4 * i + 3],
+            )
+        txl.ptx.fence.proxy.async_.shared__cta()
+        txl.ptx["bar.sync"](txl.uint32(BAR_EPILOGUE), txl.uint32(NUM_MMA_THREADS))
+        with txl.if_(tid == 0), txl.then_():
+            txl.ptx[_BULK_REDUCE](
+                accum.ptr_to([tile]), f32p(OFF["k"]), txl.uint32(BLOCK_N * HEAD_DIM * 4), txl.uint64(EVICT_LAST)
+            )
+            txl.ptx.cp.async_.bulk.commit_group()
+            txl.ptx.cp.async_.bulk.wait_group.read(0)
 
 
 def _store_zero(L, n_block, bidh, bidb, tid):

@@ -56,7 +56,7 @@ def import_fa3():
 
 
 def prepare(
-    *, batch_size, seqlen_q, seqlen_k, num_heads, head_dim, is_causal, seed=0, **_
+    *, batch_size, seqlen_q, seqlen_k, num_heads, head_dim, is_causal, num_heads_k=None, seed=0, **_
 ) -> dict[str, Any]:
     """Inputs (q, k, v, dO), the forward's O and LSE (flash_attn_3), and the workspace shapes."""
     import torch
@@ -66,9 +66,10 @@ def prepare(
     dev = torch.device("cuda")
     gen = torch.Generator(device=dev).manual_seed(seed)
     b, h, d = batch_size, num_heads, head_dim
+    h_k = h if num_heads_k is None else num_heads_k
     q = torch.randn(b, seqlen_q, h, d, device=dev, dtype=torch.bfloat16, generator=gen)
-    k = torch.randn(b, seqlen_k, h, d, device=dev, dtype=torch.bfloat16, generator=gen)
-    v = torch.randn(b, seqlen_k, h, d, device=dev, dtype=torch.bfloat16, generator=gen)
+    k = torch.randn(b, seqlen_k, h_k, d, device=dev, dtype=torch.bfloat16, generator=gen)
+    v = torch.randn(b, seqlen_k, h_k, d, device=dev, dtype=torch.bfloat16, generator=gen)
     dout = torch.randn(b, seqlen_q, h, d, device=dev, dtype=torch.bfloat16, generator=gen)
     scale = 1.0 / math.sqrt(d)
     out, lse, *_ = fa3.fwd(
@@ -79,26 +80,27 @@ def prepare(
     return {
         "q": q, "k": k, "v": v, "out": out, "lse": lse, "dout": dout,
         "softmax_scale": scale, "is_causal": is_causal,
-        "b": b, "s_q": seqlen_q, "s_k": seqlen_k, "h": h, "d": d,
+        "b": b, "s_q": seqlen_q, "s_k": seqlen_k, "h": h, "h_k": h_k, "gqa": h_k != h, "d": d,
         "block_m": bm, "block_n": bn,
         "s_q_rounded": _cdiv(seqlen_q, bm) * bm, "s_k_rounded": _cdiv(seqlen_k, bn) * bn,
     }
 
 
 def run_fa3(p, dq=None, dk=None, dv=None):
-    """``torch.ops.flash_attn_3.bwd``: (dq, dk, dv, softmax_d, softmax_lse_log2, dq_accum)."""
+    """``torch.ops.flash_attn_3.bwd``: (dq, dk, dv, softmax_d, softmax_lse_log2, dq_accum, dk_accum,
+    dv_accum); the last two are None unless GQA."""
     import torch
 
     fa3 = import_fa3()
     dq = torch.empty_like(p["q"]) if dq is None else dq
     dk = torch.empty_like(p["k"]) if dk is None else dk
     dv = torch.empty_like(p["v"]) if dv is None else dv
-    softmax_d, lse_log2, dq_accum, _, _ = fa3.bwd(
+    softmax_d, lse_log2, dq_accum, dk_accum, dv_accum = fa3.bwd(
         p["dout"], p["q"], p["k"], p["v"], p["out"], p["lse"], dq, dk, dv,
         softmax_scale=p["softmax_scale"], is_causal=p["is_causal"], window_size_left=-1,
         window_size_right=0 if p["is_causal"] else -1, softcap=0.0, deterministic=False, sm_margin=0,
     )
-    return dq, dk, dv, softmax_d, lse_log2, dq_accum
+    return dq, dk, dv, softmax_d, lse_log2, dq_accum, dk_accum, dv_accum
 
 
 def alloc_outputs(p) -> dict[str, Any]:
@@ -111,7 +113,14 @@ def alloc_outputs(p) -> dict[str, Any]:
         return torch.full(shape, NAN_F32, dtype=torch.int32, device="cuda").view(torch.float32)
 
     b, h, d = p["b"], p["h"], p["d"]
+    gqa_ws = {}
+    if p["gqa"]:  # zero-filled by the launch (mha_bwd: torch fill_), NaN until then
+        gqa_ws = {
+            "dk_accum": nan_like((b, p["h_k"], p["s_k_rounded"] * d), torch.float32),
+            "dv_accum": nan_like((b, p["h_k"], p["s_k_rounded"] * d), torch.float32),
+        }
     return {
+        **gqa_ws,
         "dq": nan_like(p["q"].shape, torch.bfloat16),
         "dk": nan_like(p["k"].shape, torch.bfloat16),
         "dv": nan_like(p["v"].shape, torch.bfloat16),
@@ -148,17 +157,16 @@ def check_case(config, *, backend_config=None) -> dict[str, Any]:
     a row. Tolerance (upstream's test bound, against PyTorch references): dQ always."""
     import torch
 
-    from .launch import compile_kernels, launch_backward, launch_postprocess
+    from .launch import compile_kernels, launch_backward, launch_postprocess, launch_postprocess_dkv
 
     p = prepare(**config)
-    ex = compile_kernels(p["d"], p["is_causal"], backend_config=backend_config)
+    ex = compile_kernels(p["d"], p["is_causal"], gqa=p["gqa"], backend_config=backend_config)
     ours = alloc_outputs(p)
     launch_backward(ex, p, ours)
-    ref_dq, ref_dk, ref_dv, ref_d, ref_lse2, ref_acc = run_fa3(p)
+    ref_dq, ref_dk, ref_dv, ref_d, ref_lse2, ref_acc, ref_dkacc, ref_dvacc = run_fa3(p)
     torch.cuda.synchronize()
 
     report = {}
-    s_q = p["s_q"]
     checks = {
         "dk": (ours["dk"], ref_dk),
         "dv": (ours["dv"], ref_dv),
@@ -170,23 +178,40 @@ def check_case(config, *, backend_config=None) -> dict[str, Any]:
         report[name] = _bitwise_mismatch(a, e)
     report["dq_bitwise"] = _bitwise_mismatch(ours["dq"], ref_dq)
     report["kv_contributors"] = max_kv_contributors(p)
+    group = p["h"] // p["h_k"]
+    report["q_heads_per_kv_head"] = group
 
     # The dQ convert alone: our postprocess on upstream's accumulator must give upstream's dq.
     dq_conv = alloc_outputs(p)["dq"]
     launch_postprocess(ex, p, ref_acc, dq_conv)
+    if p["gqa"]:  # and the dK / dV converts on upstream's fp32 accumulators
+        dk_conv, dv_conv = alloc_outputs(p)["dk"], alloc_outputs(p)["dv"]
+        launch_postprocess_dkv(ex, p, ref_dkacc, dk_conv, ref_dvacc, dv_conv)
     torch.cuda.synchronize()
     report["dq_convert"] = _bitwise_mismatch(dq_conv, ref_dq)
-
+    must = ["softmax_d", "lse_log2", "dq_convert"]
+    if p["gqa"]:
+        report["dk_convert"] = _bitwise_mismatch(dk_conv, ref_dk)
+        report["dv_convert"] = _bitwise_mismatch(dv_conv, ref_dv)
+        must += ["dk_convert", "dv_convert"]
+    # dK / dV: per-CTA results (MHA), or sums of `group` fp32 bulk reduce-adds (GQA), which are order
+    # independent for at most two addends.
+    if group <= 2:
+        must += ["dk", "dv"]
     report.update(_check_k_isolation(ex, p))
-    bad = [k for k in ("dk", "dv", "softmax_d", "lse_log2", "dq_convert", "dq_iso", "dq_accum_iso") if report[k]]
+    must += ["dq_iso", "dq_accum_iso"]
+    if group > 2:
+        report.update(_check_head_isolation(ex, p))
+        must += ["dk_hiso", "dv_hiso", "dk_accum_hiso", "dv_accum_hiso"]
+    bad = [k for k in must if report[k]]
     if report["kv_contributors"] <= 2 and report["dq_bitwise"]:
         bad.append("dq_bitwise")
     if bad:
-        raise AssertionError(f"bitwise mismatches vs flash_attn_3: {report}")
-    assert not torch.isnan(ours["dq"]).any(), f"dq has unwritten (sentinel) elements: {report}"
+        raise AssertionError(f"bitwise mismatches vs flash_attn_3 ({bad}): {report}")
+    for name in ("dq", "dk", "dv"):
+        assert not torch.isnan(ours[name]).any(), f"{name} has unwritten (sentinel) elements: {report}"
     if p["b"] * p["h"] * p["s_q"] * p["s_k"] <= TOLERANCE_MAX_SCORES:
-        report.update(_check_dq_tolerance(p, ours["dq"], ref_dq))
-    del s_q
+        report.update(_check_tolerance(p, ours, (ref_dq, ref_dk, ref_dv)))
     return report
 
 
@@ -222,6 +247,33 @@ def _check_k_isolation(ex, p) -> dict:
     }
 
 
+def _check_head_isolation(ex, p) -> dict:
+    """dK / dV bitwise for GQA groups of more than two query heads: dO zeroed for every query head but
+    the first and last of each group (O, LSE, Q, K, V unchanged) makes the other heads' dK / dV
+    partials exactly 0 (dP = V dO^T = 0 and dPsum = rowsum(dO * O) = 0, so dS = 0 and P^T dO = 0); the
+    two remaining fp32 bulk reduce-adds commute, so dk_accum / dv_accum and dK / dV must be bitwise."""
+    import torch
+
+    from .launch import launch_backward
+
+    group = p["h"] // p["h_k"]
+    keep = torch.zeros(p["h"], dtype=torch.bool, device="cuda")
+    for g0 in range(0, p["h"], group):
+        keep[g0] = keep[g0 + group - 1] = True
+    p_iso = {key: val for key, val in p.items() if key != "_launch_args"}
+    p_iso["dout"] = (p["dout"] * keep[None, None, :, None].to(p["dout"].dtype)).contiguous()
+    ours = alloc_outputs(p_iso)
+    launch_backward(ex, p_iso, ours)
+    ref = run_fa3(p_iso)
+    torch.cuda.synchronize()
+    return {
+        "dk_hiso": _bitwise_mismatch(ours["dk"], ref[1]),
+        "dv_hiso": _bitwise_mismatch(ours["dv"], ref[2]),
+        "dk_accum_hiso": _bitwise_mismatch(ours["dk_accum"], ref[6]),
+        "dv_accum_hiso": _bitwise_mismatch(ours["dv_accum"], ref[7]),
+    }
+
+
 def attention_ref(q, k, v, causal=False, upcast=True, reorder_ops=False):
     """``hopper/test_util.py::attention_ref`` for the cases here (MHA, no padding, no softcap, no
     dropout, window (-1, 0) when causal): same operations in the same order."""
@@ -231,6 +283,9 @@ def attention_ref(q, k, v, causal=False, upcast=True, reorder_ops=False):
     if upcast:
         q, k, v = q.float(), k.float(), v.float()
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+    g = q.shape[2] // k.shape[2]  # repeat(k, "b s h d -> b s (h g) d")
+    k = k.repeat_interleave(g, dim=2)
+    v = v.repeat_interleave(g, dim=2)
     d = q.shape[-1]
     softmax_scale = 1.0 / math.sqrt(d)
     if not reorder_ops:
@@ -255,25 +310,28 @@ def attention_ref(q, k, v, causal=False, upcast=True, reorder_ops=False):
 TOLERANCE_MAX_SCORES = 1 << 31
 
 
-def _check_dq_tolerance(p, dq, ref_dq) -> dict:
-    """``test_flash_attn_output``'s dQ assertion, verbatim: with bf16 leaf tensors,
-    |dq - dq_ref| <= 2 |dq_pt - dq_ref| + 2 |dq_ref + 0.3 - 0.3 - dq_ref| (rtol 2, no softcap), where
-    dq_ref is the grad of the upcast reference and dq_pt that of the bf16 reorder_ops reference."""
+def _check_tolerance(p, ours, refs) -> dict:
+    """``test_flash_attn_output``'s dQ / dK / dV assertions, verbatim: with bf16 leaf tensors,
+    |dx - dx_ref| <= 2 |dx_pt - dx_ref| + 2 |dx_ref + 0.3 - 0.3 - dx_ref| (rtol 2, no softcap), where
+    dx_ref is the grad of the upcast reference and dx_pt that of the bf16 reorder_ops reference."""
     import torch
 
     q_ref, k_ref, v_ref = (t.detach().clone().requires_grad_() for t in (p["q"], p["k"], p["v"]))
     g = p["dout"]
     out_ref = attention_ref(q_ref, k_ref, v_ref, causal=p["is_causal"])
     out_pt = attention_ref(q_ref, k_ref, v_ref, causal=p["is_causal"], upcast=False, reorder_ops=True)
-    (dq_ref,) = torch.autograd.grad(out_ref, (q_ref,), g)
-    (dq_pt,) = torch.autograd.grad(out_pt, (q_ref,), g)
-    dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item()
-    err = (dq - dq_ref).abs().max().item()
-    ref_err = (ref_dq - dq_ref).abs().max().item()
-    bound = 2 * (dq_pt - dq_ref).abs().max().item() + dq_atol
-    if not err <= bound:
-        raise AssertionError(f"dq error {err} > upstream bound {bound} (flash_attn_3: {ref_err})")
-    return {"dq_err": err, "dq_bound": bound, "fa3_dq_err": ref_err}
+    grads_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g)
+    grads_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
+    out = {}
+    for name, ref, x_ref, x_pt in zip(("dq", "dk", "dv"), refs, grads_ref, grads_pt):
+        atol = 2 * (x_ref + 0.3 - 0.3 - x_ref).abs().max().item()
+        err = (ours[name] - x_ref).abs().max().item()
+        ref_err = (ref - x_ref).abs().max().item()
+        bound = 2 * (x_pt - x_ref).abs().max().item() + atol
+        if not err <= bound:
+            raise AssertionError(f"{name} error {err} > upstream bound {bound} (flash_attn_3: {ref_err})")
+        out.update({f"{name}_err": err, f"{name}_bound": bound, f"fa3_{name}_err": ref_err})
+    return out
 
 
 def bench_against_fa3(
@@ -285,7 +343,7 @@ def bench_against_fa3(
     from .launch import compile_kernels, launch_backward
 
     p = prepare(**config)
-    ex = compile_kernels(p["d"], p["is_causal"], backend_config=backend_config)
+    ex = compile_kernels(p["d"], p["is_causal"], gqa=p["gqa"], backend_config=backend_config)
     ours = alloc_outputs(p)
 
     def tirx():
