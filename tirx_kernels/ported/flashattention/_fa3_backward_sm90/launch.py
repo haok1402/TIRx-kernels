@@ -238,9 +238,11 @@ def _args(p, ours):
 def launch_backward(ex: Executables, p, ours) -> None:
     """preprocess, main, postprocess (no PDL: ``launch_with_pdl`` is false upstream)."""
     _, pre_args, main_args, post_args, dkv_args = _args(p, ours)
-    if ex.gqa:  # mha_bwd zero-fills dk_accum / dv_accum (torch fill_) before run_mha_bwd
-        ours["dk_accum"].zero_()
-        ours["dv_accum"].zero_()
+    if ex.gqa:
+        # mha_bwd zero-fills dk_accum / dv_accum with torch fill_(0.0) (flash_api_stable.cpp:1565, :1567),
+        # an elementwise fill kernel; zero_() would be a cudaMemsetAsync, which a kernel trace omits.
+        ours["dk_accum"].fill_(0.0)
+        ours["dv_accum"].fill_(0.0)
     ex.pre.mod(*pre_args)
     ex.main.mod(*main_args)
     ex.post.mod(*post_args)
