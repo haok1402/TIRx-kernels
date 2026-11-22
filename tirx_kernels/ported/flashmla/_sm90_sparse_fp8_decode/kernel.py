@@ -67,6 +67,7 @@ _BULK_S2G = "cp.async.bulk.global.shared::cta.bulk_group"
 _LDG_256 = "ld.global.nc.L1::evict_last.L2::256B.v4.s32"
 _LDG_128 = "ld.global.nc.L1::evict_last.L2::128B.v4.s32"
 _ST_ASYNC = "st_async.weak.shared::cluster.mbarrier::complete_tx::bytes.v2.s64"
+_ST_ASYNC_V4 = "st_async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32"
 _WG_QK = "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16"
 _WG_PV = "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16"
 
@@ -393,18 +394,18 @@ def build_main_kernel(model_type: str, num_heads: int, *, backend_config=None):
                 a["extra_topk_length"] = xtl
                 a["num_orig"] = txl.local_scalar("int32", init=orig_padded // TOPK_BLOCK)
             a["start"] = txl.local_scalar(
-                "int32", init=txl.if_then_else(batch == begin_req, begin_block, 0)
+                "int32", init=txl.Select(batch == begin_req, begin_block, 0)
             )
             a["end"] = txl.local_scalar(
                 "int32",
-                init=txl.if_then_else(batch == end_req, meta_end_block, total_padded // TOPK_BLOCK),
+                init=txl.Select(batch == end_req, meta_end_block, total_padded // TOPK_BLOCK),
             )
             a["no_split"] = txl.local_scalar(
                 "int32",
-                init=txl.if_then_else(
+                init=txl.Select(
                     batch == begin_req,
                     txl.cast(first_splitted == 0, "int32"),
-                    txl.if_then_else(batch == end_req, txl.cast(last_splitted == 0, "int32"), 1),
+                    txl.Select(batch == end_req, txl.cast(last_splitted == 0, "int32"), 1),
                 ),
             )
             return a
@@ -412,7 +413,7 @@ def build_main_kernel(model_type: str, num_heads: int, *, backend_config=None):
         num_valid = txl.local_scalar("int32", init=txl.min(h_q - head_block_idx * BLOCK_M, BLOCK_M))
 
         def split_index(batch):
-            n_split_idx = txl.if_then_else(batch == begin_req, begin_split, 0)
+            n_split_idx = txl.Select(batch == begin_req, begin_split, 0)
             return txl.local_scalar("int32", init=ldg_s32(num_splits, batch) + n_split_idx)
 
         # ---------------------------------------------------------------------------
@@ -572,7 +573,7 @@ def build_main_kernel(model_type: str, num_heads: int, *, backend_config=None):
                                 j = 4 * g + 2 * r + e
                                 txl.assign(
                                     rP[j],
-                                    txl.if_then_else(
+                                    txl.Select(
                                         txl.cast(fl[e], "uint16") == txl.uint16(0),
                                         txl.float32(-float("inf")),
                                         rP[j],
@@ -824,6 +825,17 @@ def build_main_kernel(model_type: str, num_heads: int, *, backend_config=None):
                         peer = txl.ptr_byte_offset(ptr, delta, ty=ptr.ty)
                         return txl.local_scalar("uint32", init=_u32(txl.cuda.cvta_generic_to_shared(peer)))
 
+                    def store16(byte, w):
+                        """The 16-byte shared store of one bf16x8 (st.shared.v4.b32: STS.128)."""
+                        txl.ptx["st.shared.v4.u32"](
+                            pool.view("uint32").ptr_to([byte // 4]), w[0], w[1], w[2], w[3]
+                        )
+
+                    def store16_peer(addr32, w):
+                        """st_async_128b (helpers.h:206) into the peer CTA, completing its
+                        bar_k_remote_ready (st.async ... v4.b32: STAS.128)."""
+                        txl.ptx[_ST_ASYNC_V4](addr32, w[0], w[1], w[2], w[3], remote_bar)
+
                     remote_bar = txl.local_scalar("uint32")
                     if CLUSTER == 2:
                         txl.assign(remote_bar, peer_of(bar_at(pl.off_bar_remote, buf)))
@@ -860,7 +872,7 @@ def build_main_kernel(model_type: str, num_heads: int, *, backend_config=None):
                         if not V32:
                             txl.assign(
                                 token,
-                                txl.if_then_else(rel_block * TOPK_BLOCK + slot >= tlen, -1, token),
+                                txl.Select(rel_block * TOPK_BLOCK + slot >= tlen, -1, token),
                             )
                         block_index = txl.local_scalar("int32", init=0)
                         with txl.if_(token != -1), txl.then_():
@@ -880,10 +892,6 @@ def build_main_kernel(model_type: str, num_heads: int, *, backend_config=None):
                             )
                             sf = txl.alloc_local((4,), "int32")
                             txl.ptx[_LDG_128](sf[0], sf[1], sf[2], sf[3], kptr.ptr_to([g_k + 512]))
-                            for i in range(4):
-                                sfv = txl.local_scalar("float32")
-                                txl.ptx["mov.b32"](sfv, sf[i])
-                                txl.ptx["cvt.rn.bf16.f32"](scales[i], sfv)
                         else:
                             blk = txl.local_scalar(
                                 "int64",
@@ -899,21 +907,38 @@ def build_main_kernel(model_type: str, num_heads: int, *, backend_config=None):
                                     [blk + txl.cast(page * 576 + rel_idx * 8, "int64")]
                                 ),
                             )
+                        # NoPE gathers before the bar_k_avail wait (they read only global memory), as
+                        # the source's build schedules them (ptxas hoists its LDGs above the try_wait).
+                        n_nope = pl.d_nope // 64
+                        xs = txl.alloc_local((4 * n_nope,), "int32")
+                        for di in range(n_nope):
+                            txl.ptx[_LDG_256](
+                                xs[4 * di], xs[4 * di + 1], xs[4 * di + 2], xs[4 * di + 3],
+                                kptr.ptr_to([g_k + txl.cast(16 * (lane // 8) + 64 * di, "int64")]),
+                            )
+                        # The scale conversion consumes the scale load: issued after the NoPE gathers so
+                        # the gathers do not wait on its latency (the source's SASS order).
+                        if V32:
+                            for i in range(4):
+                                sfv = txl.local_scalar("float32")
+                                txl.ptx["mov.b32"](sfv, sf[i])
+                                txl.ptx["cvt.rn.bf16.f32"](scales[i], sfv)
+                        else:
                             for i in range(7):
-                                x = txl.cast(txl.shift_right(e8, txl.int64(8 * i)), "uint16")
-                                e = x & txl.uint16(0xFF)
-                                txl.assign(
-                                    scales[i],
-                                    txl.if_then_else(
-                                        e == txl.uint16(255),
-                                        txl.uint16(0x7FFF),
-                                        txl.if_then_else(
-                                            e == txl.uint16(0),
-                                            txl.uint16(0x0040),
-                                            (x << txl.uint16(7)) & txl.uint16(0x7F80),
-                                        ),
-                                    ),
+                                # __internal_e8m0_to_bf16 (cuda_fp8.hpp:858-868): res = x << 7,
+                                # then x == 0 -> 0x0040 and x == 0xFF -> 0x7FFF, as the two
+                                # selp.b16 the source's build emits.
+                                x = txl.local_scalar(
+                                    "uint16", init=txl.cast(txl.shift_right(e8, txl.int64(8 * i)), "uint16")
                                 )
+                                e = txl.local_scalar("uint16", init=x & txl.uint16(0xFF))
+                                r = txl.local_scalar(
+                                    "uint16", init=(x << txl.uint16(7)) & txl.uint16(0x7F80)
+                                )
+                                is0 = txl.local_scalar("bool", init=e == txl.uint16(0))
+                                is255 = txl.local_scalar("bool", init=e == txl.uint16(255))
+                                txl.ptx.selp.b16(r, txl.uint16(0x0040), r, txl.ptx.pred(is0))
+                                txl.ptx.selp.b16(scales[i], txl.uint16(0x7FFF), r, txl.ptx.pred(is255))
                         if rnd == 0:
                             wait_barrier(
                                 bar_at(pl.off_bar_avail, buf), ((bar_phase_k >> buf) & 1) ^ 1
@@ -927,12 +952,11 @@ def build_main_kernel(model_type: str, num_heads: int, *, backend_config=None):
                         invalid = token == -1
                         # NoPE (.cuh:576-598)
                         nope_base = k_off + 2 * 8 * slot + 2 * 16 * (lane // 8) * TOPK_BLOCK
-                        for di in range(pl.d_nope // 64):
-                            x = txl.alloc_local((4,), "int32")
-                            txl.ptx[_LDG_256](
-                                x[0], x[1], x[2], x[3],
-                                kptr.ptr_to([g_k + txl.cast(16 * (lane // 8) + 64 * di, "int64")]),
-                            )
+                        if CLUSTER == 2:
+                            # sK_nope_peer_base = get_peer_addr(sK_nope_base) (.cuh:513), once per round
+                            nope_peer = peer_of(pool_u64.ptr_to([nope_base // 8]))
+                        for di in range(n_nope):
+                            x = [xs[4 * di + i] for i in range(4)]
                             sidx = di // 2 if V32 else di
                             s2 = txl.local_scalar(
                                 "uint32",
@@ -942,7 +966,7 @@ def build_main_kernel(model_type: str, num_heads: int, *, backend_config=None):
                                 out = txl.alloc_local((4,), "uint32")
                                 for q in range(2):
                                     w = txl.local_scalar(
-                                        "uint32", init=txl.if_then_else(invalid, 0, _u32(x[2 * half + q]))
+                                        "uint32", init=txl.Select(invalid, txl.uint32(0), _u32(x[2 * half + q]))
                                     )
                                     f = txl.alloc_local((4,), "float32")
                                     for p in range(2):
@@ -951,9 +975,7 @@ def build_main_kernel(model_type: str, num_heads: int, *, backend_config=None):
                                             h2,
                                             txl.cast(txl.shift_right(w, txl.uint32(16 * p)), "uint16"),
                                         )
-                                        txl.ptx.cvt.f32.f16(
-                                            f[2 * p], txl.cast(h2 & txl.uint32(0xFFFF), "uint16")
-                                        )
+                                        txl.ptx.cvt.f32.f16(f[2 * p], txl.cast(h2, "uint16"))
                                         txl.ptx.cvt.f32.f16(
                                             f[2 * p + 1], txl.cast(txl.shift_right(h2, txl.uint32(16)), "uint16")
                                         )
@@ -961,19 +983,17 @@ def build_main_kernel(model_type: str, num_heads: int, *, backend_config=None):
                                         bf = txl.local_scalar("uint32")
                                         txl.ptx["cvt.rn.bf16x2.f32"](bf, f[2 * p + 1], f[2 * p])
                                         txl.ptx["mul.bf16x2"](out[2 * q + p], bf, s2)
-                                lo = (_u64(out[1]) << txl.uint64(32)) | _u64(out[0])
-                                hi = (_u64(out[3]) << txl.uint64(32)) | _u64(out[2])
                                 addr = nope_base + 2 * (64 * di + 8 * half) * TOPK_BLOCK
-                                txl.ptx["st.shared.v2.u64"](pool_u64.ptr_to([addr // 8]), lo, hi)
+                                store16(addr, out)
                                 if CLUSTER == 2:
-                                    txl.ptx[_ST_ASYNC](
-                                        peer_of(pool_u64.ptr_to([addr // 8])),
-                                        txl.cast(lo, "int64"),
-                                        txl.cast(hi, "int64"),
-                                        remote_bar,
+                                    store16_peer(
+                                        nope_peer + txl.uint32(2 * (64 * di + 8 * half) * TOPK_BLOCK),
+                                        out,
                                     )
                         # RoPE (.cuh:600-623)
                         rope_base = k_off + 2 * 8 * slot + 2 * (pl.d_nope + 8 * (lane // 8)) * TOPK_BLOCK
+                        if CLUSTER == 2:
+                            rope_peer = peer_of(pool_u64.ptr_to([rope_base // 8]))  # .cuh:607
                         rope_off = pl.d_nope + (16 if V32 else 0)
                         for di in range(2):
                             y = txl.alloc_local((4,), "int32")
@@ -985,24 +1005,12 @@ def build_main_kernel(model_type: str, num_heads: int, *, backend_config=None):
                             )
                             if not V32:
                                 for i in range(4):
-                                    txl.assign(y[i], txl.if_then_else(invalid, 0, y[i]))
+                                    txl.assign(y[i], txl.Select(invalid, 0, y[i]))
                             addr = rope_base + 2 * 32 * di * TOPK_BLOCK
-                            if not V32 and CLUSTER == 1:
-                                txl.ptx["st.shared.v4.u32"](
-                                    pool.view("uint32").ptr_to([addr // 4]),
-                                    _u32(y[0]), _u32(y[1]), _u32(y[2]), _u32(y[3]),
-                                )
-                            else:
-                                lo = (_u64(y[1]) << txl.uint64(32)) | (_u64(y[0]) & txl.uint64(0xFFFFFFFF))
-                                hi = (_u64(y[3]) << txl.uint64(32)) | (_u64(y[2]) & txl.uint64(0xFFFFFFFF))
-                                txl.ptx["st.shared.v2.u64"](pool_u64.ptr_to([addr // 8]), lo, hi)
-                                if CLUSTER == 2:
-                                    txl.ptx[_ST_ASYNC](
-                                        peer_of(pool_u64.ptr_to([addr // 8])),
-                                        txl.cast(lo, "int64"),
-                                        txl.cast(hi, "int64"),
-                                        remote_bar,
-                                    )
+                            yw = [_u32(y[i]) for i in range(4)]
+                            store16(addr, yw)
+                            if CLUSTER == 2:
+                                store16_peer(rope_peer + txl.uint32(2 * 32 * di * TOPK_BLOCK), yw)
                     fence_async_shared()
                     with txl.if_(t < 32), txl.then_():
                         ix = txl.alloc_local((2,), "int32")
