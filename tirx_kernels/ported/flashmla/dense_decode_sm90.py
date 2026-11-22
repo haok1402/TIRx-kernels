@@ -61,6 +61,7 @@ def _case(
     have_zero_seqlen_k=False,
     seed=0,
     prefix="",
+    value_scale=1.0,
 ) -> dict:
     tag = "bf16" if dtype == "bfloat16" else "fp16"
     label = (
@@ -80,6 +81,7 @@ def _case(
         "dtype": dtype,
         "have_zero_seqlen_k": have_zero_seqlen_k,
         "seed": seed,
+        **({"value_scale": value_scale} if value_scale != 1.0 else {}),
     }
 
 
@@ -154,6 +156,9 @@ _EDGE = [
     _case(1, 1, 131072, False, False, 128, 1, seed=15, prefix="edge_"),
     _case(2, 4, 65, True, True, 63, 3, seed=16, prefix="edge_"),
     _case(132, 1, 1000, True, False, 16, 1, seed=17, prefix="edge_"),
+    # QK^T ~ 1e13 (Q and K scaled by 1e6): the rL == 0 / NaN guards and the inf/-inf LSE paths.
+    _case(4, 2, 300, True, True, 128, 1, seed=18, prefix="edge_overflow_", value_scale=1e6),
+    _case(8, 1, 4096, True, False, 64, 1, seed=19, prefix="edge_overflow_", value_scale=1e6),
 ]
 
 CONFIGS = [

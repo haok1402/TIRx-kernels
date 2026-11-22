@@ -72,8 +72,12 @@ def generate(
     seed=0,
     block_size=PAGE_BLOCK_SIZE,
     d=HEAD_DIM_K,
+    value_scale=1.0,
 ):
-    """`generate_test_data`, with the upstream test's default dtype/device made explicit."""
+    """`generate_test_data`, with the upstream test's default dtype/device made explicit.
+
+    `value_scale` (not in the upstream test) multiplies Q and K after the clamp, to reach the
+    overflow regime the source guards against (rL == 0 or NaN for QK^T ~ 1e12)."""
     import torch
 
     del is_causal
@@ -105,6 +109,9 @@ def generate(
     blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d, dtype=dt, device=dev) / 10
     blocked_k.clamp_(min=-1.0, max=1.0)
 
+    if value_scale != 1.0:
+        q.mul_(value_scale)
+        blocked_k.mul_(value_scale)
     for i in range(b):
         cur_len = int(cache_seqlens_cpu[i].item())
         cur_num_blocks = _cdiv(cur_len, block_size)
@@ -310,6 +317,9 @@ def check_case(config, *, backend_config=None, kernel="flashmla_sm90_dense_decod
             f"(first {first_out}), lse {n_lse}/{lse.numel()} (first {first_lse})"
         )
 
+    if config.get("value_scale", 1.0) != 1.0:
+        # Overflow regime: only the bitwise comparison with FlashMLA is meaningful.
+        return {"bitwise": True, "num_sm_parts": p["num_sm_parts"]}
     # FlashMLA's own acceptance test against the PyTorch reference.
     out_ref, lse_ref = torch_reference(
         p["seqlens_k"], p["block_table"], p["q"], p["kcache"], HEAD_DIM_V, p["config"]["is_causal"]

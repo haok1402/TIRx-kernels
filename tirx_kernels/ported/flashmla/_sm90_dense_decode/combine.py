@@ -67,8 +67,8 @@ def build_combine_kernel(dtype: str, max_splits: int, *, backend_config=None):
             backend_config=backend_config,
         )
         del b
-        smem = txl.smem_pool()
-        smem_buf = smem.alloc((BLOCK_SIZE_M * max_splits,), "float32")  # [warp][split]
+        # `__shared__ float smem_buf[BLOCK_SIZE_M][MAX_SPLITS]` (static), [warp][split].
+        smem_buf = txl.alloc_tensor([BLOCK_SIZE_M * max_splits], "float32", scope="shared")
 
         # combine.cu:21-42: one warp per q head, BLOCK_SIZE_M heads per CTA.
         batch_s_q_idx = txl.cuda.block_idx("x")
