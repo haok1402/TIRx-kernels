@@ -529,14 +529,15 @@ def _copy_param_tensor_map_to_smem(tmap, smem_tmap, word_offset):
     """Copy one grid-constant 128-byte TensorMap into SMEM: 8 x 16-byte loads into registers,
     then 8 x 16-byte shared stores (the source's struct copy, `.cuh:130-131`).
 
-    The source's loads are `ld.param.v4.u32`; the PTX table has no parameter-space `ld`, so these are
-    generic `ld.v4.u32` through the parameter's generic address (sm90-probe ISSUE-018)."""
+    The loads are the source's `ld.param.v4.u32` (constant-bank `LDC` in SASS), through the parameter
+    address `cvta.to.param` gives for the grid-constant TensorMap."""
     words = txl.alloc_local((32,), "uint32")
-    src = txl.address_of(tmap)
+    base = txl.local_scalar("uint64")
+    txl.ptx["cvta.to.param.u64"](base, txl.reinterpret(txl.address_of(tmap), ty="handle"))
     for j in range(8):
-        txl.ptx["ld.v4.u32"](
+        txl.ptx["ld.param.v4.u32"](
             words[4 * j], words[4 * j + 1], words[4 * j + 2], words[4 * j + 3],
-            _byte_address(src, 16 * j),
+            base + txl.uint64(16 * j),
         )  # fmt: skip
     for j in reversed(range(8)):
         txl.ptx["st.shared.v4.u32"](
