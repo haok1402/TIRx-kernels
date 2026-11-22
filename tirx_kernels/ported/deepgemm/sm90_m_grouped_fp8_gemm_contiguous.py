@@ -248,19 +248,21 @@ def run_test(*, backend_config=None, **config):
     import torch
 
     from ._sm90_fp8_gemm_1d2d.data import (
+        assert_whole_output_identical,
         assert_within_threshold,
         calc_diff,
         deepgemm_launch_m_grouped_contiguous,
         psum_slice_diff,
+        sentinel_like,
     )
 
     config.pop("label", None)
     data = prepare_data(**config)
     launch = _tirx_launch(data, config, backend_config=backend_config)
-    data["d"].zero_()
+    data["d"].copy_(sentinel_like(data["d"]))
     launch()
     torch.cuda.synchronize()
-    _, deepgemm_out = deepgemm_launch_m_grouped_contiguous(data)
+    _, deepgemm_out = deepgemm_launch_m_grouped_contiguous(data, out=sentinel_like(data["d"]))
     torch.cuda.synchronize()
     if data["use_psum_layout"]:
         diff = psum_slice_diff(data["d"], deepgemm_out, data["grouped_layout"], data["alignment"])
@@ -268,13 +270,17 @@ def run_test(*, backend_config=None, **config):
         # Rows marked -1 (alignment padding) are not computed by either side.
         valid = data["grouped_layout"] >= 0
         diff = calc_diff(data["d"][valid], deepgemm_out[valid])
-    return assert_within_threshold(
+    result = assert_within_threshold(
         diff,
         data,
         kernel=KERNEL_META["name"],
         detail=f"g={data['num_groups']} M={data['M']} N={data['N']} K={data['K']} psum={data['use_psum_layout']}",
         M=data["M"],
     )
+    assert_whole_output_identical(
+        data["d"], deepgemm_out, kernel=KERNEL_META["name"], detail=f"M={data['M']} N={data['N']}"
+    )
+    return result
 
 
 def run_gpu(

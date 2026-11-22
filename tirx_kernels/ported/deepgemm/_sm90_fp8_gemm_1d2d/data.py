@@ -29,6 +29,7 @@ from .._sm100_fp8_fp4_gemm_1d1d.spec import make_actual_ms
 from .spec import BLOCK_K, MK_ALIGNMENT, align_up
 
 __all__ = [
+    "assert_whole_output_identical",
     "assert_within_threshold",
     "bench_against_deepgemm",
     "calc_diff",
@@ -40,12 +41,44 @@ __all__ = [
     "prepare_m_grouped_masked",
     "psum_slice_diff",
     "require_sm90",
+    "sentinel_like",
 ]
 
 #: `QuantConfig()` defaults on SM90: `gran_k_a = gran_k_b = 128`.
 GRAN_K = BLOCK_K
 RECIPE_A = (1, GRAN_K)
 RECIPE_B = (GRAN_K, GRAN_K)
+
+
+#: A quiet-NaN bf16 bit pattern both outputs start from, so rows neither kernel writes (skipped
+#: padding bands, groups past their row count) are compared too.
+_SENTINEL_BITS = 0x7FC1
+
+
+def sentinel_like(t):
+    """A copy-shaped tensor of `t` filled with the sentinel bit pattern."""
+    import torch
+
+    out = torch.empty_like(t)
+    out.view(torch.int16).fill_(_SENTINEL_BITS)
+    return out
+
+
+def assert_whole_output_identical(actual, expected, *, kernel: str, detail: str) -> None:
+    """Every element, written or not, must have the same bits as DeepGEMM's.
+
+    Both outputs start from `sentinel_like`, so this also checks which rows each kernel writes
+    (e.g. that fully padded row bands are skipped) -- something a valid-rows diff cannot see.
+    """
+    import torch
+
+    differ = actual.view(torch.int16) != expected.view(torch.int16)
+    if bool(differ.any()):
+        first = tuple(int(i) for i in differ.nonzero()[0])
+        raise AssertionError(
+            f"{kernel} {detail}: {int(differ.sum())} of {differ.numel()} output elements differ "
+            f"bitwise from DeepGEMM (first at {first})"
+        )
 
 
 def require_sm90() -> None:

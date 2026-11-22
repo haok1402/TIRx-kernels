@@ -103,6 +103,10 @@ class _Scheduler:
             )
 
     def _layout_at(self, index):
+        # A signed destination (the source's `int` load emits `ld.global.u32`, the same 32-bit
+        # load): reading into a uint32 and casting lets TIRx's arithmetic analysis assume the
+        # value is non-negative and delete the `>= 0` skip test and the `max(., 0)` clamp
+        # (sm90-probe ISSUE-011).
         value = txl.local_scalar("int32")
         txl.ptx["ld.global.s32"](value, self.gl.ptr_to([index]))
         return value
@@ -489,7 +493,6 @@ def _producer(spec, *, sched_args, smem, maps, full, empty, stage_idx, phase, ad
             with txl.if_(mc_valid == txl.uint32(1)):
                 with txl.then_():
                     txl.assign(mc_b, txl.uint32(mc))
-        b_group = txl.local_scalar("uint32", init=sched.group_offset(m_block))
         k_block_idx = txl.local_scalar("uint32", init=txl.uint32(0))
         with txl.while_(k_block_idx < txl.uint32(shape_k_scales)):
             _wait(empty(stage_idx), phase ^ txl.uint32(1))
@@ -497,7 +500,10 @@ def _producer(spec, *, sched_args, smem, maps, full, empty, stage_idx, phase, ad
             group_a = sched.current_group_idx if is_masked else txl.uint32(0)
             m_idx = group_a * _u32(shape_m) + m_block * txl.uint32(BM)
             sfa_k = group_a * txl.uint32(shape_k_scales) + k_block_idx
-            n_idx = b_group * txl.uint32(spec.shape_n) + sched.n_block_idx * txl.uint32(BN)
+            # `get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx)`, per K block.
+            n_idx = sched.group_offset(m_block) * txl.uint32(
+                spec.shape_n
+            ) + sched.n_block_idx * txl.uint32(BN)
             txl.ptx[_TMA_LOAD_HINT](
                 smem_a.ptr_to([stage_idx * txl.uint32(a_stage)]),
                 txl.address_of(tensor_map_a),
@@ -666,11 +672,19 @@ def _math(
                 txl.ptx.wgmma.wait_group.sync.aligned(0)
                 if local_idx == num_waves - 1:
                     empty_barrier_arrive()
-                txl.assign(scale[4], scale[0] * scale[2])
-                txl.assign(scale[5], scale[1] * scale[2])
-                if not uniform_sfb:
-                    txl.assign(scale[6], scale[0] * scale[3])
-                    txl.assign(scale[7], scale[1] * scale[3])
+                # Plain (non-FTZ) `mul.f32` / `fma.rn.f32`, as the source compiles them: written as
+                # PTX so the result does not depend on the backend's fast-math setting.
+                # Only the products this copy's (constant) predicate selects: the source compiler
+                # drops the others, e.g. scale_x_0 in the `num_former_iters == 0` copy.
+                groups = num_accum // 4
+                uses_former = uniform_sfb or former_iters > 0
+                uses_latter = not uniform_sfb and former_iters < groups
+                if uses_former:
+                    txl.ptx["mul.f32"](scale[4], scale[0], scale[2])
+                    txl.ptx["mul.f32"](scale[5], scale[1], scale[2])
+                if uses_latter:
+                    txl.ptx["mul.f32"](scale[6], scale[0], scale[3])
+                    txl.ptx["mul.f32"](scale[7], scale[1], scale[3])
                 base = num_accum * local_idx
                 for i in range(num_accum // 4):
                     # `predicate ? scale_x_0 : scale_x_1` with `i < num_former_iters` pinned to a
@@ -679,9 +693,11 @@ def _math(
                     lo = scale[4] if former else scale[6]
                     hi = scale[5] if former else scale[7]
                     for j, s in ((0, lo), (1, lo), (2, hi), (3, hi)):
-                        txl.assign(
+                        txl.ptx["fma.rn.f32"](
                             final_accum[base + 4 * i + j],
-                            final_accum[base + 4 * i + j] + s * accum[4 * i + j],
+                            s,
+                            accum[4 * i + j],
+                            final_accum[base + 4 * i + j],
                         )
             advance()
 
