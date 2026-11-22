@@ -85,7 +85,8 @@ keeps them in sync.
   [`flash_attention4_tileop`](tirx_kernels/ported/flashattention/flash_attention4_tileop.py) ⟨sm_100a⟩,
   [`flash_attention4_fp4`](tirx_kernels/ported/flashattention/flash_attention4_fp4.py) ⟨sm_103a⟩
 - **Backward:**
-  [`flash_attention_backward_sm100`](tirx_kernels/ported/flashattention/flash_attention_backward.py) ⟨+sm_110a⟩
+  [`flash_attention_backward_sm100`](tirx_kernels/ported/flashattention/flash_attention_backward.py) ⟨+sm_110a⟩,
+  [`flash_attention3_backward_sm90`](tirx_kernels/ported/flashattention/fa3_backward_sm90.py) ⟨sm_90a⟩
 
 ### FlashInfer ports
 
@@ -232,6 +233,7 @@ externally managed GPU runtime dependency.
 | cuDNN Frontend (`cudnn`) | `cudnn_*` correctness and baselines | Source install pinned in the lock (v1.28.0); replaces any released `nvidia-cudnn-frontend` wheel, which lacks the CuTeDSL kernel sources. |
 | `flashinfer`     | all `flashinfer.*` ports, `nvfp4_gemm` and `rmsnorm` baselines | Correctness reference and optimized baseline. |
 | `flash-attn` + CUTLASS DSL | `flash_attention_backward_sm100` baseline | Current SM100 forward/backward reference. |
+| `flash-attn-3` (`hopper/`, `flash_attn_interface`) | `flash_attention3_backward_sm90` correctness and baseline | FlashAttention-3 C++/CUDA build from the same pinned flash-attention commit; a full build compiles every head dim / dtype / feature instantiation (hours), `FLASH_ATTENTION_DISABLE_*` env vars restrict it. |
 | SGLang CuTeDSL kernels (vendored, + CUTLASS DSL) | `deepgemm_sm100_fp8_paged_mqa_logits` reference | `sglang_cutedsl` benchmark reference; copied into `tirx_kernels/ported/deepgemm/_sglang_cutedsl/`, no SGLang install needed. |
 | `flash_mla`      | `sparse_flashmla_*` / `flash_mla_sparse_fwd` baselines | Reference impls. |
 | `deep_ep`        | `deepep_*` correctness and baselines | Reference implementation. |
