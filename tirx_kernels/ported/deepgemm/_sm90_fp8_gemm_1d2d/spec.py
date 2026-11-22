@@ -53,6 +53,10 @@ PORTED_CLASSES = frozenset(
         (_M, 64, 112, 2, False), (_C, 128, 160, 2, False),
         (_C, 128, 112, 2, True), (_P, 128, 112, 2, True), (_M, 128, 112, 2, True),
         (_C, 128, 128, 2, True), (_P, 128, 128, 2, True), (_M, 128, 128, 2, True),
+        (_C, 128, 96, 1, False), (_P, 128, 96, 1, False), (_M, 128, 96, 1, False),
+        (_M, 64, 96, 1, False), (_C, 128, 128, 1, False), (_P, 128, 128, 1, False),
+        (_M, 128, 128, 1, False), (_M, 64, 128, 1, False), (_C, 128, 192, 1, False),
+        (_M, 128, 192, 1, False),
     }
 )  # fmt: skip
 

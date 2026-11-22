@@ -109,6 +109,11 @@ _COVERAGE = [
     (8, 64, 4096, 7168, True),
     (8, 64, 7168, 2048, False),  # 128x160, multicast on B, dispatched BLOCK_N > BLOCK_K
     (4, 128, 6352, 2048, False),  # 128x112 on A, odd N-block count (57)
+    (4, 128, 4096, 7168, False),  # 128x128, no cluster
+    (4, 128, 4096, 7168, True),
+    (4, 128, 3072, 4096, False),  # 128x96, no cluster
+    (4, 128, 3072, 4096, True),
+    (4, 256, 3072, 4096, False),  # 128x192, no cluster
 ]
 
 
